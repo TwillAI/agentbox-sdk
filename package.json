@@ -127,7 +127,7 @@
     "@radix-ui/react-toggle-group": "^1.1.7",
     "@radix-ui/react-tooltip": "^1.2.6",
     "@sentry/electron": "^6.8.0",
-    "@sentry/react": "^9.27.0",
+    "@sentry/react": "^10.1.0",
     "@tailwindcss/vite": "^4.1.4",
     "@tanstack/react-query": "^5.74.7",
     "@tanstack/react-router": "^1.121.16",
