@@ -26,7 +26,7 @@ Summon is an open-source project that thrives on community contributions. Whethe
    ```
 4. **Start the development server**:
    ```bash
-   npm run dev
+   npm start
    ```
 
 ## 🛠️ Development Workflow
@@ -66,7 +66,7 @@ We follow conventional commit format:
 Before submitting your PR, make sure to:
 
 - [ ] Run the test suite: `npm test`
-- [ ] Test the Electron app: `npm run electron:dev`
+- [ ] Test the Electron app: `npm start`
 - [ ] Verify MCP server generation works correctly
 - [ ] Test the AI playground with your changes
 
