@@ -1,0 +1,90 @@
+{
+  "name": "openagent",
+  "version": "0.1.0",
+  "description": "Swappable coding agents and sandbox providers for Bun and TypeScript.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "images"
+  ],
+  "bin": {
+    "openagent": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./agents": {
+      "types": "./dist/agents/index.d.ts",
+      "import": "./dist/agents/index.js"
+    },
+    "./sandboxes": {
+      "types": "./dist/sandboxes/index.d.ts",
+      "import": "./dist/sandboxes/index.js"
+    },
+    "./events": {
+      "types": "./dist/events/index.d.ts",
+      "import": "./dist/events/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts src/agents/index.ts src/sandboxes/index.ts src/events/index.ts src/cli.ts --format esm --dts --clean",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "lint:fix": "eslint . --fix",
+    "test": "vitest run",
+    "test:e2e:local-docker": "vitest run test/local-docker.e2e.test.ts",
+    "test:smoke": "vitest run test/smoke.test.ts",
+    "test:watch": "vitest",
+    "check": "npm run typecheck && npm run lint && npm run test",
+    "hooks:install": "lefthook install",
+    "prepare": "if [ -d .git ]; then lefthook install; else echo 'Skipping lefthook install (no .git directory)'; fi",
+    "examples:codex": "tsx examples/basic-codex.ts",
+    "examples:opencode": "tsx examples/basic-opencode.ts",
+    "examples:claude": "tsx examples/basic-claude-code.ts",
+    "examples:modal": "tsx examples/basic-modal.ts"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "bun": ">=1.1.0"
+  },
+  "dependencies": {
+    "@daytonaio/sdk": "^0.161.0",
+    "dockerode": "^4.0.10",
+    "eventsource-parser": "^3.0.6",
+    "modal": "^0.7.4",
+    "tar-stream": "^3.1.8",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/dockerode": "^3.3.42",
+    "@types/node": "^25.5.2",
+    "@types/tar-stream": "^3.1.4",
+    "@types/ws": "^8.18.1",
+    "eslint": "^10.2.0",
+    "globals": "^17.4.0",
+    "lefthook": "^2.1.5",
+    "tsup": "^8.5.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.58.0",
+    "vitest": "^3.1.2"
+  },
+  "keywords": [
+    "agents",
+    "codex",
+    "claude-code",
+    "opencode",
+    "sandbox",
+    "modal",
+    "daytona",
+    "docker",
+    "typescript",
+    "bun"
+  ]
+}

@@ -1,0 +1,56 @@
+name: Local Docker E2E
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/local-docker-e2e.yml"
+      - "docker/e2e/**"
+      - "package.json"
+      - "package-lock.json"
+      - "src/**"
+      - "test/**"
+      - "scripts/local-docker-e2e.ts"
+      - "scripts/e2e-local-docker.mts"
+
+jobs:
+  local-docker-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OPENAGENT_RUN_LOCAL_DOCKER_E2E: "1"
+      OPENAGENT_E2E_DOCKER_IMAGE: "openagent-e2e"
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - name: Check required secrets
+        run: |
+          if [ -z "${OPENAI_API_KEY}" ]; then
+            echo "OPENAI_API_KEY secret is required for Codex and OpenCode E2E runs." >&2
+            exit 1
+          fi
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "ANTHROPIC_API_KEY secret is required for Claude Code E2E runs." >&2
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build local Docker E2E image
+        run: docker build -t "${OPENAGENT_E2E_DOCKER_IMAGE}" -f docker/e2e/Dockerfile .
+
+      - name: Run local Docker E2E suite
+        run: npm run test:e2e:local-docker
