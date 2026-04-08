@@ -1,7 +1,12 @@
-export * from "./types";
-export * from "./runtime";
-export * from "./mcp";
-export * from "./skills";
-export * from "./subagents";
-export * from "./hooks";
-export * from "./commands";
+export type {
+  AgentCommandConfig,
+  AgentHookConfig,
+  AgentHookEvent,
+  AgentLocalMcpConfig,
+  AgentMcpConfig,
+  AgentRemoteMcpConfig,
+  AgentSkillConfig,
+  AgentSubAgentConfig,
+  EmbeddedSkillConfig,
+  RepoSkillConfig,
+} from "./types";

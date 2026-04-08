@@ -52,8 +52,8 @@ npm install /absolute/path/to/openagent/openagent-<version>.tgz
 Pick a sandbox provider:
 
 - `local-docker` for the easiest local setup
-- `modal` for managed sandboxes and preview URLs
-- `daytona` for managed sandboxes with prebuilt snapshots
+- `modal`
+- `daytona`
 
 Provider credentials:
 
@@ -76,9 +76,6 @@ const sandbox = new Sandbox("local-docker", {
   image: process.env.IMAGE_ID!,
   env: {
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY!,
-  },
-  provider: {
-    publishedPorts: [4096],
   },
 });
 
@@ -103,6 +100,46 @@ const result = await agent.run({
 console.log(result.text);
 ```
 
+## Multimodal input
+
+`Agent.run()` and `Agent.stream()` accept either a plain string or an AI SDK-style array of user parts:
+
+- `text`
+- `image`
+- `file`
+
+Example:
+
+```ts
+import { pathToFileURL } from "node:url";
+import { Agent } from "openagent";
+
+const result = await agent.run({
+  input: [
+    {
+      type: "text",
+      text: "Compare the design mockup and the attached brief.",
+    },
+    {
+      type: "image",
+      image: pathToFileURL("/workspace/reference/mockup.png"),
+    },
+    {
+      type: "file",
+      data: pathToFileURL("/workspace/reference/brief.pdf"),
+      mediaType: "application/pdf",
+      filename: "brief.pdf",
+    },
+  ],
+});
+```
+
+Current provider support:
+
+- `opencode`: text, images, and files
+- `claude-code`: text, images, PDFs, and text-like files
+- `codex`: text and images; generic `file` parts still fail fast
+
 ## Built-in images
 
 OpenAgent ships with two presets:
@@ -123,6 +160,59 @@ The printed value is:
 - a Modal image id for `modal`
 - a Daytona snapshot name for `daytona`
 
+## Custom images
+
+You can also build your own sandbox image definition instead of using a built-in preset.
+
+Example `images/playwright-sandbox.mjs`:
+
+```js
+export default {
+  name: "playwright-sandbox",
+  base: "node:20-bookworm",
+  env: {
+    DEBIAN_FRONTEND: "noninteractive",
+    PLAYWRIGHT_BROWSERS_PATH: "/ms-playwright",
+  },
+  run: [
+    "apt-get update && apt-get install -y --no-install-recommends git python3 ca-certificates && rm -rf /var/lib/apt/lists/*",
+    "npm install -g pnpm @openai/codex",
+    "npx playwright install --with-deps chromium",
+  ],
+  workdir: "/workspace",
+  cmd: ["sleep", "infinity"],
+  resources: {
+    cpu: 4,
+    memoryMiB: 8192,
+  },
+};
+```
+
+Build it with:
+
+```bash
+npx openagent image build \
+  --provider local-docker \
+  --file ./images/playwright-sandbox.mjs \
+  --image-name openagent/playwright-sandbox:dev
+```
+
+The command prints the image reference you should pass to `Sandbox`:
+
+```ts
+import { Sandbox } from "openagent";
+
+const sandbox = new Sandbox("local-docker", {
+  workingDir: "/workspace",
+  image: "openagent/playwright-sandbox:dev",
+  env: {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY!,
+  },
+});
+```
+
+`--file` works with all providers. For `modal` and `daytona`, the printed value will be that provider's image id or snapshot name instead of a Docker tag.
+
 ## Examples
 
 Example scripts live in `examples/`:
@@ -130,6 +220,7 @@ Example scripts live in `examples/`:
 - `examples/basic-codex.ts`
 - `examples/basic-opencode.ts`
 - `examples/basic-claude-code.ts`
+- `examples/multimodal-claude-code.ts`
 - `examples/basic-modal.ts`
 
 Run them with:
@@ -138,6 +229,7 @@ Run them with:
 npm run examples:codex
 npm run examples:opencode
 npm run examples:claude
+npm run examples:multimodal
 npm run examples:modal
 ```
 

@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
 
+import { Agent } from "../src";
+import { buildOpenCodeCommandsConfig } from "../src/agents/config/commands";
+import { buildClaudeHookSettings } from "../src/agents/config/hooks";
+import { buildOpenCodeMcpConfig } from "../src/agents/config/mcp";
+import { prepareSkillArtifacts } from "../src/agents/config/skills";
 import {
-  Agent,
   buildClaudeAgentsConfig,
-  buildClaudeHookSettings,
-  buildOpenCodeCommandsConfig,
-  buildOpenCodeMcpConfig,
   buildCodexSubagentArtifacts,
-  prepareSkillArtifacts,
-} from "../src";
+} from "../src/agents/config/subagents";
 
 describe("agent options config", () => {
   it("constructs an agent with shared runtime option fields", () => {

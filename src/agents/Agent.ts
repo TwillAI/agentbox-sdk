@@ -339,11 +339,12 @@ class AgentRunController implements AgentRun, AgentRunSink {
 
 export class Agent<P extends AgentProviderName = AgentProviderName> {
   private readonly adapter: AgentProviderAdapter<P>;
+  private readonly provider: P;
+  private readonly options: AgentOptions<P>;
 
-  constructor(
-    private readonly provider: P,
-    private readonly options: AgentOptions<P>,
-  ) {
+  constructor(provider: P, options: AgentOptions<P>) {
+    this.provider = provider;
+    this.options = options;
     this.adapter = createAdapter(provider);
   }
 

@@ -3,7 +3,7 @@ import path from "node:path";
 import type { AgentProviderName } from "../types";
 import type {
   AgentSkillConfig,
-  MaterializationTarget,
+  RuntimeTarget,
   PreparedSkill,
   RuntimeLayout,
   TextArtifact,
@@ -89,7 +89,7 @@ export function buildSkillsSystemAppendix(
 }
 
 export async function installSkills(
-  target: MaterializationTarget,
+  target: RuntimeTarget,
   installCommands: string[],
 ): Promise<void> {
   for (const command of installCommands) {

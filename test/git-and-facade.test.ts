@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   Agent,
@@ -51,6 +51,46 @@ describe("public facades", () => {
     expect(agent).toBeInstanceOf(Agent);
   });
 
+  it("opens a local-docker port", async () => {
+    const sandbox = new Sandbox("local-docker", {
+      image: "openagent-e2e",
+    });
+
+    await sandbox.openPort(4096);
+
+    expect(sandbox.optionsSnapshot.provider?.publishedPorts).toEqual([4096]);
+  });
+
+  it("opens a modal port", async () => {
+    const sandbox = new Sandbox("modal", {
+      image: "im-demo-image",
+    });
+
+    await sandbox.openPort(4242);
+
+    expect(sandbox.optionsSnapshot.provider?.unencryptedPorts).toEqual([4242]);
+  });
+
+  it("opens the OpenCode sandbox port automatically at runtime", async () => {
+    const openPort = vi.fn(async () => undefined);
+    const fakeSandbox = {
+      openPort,
+      run: vi.fn(async () => {
+        throw new Error("stop after opening port");
+      }),
+    } as unknown as Sandbox<"local-docker">;
+
+    const agent = new Agent("opencode", {
+      sandbox: fakeSandbox,
+      cwd: "/workspace",
+    });
+
+    await expect(agent.run({ input: "hello" })).rejects.toThrow(
+      "stop after opening port",
+    );
+    expect(openPort).toHaveBeenCalledWith(4096);
+  });
+
   it("accepts resumeSessionId in run config", () => {
     const runConfig: AgentRunConfig = {
       input: "Continue from the existing session.",
@@ -59,5 +99,19 @@ describe("public facades", () => {
     };
 
     expect(runConfig.resumeSessionId).toBe("session-123");
+  });
+
+  it("accepts multipart input in run config", () => {
+    const runConfig: AgentRunConfig = {
+      input: [
+        { type: "text", text: "Review the attached mockup." },
+        {
+          type: "image",
+          image: new URL("https://example.com/mockup.png"),
+        },
+      ],
+    };
+
+    expect(Array.isArray(runConfig.input)).toBe(true);
   });
 });

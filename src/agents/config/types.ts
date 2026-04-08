@@ -110,7 +110,7 @@ export interface CodexPreparedConfig extends PreparedAgentConfig {
   inputItems?: Array<Record<string, unknown>>;
 }
 
-export interface MaterializationTarget {
+export interface RuntimeTarget {
   readonly provider: AgentProviderName;
   readonly layout: RuntimeLayout;
   readonly env: Record<string, string>;

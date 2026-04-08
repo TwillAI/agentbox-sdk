@@ -62,6 +62,11 @@ export class Sandbox<P extends SandboxProviderName = SandboxProviderName> {
     return this.driver.raw;
   }
 
+  async openPort(port: number): Promise<this> {
+    await this.driver.openPort(port);
+    return this;
+  }
+
   setSecret(name: string, value: string): this {
     this.driver.setSecret(name, value);
     return this;

@@ -238,6 +238,17 @@ export class ModalSandboxDriver extends SandboxDriver<
     await this.stop();
   }
 
+  async openPort(port: number): Promise<void> {
+    const provider = this.options.provider ?? (this.options.provider = {});
+    if (provider.encryptedPorts?.includes(port)) {
+      return;
+    }
+
+    provider.unencryptedPorts = provider.unencryptedPorts?.includes(port)
+      ? provider.unencryptedPorts
+      : [...(provider.unencryptedPorts ?? []), port];
+  }
+
   async getPreviewLink(port: number): Promise<string> {
     await this.ensureProvisioned();
     const sandbox = this.requireSandbox();

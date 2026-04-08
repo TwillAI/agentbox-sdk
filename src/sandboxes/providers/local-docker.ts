@@ -318,6 +318,17 @@ export class LocalDockerSandboxDriver extends SandboxDriver<
     this.container = undefined;
   }
 
+  async openPort(port: number): Promise<void> {
+    const provider = this.options.provider ?? (this.options.provider = {});
+    if (provider.networkMode === "host") {
+      return;
+    }
+
+    provider.publishedPorts = provider.publishedPorts?.includes(port)
+      ? provider.publishedPorts
+      : [...(provider.publishedPorts ?? []), port];
+  }
+
   async getPreviewLink(port: number): Promise<string> {
     const networkMode = this.options.provider?.networkMode;
     if (networkMode === "host") {

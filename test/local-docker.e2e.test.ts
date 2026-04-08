@@ -6,6 +6,7 @@ import {
   LOCAL_DOCKER_E2E_TIMEOUT_MS,
   runApprovalScenario,
   runClaudeHookScenario,
+  runImageScenario,
   runSimpleScenario,
   runSkillScenario,
   runSubAgentScenario,
@@ -20,6 +21,17 @@ describe.skipIf(!LOCAL_DOCKER_E2E_ENABLED)("local docker agent e2e", () => {
       expect(result.version.length).toBeGreaterThan(0);
       expect(result.sessionId.length).toBeGreaterThan(0);
       expect(result.text).toBe("hello");
+    },
+    LOCAL_DOCKER_E2E_TIMEOUT_MS,
+  );
+
+  it.each(LOCAL_DOCKER_E2E_PROVIDERS)(
+    "%s can inspect an attached image",
+    async (provider) => {
+      const result = await runImageScenario(provider);
+
+      expect(result.sessionId.length).toBeGreaterThan(0);
+      expect(result.text).toBe(result.expectedColor);
     },
     LOCAL_DOCKER_E2E_TIMEOUT_MS,
   );

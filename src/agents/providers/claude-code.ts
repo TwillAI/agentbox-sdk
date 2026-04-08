@@ -9,18 +9,17 @@ import type {
   AgentRunSink,
 } from "../types";
 import { shouldAutoApproveClaudeTools } from "../approval";
+import { mapToClaudeUserContent, validateProviderUserInput } from "../input";
 import {
   assertCommandsSupported,
-  assertHooksSupported,
-  buildClaudeAgentsConfig,
   buildClaudeCommandArtifacts,
-  buildClaudeHookSettings,
-  buildClaudeMcpArtifact,
-  createMaterializationTarget,
-  installSkills,
-  prepareSkillArtifacts,
-  type MaterializationTarget,
-} from "../config";
+} from "../config/commands";
+import { buildClaudeHookSettings, assertHooksSupported } from "../config/hooks";
+import { buildClaudeMcpArtifact } from "../config/mcp";
+import { createRuntimeTarget } from "../config/runtime";
+import { installSkills, prepareSkillArtifacts } from "../config/skills";
+import { buildClaudeAgentsConfig } from "../config/subagents";
+import type { RuntimeTarget } from "../config/types";
 import { SdkWsServer, type SdkWsMessage } from "../transports/sdk-ws";
 import { spawnCommand } from "../transports/spawn";
 
@@ -112,14 +111,14 @@ function createClaudePermissionEvent(
 async function prepareClaudeRuntime(
   request: AgentExecutionRequest<"claude-code">,
 ): Promise<{
-  target: MaterializationTarget;
+  target: RuntimeTarget;
   args: string[];
   env: Record<string, string>;
   initializeRequest?: Record<string, unknown>;
 }> {
   const options = request.options;
   const provider = options.provider;
-  const target = await createMaterializationTarget(
+  const target = await createRuntimeTarget(
     request.provider,
     request.runId,
     options,
@@ -290,6 +289,11 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     request: AgentExecutionRequest<"claude-code">,
     sink: AgentRunSink,
   ): Promise<() => Promise<void>> {
+    const inputParts = await validateProviderUserInput(
+      request.provider,
+      request.run.input,
+    );
+    const userContent = mapToClaudeUserContent(inputParts);
     const runtime = await createRuntime(request);
     sink.setRaw(runtime.raw);
     sink.setAbort(runtime.cleanup);
@@ -467,7 +471,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       type: "user",
       message: {
         role: "user",
-        content: request.run.input,
+        content: userContent,
       },
       parent_tool_use_id: null,
       session_id: request.run.resumeSessionId ?? "",

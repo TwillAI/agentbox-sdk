@@ -46,6 +46,7 @@
     "examples:codex": "tsx examples/basic-codex.ts",
     "examples:opencode": "tsx examples/basic-opencode.ts",
     "examples:claude": "tsx examples/basic-claude-code.ts",
+    "examples:multimodal": "tsx examples/multimodal-claude-code.ts",
     "examples:modal": "tsx examples/basic-modal.ts"
   },
   "engines": {

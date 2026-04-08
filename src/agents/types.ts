@@ -15,8 +15,32 @@ import type {
 
 export type AgentProviderName = "codex" | "opencode" | "claude-code";
 
+export type DataContent = string | URL | Uint8Array | ArrayBuffer | Buffer;
+
+export interface TextPart {
+  type: "text";
+  text: string;
+}
+
+export interface ImagePart {
+  type: "image";
+  image: DataContent;
+  mediaType?: string;
+}
+
+export interface FilePart {
+  type: "file";
+  data: DataContent;
+  mediaType: string;
+  filename?: string;
+}
+
+export type UserContentPart = TextPart | ImagePart | FilePart;
+
+export type UserContent = string | UserContentPart[];
+
 export interface AgentRunConfig {
-  input: string;
+  input: UserContent;
   model?: string;
   systemPrompt?: string;
   resumeSessionId?: string;

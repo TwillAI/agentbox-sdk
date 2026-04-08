@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { deflateSync } from "node:zlib";
 
 import { Agent, Sandbox, type AgentProviderName } from "../src";
 import type { NormalizedAgentEvent, PermissionRequestedEvent } from "../src";
@@ -35,6 +36,10 @@ type BaseScenarioResult = {
 };
 
 export type SimpleScenarioResult = BaseScenarioResult;
+
+export type ImageScenarioResult = BaseScenarioResult & {
+  expectedColor: string;
+};
 
 export type SkillScenarioResult = BaseScenarioResult & {
   skillName: string;
@@ -118,6 +123,56 @@ export async function runSimpleScenario(
       return {
         provider,
         version,
+        sessionId: result.sessionId,
+        text: result.text.trim(),
+      };
+    },
+  );
+}
+
+export async function runImageScenario(
+  provider: LocalDockerProvider,
+): Promise<ImageScenarioResult> {
+  const expectedColor = "blue";
+  const imageBuffer = createSolidColorPng({
+    width: 64,
+    height: 64,
+    r: 0,
+    g: 0,
+    b: 255,
+  });
+
+  return withPreparedSandbox(
+    provider,
+    "image",
+    async ({ sandbox, version }) => {
+      const agent = new Agent(provider, {
+        sandbox,
+        cwd: "/workspace",
+        env: COMMON_SANDBOX_ENV,
+      });
+      const result = await agent.run({
+        input: [
+          {
+            type: "text",
+            text: [
+              "The attached image is a single solid color.",
+              "Reply with exactly the dominant color in lowercase and nothing else.",
+            ].join(" "),
+          },
+          {
+            type: "image",
+            image: imageBuffer,
+            mediaType: "image/png",
+          },
+        ],
+        model: getImageScenarioModel(provider),
+      });
+
+      return {
+        provider,
+        version,
+        expectedColor,
         sessionId: result.sessionId,
         text: result.text.trim(),
       };
@@ -505,6 +560,88 @@ function buildOpenCodeConfigContent(): string | undefined {
     $schema: "https://opencode.ai/config.json",
     provider: providerConfig,
   });
+}
+
+function getImageScenarioModel(provider: LocalDockerProvider): string {
+  if (provider === "codex") {
+    return "gpt-5.4";
+  }
+
+  if (provider === "claude-code") {
+    return "claude-sonnet-4-6";
+  }
+
+  if (ROOT_ENV.ANTHROPIC_API_KEY) {
+    return "anthropic/claude-sonnet-4-6";
+  }
+
+  if (ROOT_ENV.OPENAI_API_KEY) {
+    return "openai/gpt-4o";
+  }
+
+  throw new Error(
+    "OpenCode image E2E requires an image-capable provider config such as ANTHROPIC_API_KEY or OPENAI_API_KEY.",
+  );
+}
+
+function createSolidColorPng(input: {
+  width: number;
+  height: number;
+  r: number;
+  g: number;
+  b: number;
+}): Buffer {
+  const signature = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  ]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(input.width, 0);
+  ihdr.writeUInt32BE(input.height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  const row = Buffer.alloc(1 + input.width * 3);
+  row[0] = 0;
+  for (let offset = 1; offset < row.length; offset += 3) {
+    row[offset] = input.r;
+    row[offset + 1] = input.g;
+    row[offset + 2] = input.b;
+  }
+  const pixelData = Buffer.concat(
+    Array.from({ length: input.height }, () => row),
+  );
+  const idat = deflateSync(pixelData);
+
+  return Buffer.concat([
+    signature,
+    createPngChunk("IHDR", ihdr),
+    createPngChunk("IDAT", idat),
+    createPngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+function createPngChunk(type: string, data: Buffer): Buffer {
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length, 0);
+  const typeBuffer = Buffer.from(type, "ascii");
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([typeBuffer, data])), 0);
+  return Buffer.concat([length, typeBuffer, data, crc]);
+}
+
+function crc32(buffer: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function buildEmbeddedSkillMarkdown(input: {

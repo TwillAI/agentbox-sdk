@@ -252,6 +252,11 @@ export class DaytonaSandboxDriver extends SandboxDriver<
     this.sandbox = undefined;
   }
 
+  async openPort(port: number): Promise<void> {
+    await this.ensureProvisioned();
+    await this.requireSandbox().getPreviewLink(port);
+  }
+
   async getPreviewLink(port: number): Promise<string> {
     await this.ensureProvisioned();
     const sandbox = this.requireSandbox();

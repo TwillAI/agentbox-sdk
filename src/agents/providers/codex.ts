@@ -13,18 +13,22 @@ import type {
 } from "../types";
 import { isInteractiveApproval } from "../approval";
 import {
-  assertCommandsSupported,
-  assertHooksSupported,
-  buildCodexConfigToml,
-  buildCodexSubagentArtifacts,
-  createMaterializationTarget,
-  installSkills,
-  prepareSkillArtifacts,
-  type PreparedSkill,
-} from "../config";
+  joinTextParts,
+  mapToCodexPromptParts,
+  type ResolvedImagePart,
+  validateProviderUserInput,
+} from "../input";
+import { assertCommandsSupported } from "../config/commands";
+import { assertHooksSupported } from "../config/hooks";
+import { buildCodexConfigToml } from "../config/mcp";
+import { createRuntimeTarget } from "../config/runtime";
+import { installSkills, prepareSkillArtifacts } from "../config/skills";
+import { buildCodexSubagentArtifacts } from "../config/subagents";
+import type { PreparedSkill, RuntimeTarget } from "../config/types";
 import { JsonRpcLineClient } from "../transports/app-server";
 import { linesFromNodeStream, spawnCommand } from "../transports/spawn";
 import { linesFromTextChunks } from "../../shared/streams";
+import { shellQuote } from "../../shared/shell";
 
 type CodexNotification = {
   id?: number;
@@ -348,6 +352,52 @@ function buildCodexPromptText(prompt: string, skills: PreparedSkill[]): string {
   ].join("\n\n");
 }
 
+function codexImageExtension(mediaType: string): string {
+  switch (mediaType) {
+    case "image/gif":
+      return ".gif";
+    case "image/jpeg":
+      return ".jpg";
+    case "image/png":
+      return ".png";
+    case "image/webp":
+      return ".webp";
+    default:
+      return ".img";
+  }
+}
+
+async function materializeCodexImage(
+  target: RuntimeTarget,
+  part: ResolvedImagePart,
+  index: number,
+): Promise<string> {
+  if (part.source.type === "url") {
+    return part.source.url;
+  }
+
+  const imagePath = path.join(
+    target.layout.rootDir,
+    "inputs",
+    `codex-image-${index}${codexImageExtension(part.mediaType)}`,
+  );
+  const encodedPath = `${imagePath}.b64`;
+
+  await target.writeArtifact({
+    path: encodedPath,
+    content: part.source.data,
+  });
+  await target.runCommand(
+    [
+      `mkdir -p ${shellQuote(path.posix.dirname(imagePath))}`,
+      `(base64 --decode < ${shellQuote(encodedPath)} > ${shellQuote(imagePath)} || base64 -D < ${shellQuote(encodedPath)} > ${shellQuote(imagePath)})`,
+      `rm -f ${shellQuote(encodedPath)}`,
+    ].join(" && "),
+  );
+
+  return imagePath;
+}
+
 async function ensureCodexLogin(
   request: AgentExecutionRequest<"codex">,
 ): Promise<void> {
@@ -356,7 +406,7 @@ async function ensureCodexLogin(
     return;
   }
 
-  const target = await createMaterializationTarget(
+  const target = await createRuntimeTarget(
     request.provider,
     `${request.runId}-codex-login`,
     request.options,
@@ -376,13 +426,14 @@ async function ensureCodexLogin(
 
 async function createRuntime(
   request: AgentExecutionRequest<"codex">,
+  inputParts: Awaited<ReturnType<typeof validateProviderUserInput>>,
 ): Promise<CodexRuntime> {
   const options = request.options;
   assertHooksSupported(request.provider, options.hooks);
   assertCommandsSupported(request.provider, options.commands);
   await ensureCodexLogin(request);
 
-  const target = await createMaterializationTarget(
+  const target = await createRuntimeTarget(
     request.provider,
     request.runId,
     options,
@@ -444,14 +495,29 @@ async function createRuntime(
   }
   configArgs.push("-c", `features.multi_agent=${enableMultiAgent}`);
 
-  const inputItems = [
-    {
+  const textPrompt = joinTextParts(
+    inputParts.filter(
+      (part): part is Extract<typeof part, { type: "text" }> =>
+        part.type === "text",
+    ),
+  );
+  const codexPromptText = buildCodexPromptText(textPrompt, preparedSkills);
+  const inputItems: Array<Record<string, unknown>> = [];
+
+  if (codexPromptText.trim().length > 0) {
+    inputItems.push({
       type: "text",
-      text: buildCodexPromptText(request.run.input, preparedSkills),
+      text: codexPromptText,
       text_elements: [],
-    },
-    ...buildCodexSkillInputItems(preparedSkills),
-  ];
+    });
+  }
+
+  inputItems.push(
+    ...(await mapToCodexPromptParts(inputParts, async (part, index) =>
+      materializeCodexImage(target, part, index),
+    )),
+  );
+  inputItems.push(...buildCodexSkillInputItems(preparedSkills));
 
   if (options.sandbox) {
     const handle = await options.sandbox.runAsync(
@@ -523,7 +589,11 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
     request: AgentExecutionRequest<"codex">,
     sink: AgentRunSink,
   ): Promise<() => Promise<void>> {
-    const runtime = await createRuntime(request);
+    const inputParts = await validateProviderUserInput(
+      request.provider,
+      request.run.input,
+    );
+    const runtime = await createRuntime(request, inputParts);
     sink.setRaw(runtime.raw);
     sink.setAbort(runtime.cleanup);
     sink.emitEvent(

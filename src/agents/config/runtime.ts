@@ -3,11 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import type { AgentOptions, AgentProviderName } from "../types";
-import type {
-  MaterializationTarget,
-  RuntimeLayout,
-  TextArtifact,
-} from "./types";
+import type { RuntimeTarget, RuntimeLayout, TextArtifact } from "./types";
 import { shellQuote } from "../../shared/shell";
 import { spawnCommand } from "../transports/spawn";
 
@@ -30,7 +26,7 @@ function createLayout(
   };
 }
 
-class HostMaterializationTarget implements MaterializationTarget {
+class HostRuntimeTarget implements RuntimeTarget {
   readonly env: Record<string, string>;
 
   constructor(
@@ -81,7 +77,7 @@ class HostMaterializationTarget implements MaterializationTarget {
   }
 }
 
-class SandboxMaterializationTarget implements MaterializationTarget {
+class SandboxRuntimeTarget implements RuntimeTarget {
   readonly env: Record<string, string>;
 
   constructor(
@@ -157,17 +153,17 @@ ${marker}`;
   }
 }
 
-export async function createMaterializationTarget<P extends AgentProviderName>(
+export async function createRuntimeTarget<P extends AgentProviderName>(
   provider: P,
   runId: string,
   options: AgentOptions<P>,
-): Promise<MaterializationTarget> {
+): Promise<RuntimeTarget> {
   if (options.sandbox) {
     const layout = createLayout(
       `/tmp/openagent/${provider}/${runId}`,
       options.env,
     );
-    return new SandboxMaterializationTarget(provider, layout, options);
+    return new SandboxRuntimeTarget(provider, layout, options);
   }
 
   const rootDir = await mkdtemp(
@@ -181,7 +177,7 @@ export async function createMaterializationTarget<P extends AgentProviderName>(
   await mkdir(layout.opencodeDir, { recursive: true });
   await mkdir(layout.codexDir, { recursive: true });
 
-  return new HostMaterializationTarget(
+  return new HostRuntimeTarget(
     provider,
     layout,
     options.cwd ?? process.cwd(),

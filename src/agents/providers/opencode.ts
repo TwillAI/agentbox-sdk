@@ -12,16 +12,16 @@ import type {
   AgentRunSink,
 } from "../types";
 import { isInteractiveApproval } from "../approval";
+import { mapToOpenCodeParts, validateProviderUserInput } from "../input";
 import {
   assertCommandsSupported,
-  assertHooksSupported,
   buildOpenCodeCommandsConfig,
-  buildOpenCodeMcpConfig,
-  buildOpenCodeSubagentConfig,
-  createMaterializationTarget,
-  installSkills,
-  prepareSkillArtifacts,
-} from "../config";
+} from "../config/commands";
+import { assertHooksSupported } from "../config/hooks";
+import { buildOpenCodeMcpConfig } from "../config/mcp";
+import { createRuntimeTarget } from "../config/runtime";
+import { installSkills, prepareSkillArtifacts } from "../config/skills";
+import { buildOpenCodeSubagentConfig } from "../config/subagents";
 import { fetchJson, streamSse } from "../transports/app-server";
 import { spawnCommand, waitForHttpReady } from "../transports/spawn";
 import { getAvailablePort } from "../../shared/network";
@@ -218,8 +218,12 @@ async function createRuntime(
   const options = request.options;
   assertHooksSupported(request.provider, options.hooks);
   assertCommandsSupported(request.provider, options.commands);
+  const port = options.provider?.port ?? 4096;
+  if (options.sandbox) {
+    await options.sandbox.openPort(port);
+  }
 
-  const target = await createMaterializationTarget(
+  const target = await createRuntimeTarget(
     request.provider,
     request.runId,
     options,
@@ -273,7 +277,6 @@ async function createRuntime(
   };
 
   if (options.sandbox) {
-    const port = options.provider?.port ?? 4096;
     const handle = await options.sandbox.runAsync(
       [
         options.provider?.binary ?? "opencode",
@@ -320,7 +323,7 @@ async function createRuntime(
     };
   }
 
-  const port = options.provider?.port ?? (await getAvailablePort());
+  const hostPort = options.provider?.port ?? (await getAvailablePort());
   const processHandle = spawnCommand({
     command: options.provider?.binary ?? "opencode",
     args: [
@@ -328,7 +331,7 @@ async function createRuntime(
       "--hostname",
       options.provider?.hostname ?? "127.0.0.1",
       "--port",
-      String(port),
+      String(hostPort),
       ...(options.provider?.args ?? []),
     ],
     cwd: options.cwd,
@@ -344,7 +347,7 @@ async function createRuntime(
         : {}),
     },
   });
-  const baseUrl = `http://${options.provider?.hostname ?? "127.0.0.1"}:${port}`;
+  const baseUrl = `http://${options.provider?.hostname ?? "127.0.0.1"}:${hostPort}`;
   await waitForHttpReady(`${baseUrl}/global/health`, { timeoutMs: 20_000 });
 
   return {
@@ -363,6 +366,10 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
     request: AgentExecutionRequest<"opencode">,
     sink: AgentRunSink,
   ): Promise<() => Promise<void>> {
+    const inputParts = await validateProviderUserInput(
+      request.provider,
+      request.run.input,
+    );
     const runtime = await createRuntime(request);
     sink.setRaw(runtime.raw);
     sink.setAbort(runtime.cleanup);
@@ -502,7 +509,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
             ? { model: toOpenCodeModel(request.run.model) }
             : {}),
           agent: "openagent",
-          parts: [{ type: "text", text: request.run.input }],
+          parts: mapToOpenCodeParts(inputParts),
         }),
       },
     );

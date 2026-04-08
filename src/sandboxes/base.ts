@@ -42,6 +42,7 @@ export abstract class SandboxDriver<
   abstract snapshot(): Promise<string | null>;
   abstract stop(): Promise<void>;
   abstract delete(): Promise<void>;
+  abstract openPort(port: number): Promise<void>;
   abstract getPreviewLink(port: number): Promise<string>;
 
   protected async ensureProvisioned(): Promise<void> {
