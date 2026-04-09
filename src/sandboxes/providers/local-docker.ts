@@ -3,7 +3,7 @@ import tar from "tar-stream";
 import { PassThrough } from "node:stream";
 import { finished } from "node:stream/promises";
 
-import { SandboxDriver } from "../base";
+import { SandboxAdapter } from "../base";
 import type {
   AsyncCommandHandle,
   CommandEvent,
@@ -23,7 +23,7 @@ type DockerRaw = {
   container?: Docker.Container;
 };
 
-export class LocalDockerSandboxDriver extends SandboxDriver<
+export class LocalDockerSandboxAdapter extends SandboxAdapter<
   "local-docker",
   LocalDockerSandboxOptions,
   DockerRaw
@@ -123,12 +123,29 @@ export class LocalDockerSandboxDriver extends SandboxDriver<
     const stream = await exec.start({ hijack: true, stdin: false, Tty: false });
     const { stdout, stderr } = this.demuxExecStream(container, stream);
 
-    const [stdoutBuffer, stderrBuffer] = await Promise.all([
+    const work = Promise.all([
       readNodeStream(stdout),
       readNodeStream(stderr),
       finished(stream),
     ]).then(([out, err]) => [out, err] as const);
 
+    let result: readonly [Buffer, Buffer];
+    if (options?.timeoutMs && options.timeoutMs > 0) {
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(
+          () =>
+            reject(
+              new Error(`Command timed out after ${options.timeoutMs}ms.`),
+            ),
+          options.timeoutMs,
+        ),
+      );
+      result = await Promise.race([work, timeout]);
+    } else {
+      result = await work;
+    }
+
+    const [stdoutBuffer, stderrBuffer] = result;
     const inspect = await exec.inspect();
     const stdoutText = stdoutBuffer.toString("utf8");
     const stderrText = stderrBuffer.toString("utf8");

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { loadSandboxImageDefinition } from "../src/sandbox-images/build";
 import {
   buildDaytonaSnapshotName,
+  buildE2bTemplateReference,
   buildSandboxImageReference,
   sandboxImageDefinitionToDockerfile,
 } from "../src/sandbox-images/utils";
@@ -50,6 +51,9 @@ describe("sandbox image builds", () => {
     );
     expect(buildDaytonaSnapshotName(definition)).toBe(
       buildDaytonaSnapshotName(definition),
+    );
+    expect(buildE2bTemplateReference(definition)).toBe(
+      buildE2bTemplateReference(definition),
     );
   });
 });

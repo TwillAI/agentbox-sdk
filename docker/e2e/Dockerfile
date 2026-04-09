@@ -1,9 +1,6 @@
 FROM node:20-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV HOME=/root
-ENV XDG_CONFIG_HOME=/root/.config
-ENV CODEX_HOME=/root/.codex
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \

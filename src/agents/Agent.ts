@@ -103,6 +103,19 @@ function createAdapter<P extends AgentProviderName>(
   }
 }
 
+function prepareAgentOptions<P extends AgentProviderName>(
+  provider: P,
+  options: AgentOptions<P>,
+): AgentOptions<P> {
+  if (provider === "opencode") {
+    const openCodeOptions = options as AgentOptions<"opencode">;
+    const port = 4096;
+    openCodeOptions.sandbox?.openPort(port);
+  }
+
+  return options;
+}
+
 class AgentRunController implements AgentRun, AgentRunSink {
   readonly id: string;
   readonly provider: AgentProviderName;
@@ -110,6 +123,7 @@ class AgentRunController implements AgentRun, AgentRunSink {
   raw?: unknown;
   readonly sessionIdReady: Promise<string>;
   private abortHandler: () => Promise<void> = async () => undefined;
+  private abortRequested = false;
   private readonly eventQueue = new AsyncQueue<NormalizedAgentEvent>();
   private readonly rawQueue = new AsyncQueue<RawAgentEvent>();
   private readonly events: NormalizedAgentEvent[] = [];
@@ -159,6 +173,9 @@ class AgentRunController implements AgentRun, AgentRunSink {
 
   setAbort(abort: () => Promise<void>): void {
     this.abortHandler = abort;
+    if (this.abortRequested) {
+      void abort();
+    }
   }
 
   setSessionId(sessionId: string): void {
@@ -321,6 +338,7 @@ class AgentRunController implements AgentRun, AgentRunSink {
   }
 
   async abort(): Promise<void> {
+    this.abortRequested = true;
     await this.abortHandler();
   }
 
@@ -344,7 +362,7 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
 
   constructor(provider: P, options: AgentOptions<P>) {
     this.provider = provider;
-    this.options = options;
+    this.options = prepareAgentOptions(provider, options);
     this.adapter = createAdapter(provider);
   }
 

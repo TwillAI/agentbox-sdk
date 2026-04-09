@@ -38,5 +38,8 @@ export function buildGitCloneCommand(options: GitCloneOptions): string {
     shellQuote(targetDir),
   ].join(" ");
 
+  if (targetDir === ".") {
+    return command;
+  }
   return `mkdir -p ${shellQuote(targetDir)} && rm -rf ${shellQuote(targetDir)} && ${command}`;
 }

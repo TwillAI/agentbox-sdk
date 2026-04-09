@@ -50,4 +50,19 @@ describe.skipIf(!smokeEnabled)("optional provider smoke tests", () => {
     const sandboxes = await sandbox.list();
     expect(Array.isArray(sandboxes)).toBe(true);
   });
+
+  it("can list E2B sandboxes when credentials are present", async () => {
+    if (!process.env.E2B_API_KEY) {
+      return;
+    }
+
+    const sandbox = new Sandbox("e2b", {
+      provider: {
+        apiKey: process.env.E2B_API_KEY,
+      },
+    });
+
+    const sandboxes = await sandbox.list();
+    expect(Array.isArray(sandboxes)).toBe(true);
+  });
 });

@@ -88,18 +88,12 @@ export interface CodexProviderOptions {
 export interface OpenCodeProviderOptions {
   binary?: string;
   args?: string[];
-  serverUrl?: string;
-  hostname?: string;
-  port?: number;
-  username?: string;
-  password?: string;
   plugins?: OpenCodePluginConfig[];
 }
 
 export interface ClaudeCodeProviderOptions {
   binary?: string;
   args?: string[];
-  sessionAccessToken?: string;
   hooks?: ClaudeCodeHooksConfig;
   permissionMode?: string;
   allowedTools?: string[];

@@ -8,9 +8,11 @@ import { ModalClient } from "modal";
 import tar from "tar-stream";
 
 import type { SandboxProviderName } from "../sandboxes/types";
+import { toShellCommand } from "../shared/shell";
 import type { BuiltInSandboxImageName, SandboxImageDefinition } from "./types";
 import {
   buildDaytonaSnapshotName,
+  buildE2bTemplateReference,
   buildSandboxImageReference,
   sandboxImageDefinitionToDockerfile,
   sandboxImageDefinitionToDockerfileCommands,
@@ -23,7 +25,25 @@ export interface BuildSandboxImageOptions {
   cwd?: string;
   modalAppName?: string;
   imageName?: string;
+  env?: Record<string, string>;
   log?: (chunk: string) => void;
+}
+
+let e2bModulePromise: Promise<typeof import("e2b")> | undefined;
+
+async function loadE2bModule(): Promise<typeof import("e2b")> {
+  if (!e2bModulePromise) {
+    e2bModulePromise = import("e2b");
+  }
+
+  return e2bModulePromise;
+}
+
+function getBuildEnv(
+  options: BuildSandboxImageOptions,
+  key: string,
+): string | undefined {
+  return options.env?.[key] ?? process.env[key];
 }
 
 export async function buildSandboxImage(
@@ -42,6 +62,8 @@ export async function buildSandboxImage(
       return buildModalImage(definition, options);
     case "daytona":
       return buildDaytonaSnapshot(definition, options);
+    case "e2b":
+      return buildE2bTemplate(definition, options);
   }
 }
 
@@ -145,8 +167,8 @@ async function buildModalImage(
   definition: SandboxImageDefinition,
   options: BuildSandboxImageOptions,
 ): Promise<string> {
-  const tokenId = process.env.MODAL_TOKEN_ID;
-  const tokenSecret = process.env.MODAL_TOKEN_SECRET;
+  const tokenId = getBuildEnv(options, "MODAL_TOKEN_ID");
+  const tokenSecret = getBuildEnv(options, "MODAL_TOKEN_SECRET");
   if (!tokenId || !tokenSecret) {
     throw new Error("MODAL_TOKEN_ID and MODAL_TOKEN_SECRET are required.");
   }
@@ -154,27 +176,35 @@ async function buildModalImage(
   const client = new ModalClient({
     tokenId,
     tokenSecret,
-    environment: process.env.MODAL_ENVIRONMENT,
-    endpoint: process.env.MODAL_ENDPOINT,
+    environment: getBuildEnv(options, "MODAL_ENVIRONMENT"),
+    endpoint: getBuildEnv(options, "MODAL_ENDPOINT"),
   });
-  const appName =
-    options.modalAppName ??
-    process.env.OPENAGENT_MODAL_APP_NAME ??
-    "openagent-images";
-  const app = await client.apps.fromName(appName, {
-    createIfMissing: true,
-    environment: process.env.MODAL_ENVIRONMENT,
-  });
+  try {
+    const appName =
+      options.modalAppName ??
+      getBuildEnv(options, "OPENAGENT_MODAL_APP_NAME") ??
+      "openagent-images";
+    const app = await client.apps.fromName(appName, {
+      createIfMissing: true,
+      environment: getBuildEnv(options, "MODAL_ENVIRONMENT"),
+    });
 
-  let image = client.images.fromRegistry(definition.base);
-  const commands = sandboxImageDefinitionToDockerfileCommands(definition);
-  if (commands.length > 0) {
-    image = image.dockerfileCommands(commands);
+    let image = client.images.fromRegistry(definition.base);
+    const commands = sandboxImageDefinitionToDockerfileCommands(definition);
+    if (commands.length > 0) {
+      image = image.dockerfileCommands(commands);
+    }
+
+    const builtImage = await image.build(app);
+    options.log?.(`Built Modal image ${builtImage.imageId}`);
+    return builtImage.imageId;
+  } finally {
+    try {
+      client.close();
+    } catch {
+      // Ignore client shutdown errors during cleanup.
+    }
   }
-
-  const builtImage = await image.build(app);
-  options.log?.(`Built Modal image ${builtImage.imageId}`);
-  return builtImage.imageId;
 }
 
 async function buildDaytonaSnapshot(
@@ -186,16 +216,19 @@ async function buildDaytonaSnapshot(
       "Daytona image definitions must include resources.cpu and resources.memoryMiB.",
     );
   }
-  if (!process.env.DAYTONA_API_KEY && !process.env.DAYTONA_JWT_TOKEN) {
+  if (
+    !getBuildEnv(options, "DAYTONA_API_KEY") &&
+    !getBuildEnv(options, "DAYTONA_JWT_TOKEN")
+  ) {
     throw new Error("DAYTONA_API_KEY or DAYTONA_JWT_TOKEN is required.");
   }
 
   const client = new Daytona({
-    apiKey: process.env.DAYTONA_API_KEY,
-    jwtToken: process.env.DAYTONA_JWT_TOKEN,
-    organizationId: process.env.DAYTONA_ORGANIZATION_ID,
-    apiUrl: process.env.DAYTONA_API_URL,
-    target: process.env.DAYTONA_TARGET,
+    apiKey: getBuildEnv(options, "DAYTONA_API_KEY"),
+    jwtToken: getBuildEnv(options, "DAYTONA_JWT_TOKEN"),
+    organizationId: getBuildEnv(options, "DAYTONA_ORGANIZATION_ID"),
+    apiUrl: getBuildEnv(options, "DAYTONA_API_URL"),
+    target: getBuildEnv(options, "DAYTONA_TARGET"),
   });
 
   let image = DaytonaImage.base(definition.base);
@@ -229,7 +262,66 @@ async function buildDaytonaSnapshot(
     },
   );
 
-  const activated = await client.snapshot.activate(snapshot);
-  options.log?.(`Built Daytona snapshot ${activated.name}`);
-  return activated.name;
+  try {
+    const activated = await client.snapshot.activate(snapshot);
+    options.log?.(`Built Daytona snapshot ${activated.name}`);
+    return activated.name;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("already active")) {
+      options.log?.(`Built Daytona snapshot ${snapshot.name}`);
+      return snapshot.name;
+    }
+    throw error;
+  }
+}
+
+async function buildE2bTemplate(
+  definition: SandboxImageDefinition,
+  options: BuildSandboxImageOptions,
+): Promise<string> {
+  if (
+    !getBuildEnv(options, "E2B_API_KEY") &&
+    !getBuildEnv(options, "E2B_ACCESS_TOKEN")
+  ) {
+    throw new Error("E2B_API_KEY or E2B_ACCESS_TOKEN is required.");
+  }
+
+  const { Template, waitForTimeout } = await loadE2bModule();
+  let template = Template().fromImage(definition.base).setUser("root");
+
+  if (definition.env) {
+    template = template.setEnvs(definition.env);
+  }
+
+  if (definition.run?.length) {
+    template = template.runCmd(definition.run);
+  }
+
+  if (definition.workdir) {
+    template = template.setWorkdir(definition.workdir);
+  }
+
+  const finalTemplate = definition.cmd?.length
+    ? template.setStartCmd(toShellCommand(definition.cmd), waitForTimeout(1000))
+    : template;
+
+  const builtTemplate = await Template.build(
+    finalTemplate,
+    options.imageName ?? buildE2bTemplateReference(definition),
+    {
+      apiKey: getBuildEnv(options, "E2B_API_KEY"),
+      accessToken: getBuildEnv(options, "E2B_ACCESS_TOKEN"),
+      domain: getBuildEnv(options, "E2B_DOMAIN"),
+      cpuCount: definition.resources?.cpu,
+      memoryMB: definition.resources?.memoryMiB,
+      onBuildLogs: (entry) => {
+        options.log?.(`[${entry.level}] ${entry.message}`);
+      },
+    },
+  );
+
+  const reference = builtTemplate.name;
+  options.log?.(`Built E2B template ${reference}`);
+  return reference;
 }

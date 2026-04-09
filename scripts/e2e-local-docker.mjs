@@ -31,9 +31,6 @@ const AUTH_PREP_COMMAND =
 const COMMON_SANDBOX_OPTIONS = {
   workingDir: "/workspace",
   env: {
-    HOME: "/root",
-    XDG_CONFIG_HOME: "/root/.config",
-    CODEX_HOME: "/root/.codex",
     ...(rootEnv.OPENAI_API_KEY
       ? { OPENAI_API_KEY: rootEnv.OPENAI_API_KEY }
       : {}),

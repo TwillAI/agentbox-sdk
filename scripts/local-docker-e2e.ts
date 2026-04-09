@@ -77,9 +77,6 @@ const HOST_AUTH_PATHS = {
 const OPENCODE_CONFIG_CONTENT = buildOpenCodeConfigContent();
 
 const COMMON_SANDBOX_ENV = {
-  HOME: "/root",
-  XDG_CONFIG_HOME: "/root/.config",
-  CODEX_HOME: "/root/.codex",
   ...(ROOT_ENV.OPENAI_API_KEY
     ? { OPENAI_API_KEY: ROOT_ENV.OPENAI_API_KEY }
     : {}),

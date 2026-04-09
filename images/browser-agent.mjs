@@ -34,9 +34,6 @@ export default {
   base: "node:20-bookworm",
   env: {
     DEBIAN_FRONTEND: "noninteractive",
-    HOME: "/root",
-    XDG_CONFIG_HOME: "/root/.config",
-    CODEX_HOME: "/root/.codex",
     CHROME_BIN: "/usr/bin/chromium",
     PUPPETEER_EXECUTABLE_PATH: "/usr/bin/chromium",
     PUPPETEER_SKIP_DOWNLOAD: "true",

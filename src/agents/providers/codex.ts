@@ -6,7 +6,6 @@ import {
   type PermissionRequestedEvent,
   type RawAgentEvent,
 } from "../../events";
-import { AsyncQueue } from "../../shared/async-queue";
 import type {
   AgentExecutionRequest,
   AgentProviderAdapter,
@@ -48,6 +47,7 @@ type CodexRuntime = {
   cleanup: () => Promise<void>;
   raw: unknown;
   inputItems: Array<Record<string, unknown>>;
+  turnStartOverrides?: Record<string, unknown>;
 };
 
 type CodexRpcClient = {
@@ -59,18 +59,7 @@ type CodexRpcClient = {
 };
 
 const REMOTE_CODEX_APP_SERVER_PORT = 43181;
-const REMOTE_CODEX_APP_SERVER_PORTS = Array.from(
-  { length: 10 },
-  (_, index) => REMOTE_CODEX_APP_SERVER_PORT + index,
-);
-const remoteCodexPortPoolBySandbox = new WeakMap<
-  object,
-  {
-    init?: Promise<void>;
-    available: number[];
-    inUse: Set<number>;
-  }
->();
+const REMOTE_CODEX_APP_SERVER_ID = "shared-app-server";
 
 function compactEnv(
   values: Record<string, string | undefined>,
@@ -145,6 +134,21 @@ function buildTurnSandboxPolicy(
   };
 }
 
+function buildTurnCollaborationMode(
+  request: AgentExecutionRequest<"codex">,
+): Record<string, unknown> | undefined {
+  if (!request.run.systemPrompt) {
+    return undefined;
+  }
+
+  return {
+    mode: "custom",
+    settings: {
+      developer_instructions: request.run.systemPrompt,
+    },
+  };
+}
+
 function toRawEvent(
   runId: string,
   payload: unknown,
@@ -157,6 +161,18 @@ function toRawEvent(
     timestamp: new Date().toISOString(),
     payload,
   };
+}
+
+function shouldIgnoreCodexError(notification: CodexNotification): boolean {
+  if (notification.method !== "error") {
+    return false;
+  }
+
+  return notification.params?.willRetry === true;
+}
+
+function buildCodexCommandArgs(binary: string, args: string[]): string[] {
+  return ["-u", "CODEX_HOME", "-u", "XDG_CONFIG_HOME", binary, ...args];
 }
 
 function toNormalizedCodexEvents(
@@ -463,28 +479,19 @@ async function materializeCodexImage(
 
 async function ensureCodexLogin(
   request: AgentExecutionRequest<"codex">,
+  target: RuntimeTarget,
 ): Promise<void> {
   const openAiApiKey = request.options.env?.OPENAI_API_KEY;
   if (!openAiApiKey) {
     return;
   }
 
-  const target = await createRuntimeTarget(
-    request.provider,
-    `${request.runId}-codex-login`,
-    request.options,
+  await target.runCommand(
+    'if [ -z "$OPENAI_API_KEY" ]; then exit 1; fi; printenv OPENAI_API_KEY | env -u CODEX_HOME -u XDG_CONFIG_HOME codex login --with-api-key >/dev/null 2>&1',
+    {
+      OPENAI_API_KEY: openAiApiKey,
+    },
   );
-
-  try {
-    await target.runCommand(
-      'if [ -z "$OPENAI_API_KEY" ]; then exit 1; fi; mkdir -p "${CODEX_HOME:-$HOME/.codex}" && printenv OPENAI_API_KEY | codex login --with-api-key >/dev/null 2>&1',
-      {
-        OPENAI_API_KEY: openAiApiKey,
-      },
-    );
-  } finally {
-    await target.cleanup();
-  }
 }
 
 function toRemoteCodexWebSocketUrl(url: string): string {
@@ -511,298 +518,27 @@ async function connectRemoteCodexAppServer(url: string) {
   );
 }
 
-function extractThreadId(message: CodexNotification): string | undefined {
-  const params = message.params;
-  if (!params) {
-    return undefined;
-  }
-
-  if (typeof params.threadId === "string") {
-    return params.threadId;
-  }
-
-  const thread = params.thread as Record<string, unknown> | undefined;
-  if (typeof thread?.id === "string") {
-    return thread.id;
-  }
-
-  return undefined;
-}
-
-class SharedCodexRunClient implements CodexRpcClient {
-  readonly notifications = new AsyncQueue<CodexNotification>();
-  threadId?: string;
-  closed = false;
-
-  constructor(
-    private readonly connection: SharedCodexAppServerConnection,
-    readonly runId: string,
-  ) {}
-
-  bindThread(threadId: string): void {
-    if (this.threadId === threadId) {
-      return;
-    }
-
-    this.threadId = threadId;
-    this.connection.bindThread(threadId, this);
-  }
-
-  push(message: CodexNotification): void {
-    if (!this.closed) {
-      this.notifications.push(message);
-    }
-  }
-
-  fail(error: unknown): void {
-    if (!this.closed) {
-      this.notifications.fail(error);
-    }
-  }
-
-  async request<TResult>(method: string, params: unknown): Promise<TResult> {
-    return this.connection.request(method, params);
-  }
-
-  async notify(method: string, params?: unknown): Promise<void> {
-    await this.connection.notify(method, params);
-  }
-
-  async respond(id: number, result: unknown): Promise<void> {
-    await this.connection.respond(id, result);
-  }
-
-  messages(): AsyncIterable<CodexNotification> {
-    return this.notifications;
-  }
-
-  close(): void {
-    if (this.closed) {
-      return;
-    }
-    this.closed = true;
-    this.notifications.finish();
-    this.connection.unbindRun(this);
-  }
-}
-
-class SharedCodexAppServerConnection {
-  private readonly runs = new Set<SharedCodexRunClient>();
-  private readonly runsByThreadId = new Map<string, SharedCodexRunClient>();
-  private readonly pendingByThreadId = new Map<string, CodexNotification[]>();
-  private readonly pending = new Map<
-    number,
-    {
-      resolve: (value: unknown) => void;
-      reject: (reason?: unknown) => void;
-    }
-  >();
-  private nextId = 1;
-  private initialized = false;
-  private initializePromise?: Promise<void>;
-
-  constructor(
-    private readonly transport: Awaited<
-      ReturnType<typeof connectJsonRpcWebSocket>
-    >,
-  ) {
-    void this.consume();
-  }
-
-  private async consume(): Promise<void> {
-    try {
-      for await (const line of this.transport.source) {
-        if (!line.trim()) {
-          continue;
-        }
-
-        const message = JSON.parse(line) as Record<string, unknown>;
-        if (typeof message.method === "string") {
-          this.routeNotification(message as CodexNotification);
-          continue;
-        }
-
-        if (typeof message.id === "number") {
-          const pending = this.pending.get(message.id);
-          if (!pending) {
-            continue;
-          }
-
-          this.pending.delete(message.id);
-          if (message.error) {
-            pending.reject(message.error);
-          } else {
-            pending.resolve(message.result);
-          }
-        }
-      }
-
-      const error = new Error("Shared Codex app-server connection closed.");
-      for (const pending of this.pending.values()) {
-        pending.reject(error);
-      }
-      this.pending.clear();
-      for (const run of this.runs) {
-        run.fail(error);
-      }
-    } catch (error) {
-      for (const pending of this.pending.values()) {
-        pending.reject(error);
-      }
-      this.pending.clear();
-      for (const run of this.runs) {
-        run.fail(error);
-      }
-    }
-  }
-
-  private routeNotification(message: CodexNotification): void {
-    const threadId = extractThreadId(message);
-    if (threadId) {
-      const run = this.runsByThreadId.get(threadId);
-      if (run) {
-        run.push(message);
-        return;
-      }
-
-      const queued = this.pendingByThreadId.get(threadId) ?? [];
-      queued.push(message);
-      this.pendingByThreadId.set(threadId, queued);
-      return;
-    }
-
-    for (const run of this.runs) {
-      run.push(message);
-    }
-  }
-
-  async initialize(): Promise<void> {
-    if (this.initialized) {
-      return;
-    }
-
-    if (this.initializePromise) {
-      await this.initializePromise;
-      return;
-    }
-
-    this.initializePromise = (async () => {
-      await this.request("initialize", {
-        clientInfo: {
-          title: "OpenAgent",
-          name: "OpenAgent",
-          version: "0.1.0",
-        },
-        capabilities: {
-          experimentalApi: true,
-        },
-      });
-      await this.notify("initialized", {});
-      this.initialized = true;
-    })().finally(() => {
-      this.initializePromise = undefined;
-    });
-
-    await this.initializePromise;
-  }
-
-  createRun(runId: string): SharedCodexRunClient {
-    const run = new SharedCodexRunClient(this, runId);
-    this.runs.add(run);
-    return run;
-  }
-
-  bindThread(threadId: string, run: SharedCodexRunClient): void {
-    this.runsByThreadId.set(threadId, run);
-    const queued = this.pendingByThreadId.get(threadId);
-    if (!queued) {
-      return;
-    }
-
-    this.pendingByThreadId.delete(threadId);
-    for (const message of queued) {
-      run.push(message);
-    }
-  }
-
-  unbindRun(run: SharedCodexRunClient): void {
-    this.runs.delete(run);
-    if (run.threadId) {
-      const current = this.runsByThreadId.get(run.threadId);
-      if (current === run) {
-        this.runsByThreadId.delete(run.threadId);
-      }
-    }
-  }
-
-  async request<TResult>(method: string, params: unknown): Promise<TResult> {
-    const id = this.nextId++;
-    const response = new Promise<TResult>((resolve, reject) => {
-      this.pending.set(id, {
-        resolve: resolve as (value: unknown) => void,
-        reject,
-      });
-    });
-
-    await this.transport.send(JSON.stringify({ id, method, params }));
-    return response;
-  }
-
-  async notify(method: string, params?: unknown): Promise<void> {
-    await this.transport.send(JSON.stringify({ method, params: params ?? {} }));
-  }
-
-  async respond(id: number, result: unknown): Promise<void> {
-    await this.transport.send(JSON.stringify({ id, result }));
-  }
-}
-
-async function acquireRemoteCodexPort(
-  sandbox: NonNullable<AgentExecutionRequest<"codex">["options"]["sandbox"]>,
-): Promise<number> {
-  const key = sandbox as object;
-  let pool = remoteCodexPortPoolBySandbox.get(key);
-  if (!pool) {
-    pool = {
-      available: [...REMOTE_CODEX_APP_SERVER_PORTS],
-      inUse: new Set<number>(),
-    };
-    pool.init = (async () => {
-      for (const port of REMOTE_CODEX_APP_SERVER_PORTS) {
-        await sandbox.openPort(port);
-      }
-    })();
-    remoteCodexPortPoolBySandbox.set(key, pool);
-  }
-
-  if (pool.init) {
-    await pool.init;
-    pool.init = undefined;
-  }
-
-  const port = pool.available.shift();
-  if (port === undefined) {
-    throw new Error("No available remote Codex app-server ports.");
-  }
-  pool.inUse.add(port);
-  return port;
-}
-
-function releaseRemoteCodexPort(
+async function waitForInternalCodexReady(
   sandbox: NonNullable<AgentExecutionRequest<"codex">["options"]["sandbox"]>,
   port: number,
-): void {
-  const pool = remoteCodexPortPoolBySandbox.get(sandbox as object);
-  if (!pool) {
-    return;
+  cwd: string,
+  env: Record<string, string>,
+): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 60_000) {
+    const result = await sandbox
+      .run(`curl -fsS http://127.0.0.1:${port}/readyz >/dev/null`, {
+        cwd,
+        env,
+        timeoutMs: 5_000,
+      })
+      .catch(() => undefined);
+    if (result?.exitCode === 0) {
+      return;
+    }
+    await sleep(250);
   }
-  if (!pool.inUse.delete(port)) {
-    return;
-  }
-  if (!pool.available.includes(port)) {
-    pool.available.push(port);
-    pool.available.sort((left, right) => left - right);
-  }
+  throw new Error(`Codex internal app-server did not become ready on ${port}.`);
 }
 
 async function createRuntime(
@@ -812,24 +548,193 @@ async function createRuntime(
   const options = request.options;
   const usesRemoteWebSocket =
     options.sandbox && options.sandbox.provider !== "local-docker";
-  const remoteAppServerPort =
-    usesRemoteWebSocket && options.sandbox
-      ? await acquireRemoteCodexPort(options.sandbox)
-      : undefined;
   const hooks = assertHooksSupported(request.provider, options);
   assertCommandsSupported(request.provider, options.commands);
-  await ensureCodexLogin(request);
+
+  if (usesRemoteWebSocket && options.sandbox) {
+    const sandbox = options.sandbox;
+    await sandbox.openPort(REMOTE_CODEX_APP_SERVER_PORT);
+    const sharedTarget = await createRuntimeTarget(
+      request.provider,
+      REMOTE_CODEX_APP_SERVER_ID,
+      options,
+    );
+    await ensureCodexLogin(request, sharedTarget);
+    const env = compactEnv({
+      ...(options.env ?? {}),
+      ...sharedTarget.env,
+      ...(options.provider?.env ?? {}),
+    });
+    const serverCwd = sharedTarget.layout.rootDir;
+    const previewUrl = await sandbox.getPreviewLink(
+      REMOTE_CODEX_APP_SERVER_PORT,
+    );
+    const {
+      artifacts: subAgentArtifacts,
+      agentSections,
+      enableMultiAgent,
+    } = buildCodexSubagentArtifacts(options.subAgents, sharedTarget.layout);
+
+    const serverArtifacts = [...subAgentArtifacts];
+    const hooksFile = buildCodexHooksFile(hooks);
+    const configToml = buildCodexConfigToml(
+      options.mcps,
+      agentSections,
+      Boolean(hooksFile),
+    );
+    if (configToml) {
+      serverArtifacts.push({
+        path: path.join(sharedTarget.layout.codexDir, "config.toml"),
+        content: configToml,
+      });
+    }
+    if (hooksFile) {
+      serverArtifacts.push({
+        path: path.join(sharedTarget.layout.codexDir, "hooks.json"),
+        content: JSON.stringify(hooksFile, null, 2),
+      });
+    }
+
+    for (const artifact of serverArtifacts) {
+      await sharedTarget.writeArtifact(artifact);
+    }
+
+    const configArgs: string[] = [];
+    configArgs.push("-c", `features.multi_agent=${enableMultiAgent}`);
+    const binary = options.provider?.binary ?? "codex";
+    const pidFilePath = path.posix.join(
+      sharedTarget.layout.rootDir,
+      "codex-app-server.pid",
+    );
+    const logFilePath = path.posix.join(
+      sharedTarget.layout.rootDir,
+      "codex-app-server.log",
+    );
+    const launchResult = await sandbox.run(
+      [
+        `mkdir -p ${shellQuote(sharedTarget.layout.rootDir)}`,
+        `if curl -fsS http://127.0.0.1:${REMOTE_CODEX_APP_SERVER_PORT}/readyz >/dev/null 2>&1; then exit 0; fi`,
+        `if [ -f ${shellQuote(pidFilePath)} ]; then kill "$(cat ${shellQuote(pidFilePath)})" >/dev/null 2>&1 || true; rm -f ${shellQuote(pidFilePath)}; fi`,
+        `(${[
+          `nohup ${[
+            "env",
+            ...buildCodexCommandArgs(binary, [
+              ...configArgs,
+              "app-server",
+              "--listen",
+              `ws://0.0.0.0:${REMOTE_CODEX_APP_SERVER_PORT}`,
+            ]),
+          ]
+            .map(shellQuote)
+            .join(" ")} > ${shellQuote(logFilePath)} 2>&1 &`,
+          `echo $! > ${shellQuote(pidFilePath)}`,
+        ].join(" ")})`,
+      ].join(" && "),
+      {
+        cwd: serverCwd,
+        env,
+      },
+    );
+    if (launchResult.exitCode !== 0) {
+      throw new Error(
+        `Could not start Codex app-server: ${launchResult.combinedOutput || launchResult.stderr}`,
+      );
+    }
+    await waitForInternalCodexReady(
+      sandbox,
+      REMOTE_CODEX_APP_SERVER_PORT,
+      serverCwd,
+      env,
+    );
+
+    const target = await createRuntimeTarget(
+      request.provider,
+      request.runId,
+      options,
+    );
+    try {
+      const {
+        artifacts: skillArtifacts,
+        installCommands,
+        preparedSkills,
+      } = await prepareSkillArtifacts(
+        request.provider,
+        options.skills,
+        target.layout,
+      );
+
+      for (const artifact of skillArtifacts) {
+        await target.writeArtifact(artifact);
+      }
+      await installSkills(target, installCommands);
+
+      const textPrompt = joinTextParts(
+        inputParts.filter(
+          (part): part is Extract<typeof part, { type: "text" }> =>
+            part.type === "text",
+        ),
+      );
+      const codexPromptText = buildCodexPromptText(textPrompt, preparedSkills);
+      const inputItems: Array<Record<string, unknown>> = [];
+
+      if (codexPromptText.trim().length > 0) {
+        inputItems.push({
+          type: "text",
+          text: codexPromptText,
+          text_elements: [],
+        });
+      }
+
+      inputItems.push(
+        ...(await mapToCodexPromptParts(inputParts, async (part, index) =>
+          materializeCodexImage(target, part, index),
+        )),
+      );
+      inputItems.push(...buildCodexSkillInputItems(preparedSkills));
+
+      const transport = await connectRemoteCodexAppServer(
+        toRemoteCodexWebSocketUrl(previewUrl),
+      );
+      return {
+        source: transport.source,
+        writeLine: transport.send,
+        cleanup: async () => {
+          await transport?.close().catch(() => undefined);
+          await target.cleanup().catch(() => undefined);
+        },
+        raw: {
+          transport: transport.raw,
+          previewUrl,
+          port: REMOTE_CODEX_APP_SERVER_PORT,
+          serverLayout: sharedTarget.layout,
+          layout: target.layout,
+        },
+        inputItems,
+        turnStartOverrides: buildTurnCollaborationMode(request),
+      };
+    } catch (error) {
+      await target.cleanup().catch(() => undefined);
+      throw error;
+    }
+  }
 
   const target = await createRuntimeTarget(
     request.provider,
     request.runId,
     options,
   );
+  try {
+    await ensureCodexLogin(request, target);
+  } catch (error) {
+    await target.cleanup().catch(() => undefined);
+    throw error;
+  }
   const env = compactEnv({
     ...(options.env ?? {}),
     ...target.env,
     ...(options.provider?.env ?? {}),
   });
+  const runtimeCwd = target.layout.rootDir;
 
   const {
     artifacts: skillArtifacts,
@@ -917,105 +822,17 @@ async function createRuntime(
   );
   inputItems.push(...buildCodexSkillInputItems(preparedSkills));
 
-  if (
-    usesRemoteWebSocket &&
-    options.sandbox &&
-    remoteAppServerPort !== undefined
-  ) {
-    const sandbox = options.sandbox;
-    const binary = options.provider?.binary ?? "codex";
-    const pidFilePath = path.posix.join(
-      target.layout.rootDir,
-      "codex-app-server.pid",
-    );
-    const logFilePath = path.posix.join(
-      target.layout.rootDir,
-      "codex-app-server.log",
-    );
-    const launchCommand = [
-      `mkdir -p ${shellQuote(target.layout.rootDir)}`,
-      `(${[
-        `nohup ${[
-          binary,
-          ...configArgs,
-          "app-server",
-          "--listen",
-          `ws://0.0.0.0:${remoteAppServerPort}`,
-        ]
-          .map(shellQuote)
-          .join(" ")} > ${shellQuote(logFilePath)} 2>&1 &`,
-        `echo $! > ${shellQuote(pidFilePath)}`,
-      ].join(" ")})`,
-    ].join(" && ");
-    const launchHandle = await sandbox.runAsync(launchCommand, {
-      cwd: options.cwd,
-      env,
-    });
-    const launchResult = await launchHandle.wait();
-    if (launchResult.exitCode !== 0) {
-      releaseRemoteCodexPort(sandbox, remoteAppServerPort);
-      throw new Error(
-        `Could not start Codex app-server: ${launchResult.combinedOutput || launchResult.stderr}`,
-      );
-    }
-    let cleanedUp = false;
-    const cleanupRemoteRun = async () => {
-      if (cleanedUp) {
-        return;
-      }
-      cleanedUp = true;
-      await sandbox
-        .run(
-          `if [ -f ${shellQuote(pidFilePath)} ]; then kill "$(cat ${shellQuote(pidFilePath)})" >/dev/null 2>&1 || true; rm -f ${shellQuote(pidFilePath)}; fi`,
-          {
-            cwd: options.cwd,
-            env,
-            timeoutMs: 30_000,
-          },
-        )
-        .catch(() => undefined);
-      releaseRemoteCodexPort(sandbox, remoteAppServerPort);
-      await target.cleanup().catch(() => undefined);
-    };
-
-    let previewUrl: string | undefined;
-    let transport:
-      | Awaited<ReturnType<typeof connectJsonRpcWebSocket>>
-      | undefined;
-    try {
-      previewUrl = await sandbox.getPreviewLink(remoteAppServerPort);
-      transport = await connectRemoteCodexAppServer(
-        toRemoteCodexWebSocketUrl(previewUrl),
-      );
-    } catch (error) {
-      await cleanupRemoteRun();
-      throw error;
-    }
-
-    return {
-      source: transport.source,
-      writeLine: transport.send,
-      cleanup: async () => {
-        await transport.close().catch(() => undefined);
-        await cleanupRemoteRun();
-      },
-      raw: {
-        transport: transport.raw,
-        previewUrl,
-        pidFilePath,
-        logFilePath,
-        port: remoteAppServerPort,
-        layout: target.layout,
-      },
-      inputItems,
-    };
-  }
-
   if (options.sandbox) {
     const handle = await options.sandbox.runAsync(
-      [options.provider?.binary ?? "codex", ...configArgs, "app-server"],
+      [
+        "env",
+        ...buildCodexCommandArgs(options.provider?.binary ?? "codex", [
+          ...configArgs,
+          "app-server",
+        ]),
+      ],
       {
-        cwd: options.cwd,
+        cwd: runtimeCwd,
         env,
       },
     );
@@ -1053,9 +870,12 @@ async function createRuntime(
   }
 
   const processHandle = spawnCommand({
-    command: options.provider?.binary ?? "codex",
-    args: [...configArgs, "app-server"],
-    cwd: options.cwd,
+    command: "env",
+    args: buildCodexCommandArgs(options.provider?.binary ?? "codex", [
+      ...configArgs,
+      "app-server",
+    ]),
+    cwd: runtimeCwd,
     env: {
       ...process.env,
       ...env,
@@ -1147,11 +967,11 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
           for (const event of toNormalizedCodexEvents(request.runId, message)) {
             sink.emitEvent(event);
             if (event.type === "text.delta") {
-              finalText = event.delta;
+              finalText += event.delta;
             }
           }
 
-          if (message.method === "thread/started") {
+          if (message.method === "thread/started" && !rootThreadId) {
             rootThreadId =
               ((message.params?.thread as Record<string, unknown> | undefined)
                 ?.id as string | undefined) ?? rootThreadId;
@@ -1172,7 +992,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
             return;
           }
 
-          if (message.method === "error") {
+          if (message.method === "error" && !shouldIgnoreCodexError(message)) {
             reject(message);
             return;
           }
@@ -1180,60 +1000,60 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       })().catch(reject);
     });
 
-    if (!runtime.client) {
-      await client.request("initialize", {
-        clientInfo: {
-          title: "OpenAgent",
-          name: "OpenAgent",
-          version: "0.1.0",
-        },
-        capabilities: {
-          experimentalApi: true,
-        },
-      });
-      await client.notify("initialized", {});
-    }
-
-    const cwd = request.options.cwd ?? process.cwd();
-    const threadResponse = request.run.resumeSessionId
-      ? await client.request<{ thread: { id: string } }>(
-          "thread/resume",
-          buildResumeParams(cwd, request.options, request),
-        )
-      : await client.request<{ thread: { id: string } }>(
-          "thread/start",
-          buildThreadParams(cwd, request.options, request),
-        );
-    rootThreadId = threadResponse.thread.id;
-    if ("bindThread" in client && typeof client.bindThread === "function") {
-      client.bindThread(threadResponse.thread.id);
-    }
-    sink.setSessionId(threadResponse.thread.id);
-    sink.emitRaw(
-      toRawEvent(
-        request.runId,
-        threadResponse,
-        request.run.resumeSessionId
-          ? "thread/resume:result"
-          : "thread/start:result",
-      ),
-    );
-
-    await client.request<{ turn?: { id?: string } }>("turn/start", {
-      threadId: threadResponse.thread.id,
-      input: runtime.inputItems,
-      approvalPolicy: isInteractiveApproval(request.options)
-        ? "untrusted"
-        : "never",
-      ...(buildTurnSandboxPolicy(request.options)
-        ? { sandboxPolicy: buildTurnSandboxPolicy(request.options) }
-        : {}),
-      model: request.run.model ?? null,
-      effort: null,
-      outputSchema: null,
-    });
-
     try {
+      if (!runtime.client) {
+        await client.request("initialize", {
+          clientInfo: {
+            title: "OpenAgent",
+            name: "OpenAgent",
+            version: "0.1.0",
+          },
+          capabilities: {
+            experimentalApi: true,
+          },
+        });
+        await client.notify("initialized", {});
+      }
+
+      const cwd = request.options.cwd ?? process.cwd();
+      const threadResponse = request.run.resumeSessionId
+        ? await client.request<{ thread: { id: string } }>(
+            "thread/resume",
+            buildResumeParams(cwd, request.options, request),
+          )
+        : await client.request<{ thread: { id: string } }>(
+            "thread/start",
+            buildThreadParams(cwd, request.options, request),
+          );
+      rootThreadId = threadResponse.thread.id;
+      if ("bindThread" in client && typeof client.bindThread === "function") {
+        client.bindThread(threadResponse.thread.id);
+      }
+      sink.setSessionId(threadResponse.thread.id);
+      sink.emitRaw(
+        toRawEvent(
+          request.runId,
+          threadResponse,
+          request.run.resumeSessionId
+            ? "thread/resume:result"
+            : "thread/start:result",
+        ),
+      );
+
+      const sandboxPolicy = buildTurnSandboxPolicy(request.options);
+      await client.request<{ turn?: { id?: string } }>("turn/start", {
+        threadId: threadResponse.thread.id,
+        input: runtime.inputItems,
+        approvalPolicy: isInteractiveApproval(request.options)
+          ? "untrusted"
+          : "never",
+        ...(sandboxPolicy ? { sandboxPolicy } : {}),
+        ...(runtime.turnStartOverrides ?? {}),
+        model: request.run.model ?? null,
+        effort: null,
+        outputSchema: null,
+      });
+
       const { text } = await completion;
       sink.complete({ text });
     } finally {

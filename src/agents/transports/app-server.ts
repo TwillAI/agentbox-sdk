@@ -220,6 +220,11 @@ export class JsonRpcLineClient<TNotification = unknown> {
         }
       }
 
+      const closeError = new Error("JSON-RPC transport closed.");
+      for (const pending of this.pending.values()) {
+        pending.reject(closeError);
+      }
+      this.pending.clear();
       this.notifications.finish();
     } catch (error) {
       for (const pending of this.pending.values()) {

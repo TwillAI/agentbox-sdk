@@ -1,6 +1,6 @@
 import { Daytona, type Sandbox as DaytonaSandboxObject } from "@daytonaio/sdk";
 
-import { SandboxDriver } from "../base";
+import { SandboxAdapter } from "../base";
 import type {
   AsyncCommandHandle,
   CommandEvent,
@@ -20,7 +20,7 @@ type DaytonaRaw = {
   sandbox?: DaytonaSandboxObject;
 };
 
-export class DaytonaSandboxDriver extends SandboxDriver<
+export class DaytonaSandboxAdapter extends SandboxAdapter<
   "daytona",
   DaytonaSandboxOptions,
   DaytonaRaw
@@ -117,11 +117,12 @@ export class DaytonaSandboxDriver extends SandboxDriver<
       options?.timeoutMs ? Math.ceil(options.timeoutMs / 1000) : undefined,
     );
 
+    const output = result.result ?? "";
     return {
       exitCode: result.exitCode,
-      stdout: result.result,
-      stderr: "",
-      combinedOutput: result.result,
+      stdout: output,
+      stderr: output,
+      combinedOutput: output,
       raw: result,
     };
   }
@@ -172,7 +173,9 @@ export class DaytonaSandboxDriver extends SandboxDriver<
       },
     );
 
+    const pollTimeoutMs = options?.timeoutMs ?? 0;
     const completion = (async () => {
+      const pollStart = Date.now();
       while (true) {
         let status;
         try {
@@ -190,6 +193,13 @@ export class DaytonaSandboxDriver extends SandboxDriver<
           if (!killed) {
             exitCode = status.exitCode;
           }
+          break;
+        }
+
+        if (pollTimeoutMs > 0 && Date.now() - pollStart > pollTimeoutMs) {
+          await sandbox.process.deleteSession(sessionId).catch(() => undefined);
+          killed = true;
+          exitCode = 130;
           break;
         }
 
@@ -259,6 +269,7 @@ export class DaytonaSandboxDriver extends SandboxDriver<
     }
 
     await sandbox.stop();
+    this.sandbox = undefined;
   }
 
   async delete(): Promise<void> {

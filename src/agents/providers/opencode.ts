@@ -20,7 +20,6 @@ import {
 import {
   assertHooksSupported,
   buildOpenCodePluginArtifacts,
-  hasConfiguredHooks,
 } from "../config/hooks";
 import { buildOpenCodeMcpConfig } from "../config/mcp";
 import { createRuntimeTarget } from "../config/runtime";
@@ -29,74 +28,17 @@ import { buildOpenCodeSubagentConfig } from "../config/subagents";
 import { fetchJson, streamSse } from "../transports/app-server";
 import { spawnCommand, waitForHttpReady } from "../transports/spawn";
 import { getAvailablePort } from "../../shared/network";
+import { shellQuote } from "../../shared/shell";
 
 type OpenCodeRuntime = {
   baseUrl: string;
   cleanup: () => Promise<void>;
   raw: unknown;
-  configPath?: string;
 };
 
-const SANDBOX_OPENCODE_PORTS = Array.from(
-  { length: 10 },
-  (_, index) => 4096 + index,
-);
-const sandboxOpenCodePortPool = new WeakMap<
-  object,
-  {
-    init?: Promise<void>;
-    available: number[];
-    inUse: Set<number>;
-  }
->();
-
-async function acquireSandboxOpenCodePort(
-  sandbox: NonNullable<AgentExecutionRequest<"opencode">["options"]["sandbox"]>,
-): Promise<number> {
-  const key = sandbox as object;
-  let pool = sandboxOpenCodePortPool.get(key);
-  if (!pool) {
-    pool = {
-      available: [...SANDBOX_OPENCODE_PORTS],
-      inUse: new Set<number>(),
-    };
-    pool.init = (async () => {
-      for (const port of SANDBOX_OPENCODE_PORTS) {
-        await sandbox.openPort(port);
-      }
-    })();
-    sandboxOpenCodePortPool.set(key, pool);
-  }
-
-  if (pool.init) {
-    await pool.init;
-    pool.init = undefined;
-  }
-
-  const port = pool.available.shift();
-  if (port === undefined) {
-    throw new Error("No available sandbox OpenCode ports.");
-  }
-  pool.inUse.add(port);
-  return port;
-}
-
-function releaseSandboxOpenCodePort(
-  sandbox: NonNullable<AgentExecutionRequest<"opencode">["options"]["sandbox"]>,
-  port: number,
-): void {
-  const pool = sandboxOpenCodePortPool.get(sandbox as object);
-  if (!pool) {
-    return;
-  }
-  if (!pool.inUse.delete(port)) {
-    return;
-  }
-  if (!pool.available.includes(port)) {
-    pool.available.push(port);
-    pool.available.sort((left, right) => left - right);
-  }
-}
+const SANDBOX_OPENCODE_PORT = 4096;
+const SANDBOX_OPENCODE_READY_TIMEOUT_MS = 90_000;
+const SHARED_OPENCODE_TARGET_ID = "shared-opencode-server";
 
 function toRawEvent(
   runId: string,
@@ -109,21 +51,6 @@ function toRawEvent(
     type,
     timestamp: new Date().toISOString(),
     payload,
-  };
-}
-
-function buildAuthHeaders(
-  options: AgentExecutionRequest<"opencode">["options"],
-): HeadersInit | undefined {
-  const password = options.provider?.password;
-  if (!password) {
-    return undefined;
-  }
-
-  const username = options.provider?.username ?? "opencode";
-  const token = Buffer.from(`${username}:${password}`).toString("base64");
-  return {
-    Authorization: `Basic ${token}`,
   };
 }
 
@@ -256,82 +183,14 @@ function createOpenCodePermissionEvent(
   ) as PermissionRequestedEvent;
 }
 
-async function createRuntime(
+function buildOpenCodeConfig(
   request: AgentExecutionRequest<"opencode">,
-): Promise<OpenCodeRuntime> {
-  if (
-    request.options.provider?.serverUrl &&
-    ((request.options.mcps?.length ?? 0) > 0 ||
-      (request.options.skills?.length ?? 0) > 0 ||
-      (request.options.subAgents?.length ?? 0) > 0 ||
-      (request.options.commands?.length ?? 0) > 0 ||
-      hasConfiguredHooks(request.options))
-  ) {
-    throw new Error(
-      "OpenCode serverUrl mode does not support OpenAgent-managed MCPs, skills, sub-agents, hooks, or commands. Start the runtime through OpenAgent instead.",
-    );
-  }
-
-  if (request.options.provider?.serverUrl) {
-    return {
-      baseUrl: request.options.provider.serverUrl.replace(/\/$/, ""),
-      cleanup: async () => undefined,
-      raw: { serverUrl: request.options.provider.serverUrl },
-    };
-  }
-
+  interactiveApproval: boolean,
+) {
   const options = request.options;
-  const plugins = assertHooksSupported(request.provider, options);
-  assertCommandsSupported(request.provider, options.commands);
-  const port =
-    options.provider?.port ??
-    (options.sandbox
-      ? await acquireSandboxOpenCodePort(options.sandbox)
-      : 4096);
-  const releasePort = () => {
-    if (options.provider?.port === undefined && options.sandbox) {
-      releaseSandboxOpenCodePort(options.sandbox, port);
-    }
-  };
-  if (options.sandbox && options.provider?.port !== undefined) {
-    await options.sandbox.openPort(port);
-  }
-
-  const target = await createRuntimeTarget(
-    request.provider,
-    request.runId,
-    options,
-  );
-  const opencodeHomeDir = path.join(target.layout.rootDir, "home");
-  const opencodeXdgConfigHome = path.join(opencodeHomeDir, ".config");
-  const opencodeDir = path.join(opencodeXdgConfigHome, "opencode");
-  const opencodeLayout = {
-    ...target.layout,
-    homeDir: opencodeHomeDir,
-    xdgConfigHome: opencodeXdgConfigHome,
-    opencodeDir,
-  };
-  const interactiveApproval = isInteractiveApproval(options);
-  const { artifacts: skillArtifacts, installCommands } =
-    await prepareSkillArtifacts(
-      request.provider,
-      options.skills,
-      opencodeLayout,
-    );
-  const pluginArtifacts = buildOpenCodePluginArtifacts(
-    plugins,
-    opencodeLayout.opencodeDir,
-  );
-
-  for (const artifact of [...skillArtifacts, ...pluginArtifacts]) {
-    await target.writeArtifact(artifact);
-  }
-  await installSkills(target, installCommands);
-
-  const configPath = path.join(opencodeLayout.opencodeDir, "openagent.json");
   const mcpConfig = buildOpenCodeMcpConfig(options.mcps);
   const commandsConfig = buildOpenCodeCommandsConfig(options.commands);
-  const openCodeConfig = {
+  return {
     $schema: "https://opencode.ai/config.json",
     ...(mcpConfig ? { mcp: mcpConfig } : {}),
     ...(commandsConfig ? { command: commandsConfig } : {}),
@@ -351,123 +210,174 @@ async function createRuntime(
       ...buildOpenCodeSubagentConfig(options.subAgents),
     },
   };
+}
 
+async function ensureSandboxOpenCodeServer(
+  request: AgentExecutionRequest<"opencode">,
+): Promise<OpenCodeRuntime> {
+  const sandbox = request.options.sandbox!;
+  const options = request.options;
+  const port = SANDBOX_OPENCODE_PORT;
+
+  await sandbox.openPort(port);
+
+  const healthCheck = await sandbox.run(
+    `curl -fsS http://127.0.0.1:${port}/global/health >/dev/null 2>&1`,
+    { cwd: options.cwd, timeoutMs: 5_000 },
+  );
+
+  if (healthCheck.exitCode === 0) {
+    const baseUrl = (await sandbox.getPreviewLink(port)).replace(/\/$/, "");
+    return {
+      baseUrl,
+      cleanup: async () => {},
+      raw: { baseUrl, port, reused: true },
+    };
+  }
+
+  const plugins = assertHooksSupported(request.provider, options);
+  assertCommandsSupported(request.provider, options.commands);
+  const interactiveApproval = isInteractiveApproval(options);
+
+  const target = await createRuntimeTarget(
+    request.provider,
+    SHARED_OPENCODE_TARGET_ID,
+    options,
+  );
+
+  const { artifacts: skillArtifacts, installCommands } =
+    await prepareSkillArtifacts(
+      request.provider,
+      options.skills,
+      target.layout,
+    );
+  const pluginArtifacts = buildOpenCodePluginArtifacts(
+    plugins,
+    target.layout.opencodeDir,
+  );
+
+  for (const artifact of [...skillArtifacts, ...pluginArtifacts]) {
+    await target.writeArtifact(artifact);
+  }
+
+  const configPath = path.join(target.layout.opencodeDir, "openagent.json");
+  const openCodeConfig = buildOpenCodeConfig(request, interactiveApproval);
   await target.writeArtifact({
     path: configPath,
     content: JSON.stringify(openCodeConfig, null, 2),
   });
 
   const commonEnv = {
-    ...target.env,
-    HOME: opencodeHomeDir,
-    XDG_CONFIG_HOME: opencodeXdgConfigHome,
     OPENCODE_CONFIG: configPath,
-    OPENCODE_CONFIG_DIR: opencodeLayout.opencodeDir,
+    OPENCODE_CONFIG_DIR: target.layout.opencodeDir,
     OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
   };
+  await installSkills(target, installCommands, commonEnv);
 
-  if (options.sandbox) {
-    const sandbox = options.sandbox;
-    const binary = options.provider?.binary ?? "opencode";
-    const pidFilePath = path.join(target.layout.rootDir, "opencode-serve.pid");
-    const logFilePath = path.join(target.layout.rootDir, "opencode-serve.log");
-    const serveEnv = {
-      ...(options.env ?? {}),
-      ...commonEnv,
-      ...(options.provider?.password
-        ? { OPENCODE_SERVER_PASSWORD: options.provider.password }
-        : {}),
-      ...(options.provider?.username
-        ? { OPENCODE_SERVER_USERNAME: options.provider.username }
-        : {}),
-    };
-    const launchCommand = [
-      `mkdir -p ${JSON.stringify(target.layout.rootDir)}`,
-      `(${[
-        `nohup ${[
-          binary,
-          "serve",
-          "--hostname",
-          "0.0.0.0",
-          "--port",
-          String(port),
-          ...(options.provider?.args ?? []),
-        ]
-          .map((part) => JSON.stringify(part))
-          .join(" ")} > ${JSON.stringify(logFilePath)} 2>&1 &`,
-        `echo $! > ${JSON.stringify(pidFilePath)}`,
-      ].join(" ")})`,
-    ].join(" && ");
-    const launchHandle = await sandbox.runAsync(launchCommand, {
-      cwd: options.cwd,
-      env: serveEnv,
-    });
-    const launchResult = await launchHandle.wait();
-    if (launchResult.exitCode !== 0) {
-      releasePort();
-      await target.cleanup().catch(() => undefined);
-      throw new Error(
-        `Could not start OpenCode server: ${launchResult.combinedOutput || launchResult.stderr}`,
-      );
-    }
-    let baseUrl;
-    try {
-      baseUrl = (await sandbox.getPreviewLink(port)).replace(/\/$/, "");
-      await waitForHttpReady(`${baseUrl}/global/health`, {
-        timeoutMs: 20_000,
-        init: {
-          headers: buildAuthHeaders(options),
-        },
-      });
-    } catch (error) {
-      await sandbox
-        .run(
-          `if [ -f ${JSON.stringify(pidFilePath)} ]; then kill \"$(cat ${JSON.stringify(pidFilePath)})\" >/dev/null 2>&1 || true; rm -f ${JSON.stringify(pidFilePath)}; fi`,
-          {
-            cwd: options.cwd,
-            env: serveEnv,
-            timeoutMs: 30_000,
-          },
-        )
-        .catch(() => undefined);
-      await target.cleanup().catch(() => undefined);
-      releasePort();
-      throw error;
-    }
+  const binary = options.provider?.binary ?? "opencode";
+  const pidFilePath = path.posix.join(
+    target.layout.rootDir,
+    "opencode-serve.pid",
+  );
+  const logFilePath = path.posix.join(
+    target.layout.rootDir,
+    "opencode-serve.log",
+  );
+  const serveEnv = { ...(options.env ?? {}), ...commonEnv };
+  const launchCommand = [
+    `mkdir -p ${shellQuote(target.layout.rootDir)}`,
+    `(${[
+      `nohup ${[
+        binary,
+        "serve",
+        "--hostname",
+        "0.0.0.0",
+        "--port",
+        String(port),
+        ...(options.provider?.args ?? []),
+      ]
+        .map(shellQuote)
+        .join(" ")} > ${shellQuote(logFilePath)} 2>&1 &`,
+      `echo $! > ${shellQuote(pidFilePath)}`,
+    ].join(" ")})`,
+  ].join(" && ");
 
-    return {
-      baseUrl: baseUrl!,
-      cleanup: async () => {
-        await sandbox
-          .run(
-            `if [ -f ${JSON.stringify(pidFilePath)} ]; then kill \"$(cat ${JSON.stringify(pidFilePath)})\" >/dev/null 2>&1 || true; rm -f ${JSON.stringify(pidFilePath)}; fi`,
-            {
-              cwd: options.cwd,
-              env: serveEnv,
-              timeoutMs: 30_000,
-            },
-          )
-          .catch(() => undefined);
-        await target.cleanup().catch(() => undefined);
-        releasePort();
-      },
-      raw: {
-        pidFilePath,
-        logFilePath,
-        baseUrl: baseUrl!,
-        layout: target.layout,
-      },
-      configPath,
-    };
+  const launchHandle = await sandbox.runAsync(launchCommand, {
+    cwd: options.cwd,
+    env: serveEnv,
+  });
+  const launchResult = await launchHandle.wait();
+  if (launchResult.exitCode !== 0) {
+    await target.cleanup().catch(() => undefined);
+    throw new Error(
+      `Could not start OpenCode server: ${launchResult.combinedOutput || launchResult.stderr}`,
+    );
   }
 
-  const hostPort = options.provider?.port ?? (await getAvailablePort());
+  const baseUrl = (await sandbox.getPreviewLink(port)).replace(/\/$/, "");
+  await waitForHttpReady(`${baseUrl}/global/health`, {
+    timeoutMs: SANDBOX_OPENCODE_READY_TIMEOUT_MS,
+  });
+
+  return {
+    baseUrl,
+    cleanup: async () => {
+      await target.cleanup().catch(() => undefined);
+    },
+    raw: { pidFilePath, logFilePath, baseUrl, layout: target.layout, port },
+  };
+}
+
+async function createLocalRuntime(
+  request: AgentExecutionRequest<"opencode">,
+): Promise<OpenCodeRuntime> {
+  const options = request.options;
+  const plugins = assertHooksSupported(request.provider, options);
+  assertCommandsSupported(request.provider, options.commands);
+  const interactiveApproval = isInteractiveApproval(options);
+
+  const target = await createRuntimeTarget(
+    request.provider,
+    request.runId,
+    options,
+  );
+
+  const { artifacts: skillArtifacts, installCommands } =
+    await prepareSkillArtifacts(
+      request.provider,
+      options.skills,
+      target.layout,
+    );
+  const pluginArtifacts = buildOpenCodePluginArtifacts(
+    plugins,
+    target.layout.opencodeDir,
+  );
+
+  for (const artifact of [...skillArtifacts, ...pluginArtifacts]) {
+    await target.writeArtifact(artifact);
+  }
+
+  const configPath = path.join(target.layout.opencodeDir, "openagent.json");
+  const openCodeConfig = buildOpenCodeConfig(request, interactiveApproval);
+  await target.writeArtifact({
+    path: configPath,
+    content: JSON.stringify(openCodeConfig, null, 2),
+  });
+
+  const commonEnv = {
+    OPENCODE_CONFIG: configPath,
+    OPENCODE_CONFIG_DIR: target.layout.opencodeDir,
+    OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
+  };
+  await installSkills(target, installCommands, commonEnv);
+
+  const hostPort = await getAvailablePort();
   const processHandle = spawnCommand({
     command: options.provider?.binary ?? "opencode",
     args: [
       "serve",
       "--hostname",
-      options.provider?.hostname ?? "127.0.0.1",
+      "127.0.0.1",
       "--port",
       String(hostPort),
       ...(options.provider?.args ?? []),
@@ -477,15 +387,9 @@ async function createRuntime(
       ...process.env,
       ...(options.env ?? {}),
       ...commonEnv,
-      ...(options.provider?.password
-        ? { OPENCODE_SERVER_PASSWORD: options.provider.password }
-        : {}),
-      ...(options.provider?.username
-        ? { OPENCODE_SERVER_USERNAME: options.provider.username }
-        : {}),
     },
   });
-  const baseUrl = `http://${options.provider?.hostname ?? "127.0.0.1"}:${hostPort}`;
+  const baseUrl = `http://127.0.0.1:${hostPort}`;
   await waitForHttpReady(`${baseUrl}/global/health`, { timeoutMs: 20_000 });
 
   return {
@@ -495,8 +399,16 @@ async function createRuntime(
       await target.cleanup();
     },
     raw: { processHandle, layout: target.layout },
-    configPath,
   };
+}
+
+async function createRuntime(
+  request: AgentExecutionRequest<"opencode">,
+): Promise<OpenCodeRuntime> {
+  if (request.options.sandbox) {
+    return ensureSandboxOpenCodeServer(request);
+  }
+  return createLocalRuntime(request);
 }
 
 export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
@@ -518,179 +430,174 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
       }),
     );
 
-    const headers = buildAuthHeaders(request.options);
-    const interactiveApproval = isInteractiveApproval(request.options);
-    const createdSession = request.run.resumeSessionId
-      ? null
-      : await fetchJson<{ id?: string; sessionId?: string }>(
-          `${runtime.baseUrl}/session`,
-          {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              ...(headers ?? {}),
-            },
-            body: JSON.stringify({
-              title: `OpenAgent ${request.runId}`,
-            }),
-          },
-        );
-    const sessionId =
-      request.run.resumeSessionId ??
-      createdSession?.id ??
-      createdSession?.sessionId;
-    if (!sessionId) {
-      throw new Error("OpenCode did not return a session id.");
-    }
-
     const sseAbort = new AbortController();
-    const sseTask = (async () => {
-      try {
-        for await (const event of streamSse(`${runtime.baseUrl}/event`, {
-          headers,
-          signal: sseAbort.signal,
-        })) {
-          let payload: unknown = event.data;
-          try {
-            payload = JSON.parse(event.data);
-          } catch {
-            // Preserve raw text payloads when event data is not JSON.
-          }
+    let sseTask: Promise<void> | undefined;
 
-          const raw = toRawEvent(
-            request.runId,
-            payload,
-            `sse:${event.event ?? "message"}`,
+    try {
+      const interactiveApproval = isInteractiveApproval(request.options);
+      const createdSession = request.run.resumeSessionId
+        ? null
+        : await fetchJson<{ id?: string; sessionId?: string }>(
+            `${runtime.baseUrl}/session`,
+            {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                title: `OpenAgent ${request.runId}`,
+              }),
+            },
           );
-          sink.emitRaw(raw);
-
-          const eventType =
-            typeof (payload as Record<string, unknown>)?.type === "string"
-              ? String((payload as Record<string, unknown>).type)
-              : event.event;
-          if (eventType === "permission.asked") {
-            const properties = (payload as Record<string, unknown>)
-              .properties as Record<string, unknown> | undefined;
-            if (
-              properties &&
-              typeof properties.sessionID === "string" &&
-              properties.sessionID === sessionId
-            ) {
-              const permissionEvent = createOpenCodePermissionEvent(
-                request,
-                raw,
-                payload as Record<string, unknown>,
-              );
-              const response = interactiveApproval
-                ? await sink.requestPermission(permissionEvent)
-                : {
-                    requestId: permissionEvent.requestId,
-                    decision: "allow" as const,
-                  };
-
-              await fetchJson<boolean>(
-                `${runtime.baseUrl}/session/${sessionId}/permissions/${permissionEvent.requestId}`,
-                {
-                  method: "POST",
-                  headers: {
-                    "content-type": "application/json",
-                    ...(headers ?? {}),
-                  },
-                  body: JSON.stringify({
-                    response:
-                      response.decision === "allow"
-                        ? response.remember
-                          ? "always"
-                          : "once"
-                        : "reject",
-                  }),
-                },
-              );
-            }
-            continue;
-          }
-
-          for (const normalized of normalizeRawAgentEvent(raw)) {
-            sink.emitEvent(normalized);
-          }
-        }
-      } catch {
-        // SSE is best effort here; the direct response is still authoritative.
+      const sessionId =
+        request.run.resumeSessionId ??
+        createdSession?.id ??
+        createdSession?.sessionId;
+      if (!sessionId) {
+        throw new Error("OpenCode did not return a session id.");
       }
-    })();
 
-    sink.setSessionId(sessionId);
-    sink.emitRaw(
-      toRawEvent(
-        request.runId,
-        createdSession ?? { sessionId },
-        request.run.resumeSessionId ? "session.resumed" : "session.created",
-      ),
-    );
-    sink.emitEvent(
-      createNormalizedEvent("message.started", {
-        provider: request.provider,
-        runId: request.runId,
-      }),
-    );
+      sseTask = (async () => {
+        try {
+          for await (const event of streamSse(`${runtime.baseUrl}/event`, {
+            signal: sseAbort.signal,
+          })) {
+            let payload: unknown = event.data;
+            try {
+              payload = JSON.parse(event.data);
+            } catch {
+              // Preserve raw text payloads when event data is not JSON.
+            }
 
-    const response = await fetchJson<unknown>(
-      `${runtime.baseUrl}/session/${sessionId}/message`,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...(headers ?? {}),
-        },
-        body: JSON.stringify({
-          ...(request.run.model
-            ? { model: toOpenCodeModel(request.run.model) }
-            : {}),
-          agent: "openagent",
-          parts: mapToOpenCodeParts(inputParts),
+            const raw = toRawEvent(
+              request.runId,
+              payload,
+              `sse:${event.event ?? "message"}`,
+            );
+            sink.emitRaw(raw);
+
+            const eventType =
+              typeof (payload as Record<string, unknown>)?.type === "string"
+                ? String((payload as Record<string, unknown>).type)
+                : event.event;
+            if (eventType === "permission.asked") {
+              const properties = (payload as Record<string, unknown>)
+                .properties as Record<string, unknown> | undefined;
+              if (
+                properties &&
+                typeof properties.sessionID === "string" &&
+                properties.sessionID === sessionId
+              ) {
+                const permissionEvent = createOpenCodePermissionEvent(
+                  request,
+                  raw,
+                  payload as Record<string, unknown>,
+                );
+                const response = interactiveApproval
+                  ? await sink.requestPermission(permissionEvent)
+                  : {
+                      requestId: permissionEvent.requestId,
+                      decision: "allow" as const,
+                    };
+
+                await fetchJson<boolean>(
+                  `${runtime.baseUrl}/session/${sessionId}/permissions/${permissionEvent.requestId}`,
+                  {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({
+                      response:
+                        response.decision === "allow"
+                          ? response.remember
+                            ? "always"
+                            : "once"
+                          : "reject",
+                    }),
+                  },
+                );
+              }
+              continue;
+            }
+
+            for (const normalized of normalizeRawAgentEvent(raw)) {
+              sink.emitEvent(normalized);
+            }
+          }
+        } catch {
+          // SSE is best effort; the direct response is authoritative.
+        }
+      })();
+
+      sink.setSessionId(sessionId);
+      sink.emitRaw(
+        toRawEvent(
+          request.runId,
+          createdSession ?? { sessionId },
+          request.run.resumeSessionId ? "session.resumed" : "session.created",
+        ),
+      );
+      sink.emitEvent(
+        createNormalizedEvent("message.started", {
+          provider: request.provider,
+          runId: request.runId,
         }),
-      },
-    );
+      );
 
-    const rawResponse = toRawEvent(request.runId, response, "message.response");
-    sink.emitRaw(rawResponse);
-    for (const event of normalizeRawAgentEvent(rawResponse)) {
-      sink.emitEvent(event);
-    }
+      const response = await fetchJson<unknown>(
+        `${runtime.baseUrl}/session/${sessionId}/message`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            ...(request.run.model
+              ? { model: toOpenCodeModel(request.run.model) }
+              : {}),
+            agent: "openagent",
+            parts: mapToOpenCodeParts(inputParts),
+          }),
+        },
+      );
 
-    const text = extractText(response);
-    if (text) {
+      const rawResponse = toRawEvent(
+        request.runId,
+        response,
+        "message.response",
+      );
+      sink.emitRaw(rawResponse);
+      for (const event of normalizeRawAgentEvent(rawResponse)) {
+        sink.emitEvent(event);
+      }
+
+      const text = extractText(response);
+      if (text) {
+        sink.emitEvent(
+          createNormalizedEvent(
+            "text.delta",
+            {
+              provider: request.provider,
+              runId: request.runId,
+            },
+            { delta: text },
+          ),
+        );
+      }
       sink.emitEvent(
         createNormalizedEvent(
-          "text.delta",
+          "run.completed",
           {
             provider: request.provider,
             runId: request.runId,
           },
-          {
-            delta: text,
-          },
+          { text },
         ),
       );
-    }
-    sink.emitEvent(
-      createNormalizedEvent(
-        "run.completed",
-        {
-          provider: request.provider,
-          runId: request.runId,
-        },
-        {
-          text,
-        },
-      ),
-    );
 
-    sseAbort.abort();
-    await sseTask;
-    try {
+      sseAbort.abort();
+      await sseTask;
       sink.complete({ text });
     } finally {
+      sseAbort.abort();
+      if (sseTask) {
+        await sseTask.catch(() => undefined);
+      }
       await runtime.cleanup().catch(() => undefined);
     }
 

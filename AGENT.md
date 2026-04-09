@@ -7,7 +7,7 @@ OpenAgent is a Bun-friendly TypeScript package for running coding agents and san
 The main goal of this package is low-cost swapping:
 
 - swap `codex`, `opencode`, and `claude-code` behind one `Agent` abstraction
-- swap `local-docker`, `modal`, and `daytona` behind one `Sandbox` abstraction
+- swap `local-docker`, `modal`, `daytona`, and `e2b` behind one `Sandbox` abstraction
 - keep provider-specific behavior available, but only behind explicit escape hatches
 
 ## Core API Rules
@@ -86,6 +86,9 @@ Provider-specific settings belong under `provider`.
 ## Important Runtime Notes
 
 - `local-docker` requires explicit port publishing for host-reachable services like OpenCode.
+- `e2b` uses template name/tag references for `image`, not Docker tags or provider image ids.
+- `e2b` runtime sizing is set at template build time; `Sandbox(..., { resources })` is intentionally unsupported there.
+- `e2b` exposes one timeout/lifecycle model, so combining `idleTimeoutMs` and `autoStopMs` should fail clearly.
 - Codex uses an env-driven login/setup path when `OPENAI_API_KEY` is present.
 - Claude Code over `--sdk-url` is sensitive to websocket startup ordering; the server must drive the initial user message correctly.
 - Resume support is run-scoped and uses `resumeSessionId`.

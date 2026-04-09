@@ -15,6 +15,13 @@
     "forceConsistentCasingInFileNames": true,
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
+    "baseUrl": ".",
+    "paths": {
+      "openagent": ["./src/index.ts"],
+      "openagent/agents": ["./src/agents/index.ts"],
+      "openagent/events": ["./src/events/index.ts"],
+      "openagent/sandboxes": ["./src/sandboxes/index.ts"]
+    },
     "outDir": "dist",
     "rootDir": "."
   },

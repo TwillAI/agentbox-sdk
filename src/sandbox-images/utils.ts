@@ -59,6 +59,22 @@ export function buildDaytonaSnapshotName(
   return `${name}-${hash}`;
 }
 
+export function buildE2bTemplateReference(
+  image: SandboxImageDefinition,
+  prefix = "openagent",
+): string {
+  const hash = createHash("sha256")
+    .update(JSON.stringify(image))
+    .digest("hex")
+    .slice(0, 12);
+  const safePrefix = sanitizeName(prefix).replace(/\//g, "-");
+  const safeName = sanitizeName(image.name ?? "sandbox-image").replace(
+    /\//g,
+    "-",
+  );
+  return `${safePrefix}-${safeName}:${hash}`;
+}
+
 function sanitizeName(value: string): string {
   return value
     .toLowerCase()

@@ -1,4 +1,4 @@
-export type SandboxProviderName = "local-docker" | "modal" | "daytona";
+export type SandboxProviderName = "local-docker" | "modal" | "daytona" | "e2b";
 
 export interface CommandOptions {
   cwd?: string;
@@ -102,6 +102,24 @@ export interface DaytonaProviderOptions {
   public?: boolean;
 }
 
+export interface E2bProviderOptions {
+  apiKey?: string;
+  accessToken?: string;
+  domain?: string;
+  apiUrl?: string;
+  sandboxUrl?: string;
+  debug?: boolean;
+  requestTimeoutMs?: number;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+  lifecycle?: {
+    onTimeout?: "pause" | "kill";
+    autoResume?: boolean;
+  };
+  secure?: boolean;
+  allowInternetAccess?: boolean;
+}
+
 export interface LocalDockerSandboxOptions extends SandboxOptionsBase {
   provider?: LocalDockerProviderOptions;
 }
@@ -114,10 +132,15 @@ export interface DaytonaSandboxOptions extends SandboxOptionsBase {
   provider?: DaytonaProviderOptions;
 }
 
+export interface E2bSandboxOptions extends SandboxOptionsBase {
+  provider?: E2bProviderOptions;
+}
+
 export type SandboxOptionsMap = {
   "local-docker": LocalDockerSandboxOptions;
   modal: ModalSandboxOptions;
   daytona: DaytonaSandboxOptions;
+  e2b: E2bSandboxOptions;
 };
 
 export type SandboxOptions<

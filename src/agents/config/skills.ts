@@ -1,6 +1,7 @@
 import path from "node:path";
 
 import type { AgentProviderName } from "../types";
+import { shellQuote } from "../../shared/shell";
 import type {
   AgentSkillConfig,
   RuntimeTarget,
@@ -30,7 +31,7 @@ function buildSkillsInstallerCommand(
 ): string {
   const repo = skill.repo ?? "https://github.com/anthropics/skills";
   const agent = provider === "claude-code" ? "claude-code" : provider;
-  return `npx skills add ${repo} -g --skill ${skill.name} --agent ${agent} -y`;
+  return `npx skills add ${shellQuote(repo)} -g --skill ${shellQuote(skill.name)} --agent ${shellQuote(agent)} -y`;
 }
 
 export async function prepareSkillArtifacts(
@@ -91,8 +92,9 @@ export function buildSkillsSystemAppendix(
 export async function installSkills(
   target: RuntimeTarget,
   installCommands: string[],
+  extraEnv?: Record<string, string>,
 ): Promise<void> {
   for (const command of installCommands) {
-    await target.runCommand(command);
+    await target.runCommand(command, extraEnv);
   }
 }

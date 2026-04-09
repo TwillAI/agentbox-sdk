@@ -29,6 +29,8 @@ import {
   type SdkWsTransport,
 } from "../transports/sdk-ws";
 import { spawnCommand } from "../transports/spawn";
+import { linesFromTextChunks } from "../../shared/streams";
+import type { AsyncCommandHandle, CommandResult } from "../../sandboxes";
 
 type ClaudeRuntime = {
   transport: SdkWsTransport;
@@ -41,6 +43,7 @@ type SharedRemoteRelay = {
   relayPort: number;
   relayPath: string;
   previewUrl: string;
+  handle?: AsyncCommandHandle;
 };
 
 type SharedRemoteHostConnection = {
@@ -50,10 +53,6 @@ type SharedRemoteHostConnection = {
 
 const REMOTE_SDK_RELAY_PORT = 43180;
 const REMOTE_SDK_RELAY_PATH = "/tmp/openagent/claude-code/relay.mjs";
-const sharedRemoteRelayBySandbox = new WeakMap<
-  object,
-  Promise<SharedRemoteRelay>
->();
 const sharedRemoteConnectionBySandbox = new WeakMap<
   object,
   Promise<SharedRemoteHostConnection>
@@ -234,11 +233,6 @@ async function prepareClaudeRuntime(
   const env = {
     ...(options.env ?? {}),
     ...target.env,
-    ...(provider?.sessionAccessToken
-      ? {
-          CLAUDE_CODE_SESSION_ACCESS_TOKEN: provider.sessionAccessToken,
-        }
-      : {}),
   };
 
   return {
@@ -624,7 +618,14 @@ async function connectRemoteTransport(
   while (Date.now() - startedAt < 30_000) {
     const client = new SharedSdkWsConnection(url);
     try {
-      await client.start();
+      await Promise.race([
+        client.start(),
+        sleep(2_000).then(() => {
+          throw new Error(
+            `Timed out connecting to remote SDK bridge at ${url}.`,
+          );
+        }),
+      ]);
       return client;
     } catch (error) {
       lastError = error;
@@ -638,8 +639,11 @@ async function connectRemoteTransport(
   );
 }
 
-async function canConnectToRemoteRelay(url: string): Promise<boolean> {
-  const client = new SharedSdkWsConnection(url);
+async function canConnectToRemoteRelay(previewUrl: string): Promise<boolean> {
+  const parsed = new URL(toWebSocketUrl(previewUrl));
+  parsed.searchParams.set("role", "claude");
+  parsed.searchParams.set("runId", "__probe__");
+  const client = new SharedSdkWsConnection(parsed.toString());
   try {
     await Promise.race([
       client.start(),
@@ -656,14 +660,11 @@ async function canConnectToRemoteRelay(url: string): Promise<boolean> {
 }
 
 async function ensureSharedRemoteConnection(
-  request: AgentExecutionRequest<"claude-code">,
-  relay: SharedRemoteRelay,
+  sandbox: NonNullable<
+    AgentExecutionRequest<"claude-code">["options"]["sandbox"]
+  >,
+  previewUrl: string,
 ): Promise<SharedRemoteHostConnection> {
-  const sandbox = request.options.sandbox;
-  if (!sandbox) {
-    throw new Error("Remote sandbox runtime requires a sandbox instance.");
-  }
-
   const key = sandbox as object;
   const existing = sharedRemoteConnectionBySandbox.get(key);
   if (existing) {
@@ -683,12 +684,9 @@ async function ensureSharedRemoteConnection(
   }
 
   const created = (async () => {
-    const url = toSharedHostWebSocketUrl(relay.previewUrl);
+    const url = toSharedHostWebSocketUrl(previewUrl);
     const connection = await connectRemoteTransport(url);
-    return {
-      previewUrl: relay.previewUrl,
-      connection,
-    };
+    return { previewUrl, connection };
   })();
 
   sharedRemoteConnectionBySandbox.set(key, created);
@@ -700,90 +698,67 @@ async function ensureSharedRemoteConnection(
   }
 }
 
-async function ensureSharedRemoteRelay(
+async function ensureRemoteRelay(
   request: AgentExecutionRequest<"claude-code">,
   prepared: Awaited<ReturnType<typeof prepareClaudeRuntime>>,
 ): Promise<SharedRemoteRelay> {
-  const sandbox = request.options.sandbox;
-  if (!sandbox) {
-    throw new Error("Remote sandbox runtime requires a sandbox instance.");
+  const sandbox = request.options.sandbox!;
+  await sandbox.openPort(REMOTE_SDK_RELAY_PORT);
+  const previewUrl = await sandbox.getPreviewLink(REMOTE_SDK_RELAY_PORT);
+
+  if (await canConnectToRemoteRelay(previewUrl)) {
+    return {
+      relayPort: REMOTE_SDK_RELAY_PORT,
+      relayPath: REMOTE_SDK_RELAY_PATH,
+      previewUrl,
+    };
   }
 
-  const key = sandbox as object;
-  const existing = sharedRemoteRelayBySandbox.get(key);
-  if (existing) {
-    try {
-      return await existing;
-    } catch {
-      sharedRemoteRelayBySandbox.delete(key);
-    }
-  }
+  await prepared.target.writeArtifact({
+    path: REMOTE_SDK_RELAY_PATH,
+    content: createRemoteSdkRelayScript(),
+  });
 
-  const created = (async () => {
-    await sandbox.openPort(REMOTE_SDK_RELAY_PORT);
-    const previewUrl = await sandbox.getPreviewLink(REMOTE_SDK_RELAY_PORT);
-    await prepared.target.writeArtifact({
-      path: REMOTE_SDK_RELAY_PATH,
-      content: createRemoteSdkRelayScript(),
+  const relayLogPath = "/tmp/openagent/claude-code/relay.log";
+  const relayHandle = await sandbox.runAsync(
+    [
+      `mkdir -p ${shellQuote(path.posix.dirname(REMOTE_SDK_RELAY_PATH))}`,
+      `mkdir -p ${shellQuote(path.posix.dirname(relayLogPath))}`,
+      `node ${shellQuote(REMOTE_SDK_RELAY_PATH)} ${shellQuote(String(REMOTE_SDK_RELAY_PORT))} > ${shellQuote(relayLogPath)} 2>&1`,
+    ].join(" && "),
+    {
+      cwd: request.options.cwd,
+      env: { ...prepared.env, IS_SANDBOX: "1" },
+    },
+  );
+  let relayExit: CommandResult | unknown;
+  void relayHandle
+    .wait()
+    .then((result) => {
+      relayExit = result;
+    })
+    .catch((error) => {
+      relayExit = error;
     });
 
-    const probeUrl = toSharedHostWebSocketUrl(previewUrl);
-    if (await canConnectToRemoteRelay(probeUrl)) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 30_000) {
+    if (await canConnectToRemoteRelay(previewUrl)) {
       return {
         relayPort: REMOTE_SDK_RELAY_PORT,
         relayPath: REMOTE_SDK_RELAY_PATH,
         previewUrl,
+        handle: relayHandle,
       };
     }
-
-    const relayLogPath = "/tmp/openagent/claude-code/relay.log";
-    const relayStart = await sandbox.runAsync(
-      [
-        `mkdir -p ${shellQuote(path.posix.dirname(REMOTE_SDK_RELAY_PATH))}`,
-        `mkdir -p ${shellQuote(path.posix.dirname(relayLogPath))}`,
-        `nohup node ${shellQuote(REMOTE_SDK_RELAY_PATH)} ${shellQuote(
-          String(REMOTE_SDK_RELAY_PORT),
-        )} > ${shellQuote(relayLogPath)} 2>&1 &`,
-      ].join(" && "),
-      {
-        cwd: request.options.cwd,
-        env: {
-          ...prepared.env,
-          IS_SANDBOX: "1",
-        },
-      },
-    );
-    const relayStartResult = await relayStart.wait();
-    if (relayStartResult.exitCode !== 0) {
-      throw new Error(
-        `Could not start shared Claude relay: ${relayStartResult.combinedOutput || relayStartResult.stderr}`,
-      );
+    if (relayExit !== undefined) {
+      break;
     }
-
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < 30_000) {
-      if (await canConnectToRemoteRelay(probeUrl)) {
-        return {
-          relayPort: REMOTE_SDK_RELAY_PORT,
-          relayPath: REMOTE_SDK_RELAY_PATH,
-          previewUrl,
-        };
-      }
-      await sleep(250);
-    }
-
-    throw new Error(
-      `Timed out waiting for shared Claude relay on ${previewUrl}.`,
-    );
-  })();
-
-  sharedRemoteRelayBySandbox.set(key, created);
-  try {
-    return await created;
-  } catch (error) {
-    sharedRemoteRelayBySandbox.delete(key);
-    throw error;
+    await sleep(250);
   }
+
+  await relayHandle.kill().catch(() => undefined);
+  throw new Error(`Timed out waiting for Claude relay on ${previewUrl}.`);
 }
 
 async function createLocalRuntime(
@@ -848,23 +823,9 @@ async function createRemoteSandboxRuntime(
   request: AgentExecutionRequest<"claude-code">,
   prepared: Awaited<ReturnType<typeof prepareClaudeRuntime>>,
 ): Promise<ClaudeRuntime> {
-  const sandbox = request.options.sandbox;
-  if (!sandbox) {
-    throw new Error("Remote sandbox runtime requires a sandbox instance.");
-  }
+  const sandbox = request.options.sandbox!;
+  const relay = await ensureRemoteRelay(request, prepared);
 
-  let relay = await ensureSharedRemoteRelay(request, prepared);
-  let transport: SdkWsTransport;
-  try {
-    const sharedConnection = await ensureSharedRemoteConnection(request, relay);
-    transport = sharedConnection.connection.createChannel(request.runId);
-  } catch {
-    sharedRemoteRelayBySandbox.delete(sandbox as object);
-    sharedRemoteConnectionBySandbox.delete(sandbox as object);
-    relay = await ensureSharedRemoteRelay(request, prepared);
-    const sharedConnection = await ensureSharedRemoteConnection(request, relay);
-    transport = sharedConnection.connection.createChannel(request.runId);
-  }
   const args = prepared.buildArgs(
     toClaudeRelayUrl(relay.relayPort, request.runId),
   );
@@ -872,13 +833,16 @@ async function createRemoteSandboxRuntime(
     [request.options.provider?.binary ?? "claude", ...args],
     {
       cwd: request.options.cwd,
-      env: {
-        ...prepared.env,
-        IS_SANDBOX: "1",
-      },
+      env: { ...prepared.env, IS_SANDBOX: "1" },
       pty: true,
     },
   );
+
+  const sharedConnection = await ensureSharedRemoteConnection(
+    sandbox,
+    relay.previewUrl,
+  );
+  const transport = sharedConnection.connection.createChannel(request.runId);
 
   return {
     transport,
@@ -887,12 +851,7 @@ async function createRemoteSandboxRuntime(
       await transport.close().catch(() => undefined);
       await prepared.target.cleanup();
     },
-    raw: {
-      transport,
-      handle,
-      relay,
-      layout: prepared.target.layout,
-    },
+    raw: { transport, handle, relay, layout: prepared.target.layout },
     initializeRequest: prepared.initializeRequest,
   };
 }
@@ -913,6 +872,44 @@ async function createRuntime(
   return createLocalRuntime(request, prepared);
 }
 
+function buildDirectClaudeArgs(
+  buildArgs: (sdkUrl: string) => string[],
+  prompt: string,
+): string[] {
+  const args = buildArgs("ws://127.0.0.1:9/");
+  const directArgs: string[] = [];
+
+  for (let index = 0; index < args.length; index += 1) {
+    const current = args[index];
+    if (current === undefined) {
+      continue;
+    }
+    if (current === "--sdk-url" || current === "--input-format") {
+      index += 1;
+      continue;
+    }
+    directArgs.push(current);
+  }
+
+  if (!directArgs.includes("--verbose")) {
+    const printIndex = directArgs.indexOf("--print");
+    if (printIndex === -1) {
+      directArgs.unshift("--verbose");
+    } else {
+      directArgs.splice(printIndex + 1, 0, "--verbose");
+    }
+  }
+
+  const promptIndex = directArgs.lastIndexOf("-p");
+  if (promptIndex !== -1 && promptIndex + 1 < directArgs.length) {
+    directArgs[promptIndex + 1] = prompt;
+  } else {
+    directArgs.push("-p", prompt);
+  }
+
+  return directArgs;
+}
+
 export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code"> {
   async execute(
     request: AgentExecutionRequest<"claude-code">,
@@ -923,6 +920,205 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       request.run.input,
     );
     const userContent = mapToClaudeUserContent(inputParts);
+
+    if (
+      request.options.sandbox?.provider === "e2b" &&
+      typeof userContent === "string" &&
+      !request.run.systemPrompt &&
+      !request.options.subAgents?.length
+    ) {
+      const prepared = await prepareClaudeRuntime(request);
+      const args = buildDirectClaudeArgs(prepared.buildArgs, userContent);
+      const handle = await request.options.sandbox.runAsync(
+        [request.options.provider?.binary ?? "claude", ...args],
+        {
+          cwd: request.options.cwd,
+          env: {
+            ...prepared.env,
+            IS_SANDBOX: "1",
+          },
+          timeoutMs: 0,
+        },
+      );
+
+      sink.setRaw({
+        handle,
+        layout: prepared.target.layout,
+        mode: "e2b-direct",
+      });
+      sink.setAbort(async () => {
+        await handle.kill().catch(() => undefined);
+        await handle.wait().catch(() => undefined);
+        await prepared.target.cleanup().catch(() => undefined);
+      });
+      sink.emitEvent(
+        createNormalizedEvent("run.started", {
+          provider: request.provider,
+          runId: request.runId,
+        }),
+      );
+
+      const completion = new Promise<{ text: string }>((resolve, reject) => {
+        let accumulatedText = "";
+
+        async function* stdoutChunks() {
+          for await (const event of handle) {
+            if (event.type === "stdout" && event.chunk) {
+              yield event.chunk;
+            }
+          }
+        }
+
+        void (async () => {
+          for await (const line of linesFromTextChunks(stdoutChunks())) {
+            const trimmed = line.trim();
+            if (!trimmed) {
+              continue;
+            }
+
+            let message: SdkWsMessage;
+            try {
+              message = JSON.parse(trimmed) as SdkWsMessage;
+            } catch {
+              continue;
+            }
+
+            sink.emitRaw(toRawEvent(request.runId, message, message.type));
+
+            if (message.type === "system" && message.subtype === "init") {
+              const sessionId = String(message.session_id ?? "");
+              if (sessionId) {
+                sink.setSessionId(sessionId);
+              }
+              sink.emitEvent(
+                createNormalizedEvent("message.started", {
+                  provider: request.provider,
+                  runId: request.runId,
+                }),
+              );
+              continue;
+            }
+
+            if (message.type === "stream_event") {
+              const delta = extractStreamDelta(message);
+              if (delta) {
+                accumulatedText += delta;
+                sink.emitEvent(
+                  createNormalizedEvent(
+                    "text.delta",
+                    {
+                      provider: request.provider,
+                      runId: request.runId,
+                    },
+                    { delta },
+                  ),
+                );
+              }
+              continue;
+            }
+
+            if (message.type === "assistant") {
+              const text = extractAssistantText(message);
+              if (text) {
+                accumulatedText = text;
+                sink.emitEvent(
+                  createNormalizedEvent(
+                    "text.delta",
+                    {
+                      provider: request.provider,
+                      runId: request.runId,
+                    },
+                    { delta: text },
+                  ),
+                );
+              }
+
+              sink.emitEvent(
+                createNormalizedEvent(
+                  "message.completed",
+                  {
+                    provider: request.provider,
+                    runId: request.runId,
+                  },
+                  { text },
+                ),
+              );
+              continue;
+            }
+
+            if (message.type === "result") {
+              if (String(message.subtype ?? "success") === "success") {
+                resolve({ text: accumulatedText });
+              } else {
+                reject(
+                  new Error(
+                    String(
+                      message.result ??
+                        message.error ??
+                        "Claude Code run failed.",
+                    ),
+                  ),
+                );
+              }
+              return;
+            }
+
+            if (
+              message.type === "auth_status" &&
+              message.authenticated === false
+            ) {
+              reject(
+                new Error("Claude Code reported an authentication failure."),
+              );
+              return;
+            }
+
+            if (message.type === "control_request") {
+              reject(
+                new Error(
+                  "Claude Code direct E2B mode does not yet support interactive control requests.",
+                ),
+              );
+              return;
+            }
+          }
+
+          const result = await handle.wait().catch((error) => error);
+          reject(
+            new Error(
+              result instanceof Error
+                ? String(result)
+                : "Claude Code direct E2B mode ended before returning a result.",
+            ),
+          );
+        })().catch(reject);
+      });
+
+      try {
+        const { text } = await completion;
+        await handle.wait().catch(() => undefined);
+        sink.emitEvent(
+          createNormalizedEvent(
+            "run.completed",
+            { provider: request.provider, runId: request.runId },
+            { text },
+          ),
+        );
+        sink.complete({ text });
+      } catch (error) {
+        await handle.kill().catch(() => undefined);
+        await handle.wait().catch(() => undefined);
+        sink.fail(error);
+      } finally {
+        await prepared.target.cleanup().catch(() => undefined);
+      }
+
+      return async () => {
+        await handle.kill().catch(() => undefined);
+        await handle.wait().catch(() => undefined);
+      };
+    }
+
     const runtime = await createRuntime(request);
     sink.setRaw(runtime.raw);
     sink.setAbort(runtime.cleanup);

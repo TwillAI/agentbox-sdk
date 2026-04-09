@@ -2,6 +2,16 @@ import path from "node:path";
 
 import type { AgentMcpConfig, TextArtifact } from "./types";
 
+const SAFE_TOML_KEY = /^[a-zA-Z0-9_-]+$/;
+
+function assertSafeTomlKey(name: string, context: string): void {
+  if (!SAFE_TOML_KEY.test(name)) {
+    throw new Error(
+      `${context} name ${JSON.stringify(name)} contains characters that are not safe for TOML keys. Use only alphanumeric characters, hyphens, and underscores.`,
+    );
+  }
+}
+
 function tomlString(value: string): string {
   return JSON.stringify(value);
 }
@@ -110,6 +120,8 @@ export function buildCodexConfigToml(
     if (mcp.enabled === false) {
       continue;
     }
+
+    assertSafeTomlKey(mcp.name, "MCP server");
 
     if (mcp.type === "remote") {
       if (mcp.headers && Object.keys(mcp.headers).length > 0) {

@@ -48,26 +48,27 @@ function handleIncomingMessage(
     .filter(Boolean);
 
   for (const line of lines) {
+    let message: SdkWsMessage;
     try {
-      const message = JSON.parse(line) as SdkWsMessage;
-      if (
-        message.type === "control_response" &&
-        typeof message.response === "object" &&
-        message.response !== null
-      ) {
-        const requestId = String(
-          (message.response as Record<string, unknown>).request_id ?? "",
-        );
-        const pending = pendingResponses.get(requestId);
-        if (pending) {
-          pendingResponses.delete(requestId);
-          pending.resolve(message);
-        }
-      }
-      messagesQueue.push(message);
-    } catch (error) {
-      messagesQueue.fail(error);
+      message = JSON.parse(line) as SdkWsMessage;
+    } catch {
+      continue;
     }
+    if (
+      message.type === "control_response" &&
+      typeof message.response === "object" &&
+      message.response !== null
+    ) {
+      const requestId = String(
+        (message.response as Record<string, unknown>).request_id ?? "",
+      );
+      const pending = pendingResponses.get(requestId);
+      if (pending) {
+        pendingResponses.delete(requestId);
+        pending.resolve(message);
+      }
+    }
+    messagesQueue.push(message);
   }
 }
 
@@ -109,6 +110,9 @@ export class SdkWsServer implements SdkWsTransport {
         }
       });
     });
+    this.server.on("error", (error) => {
+      this.messagesQueue.fail(error);
+    });
   }
 
   async waitForConnection(timeoutMs = 15_000): Promise<void> {
@@ -120,13 +124,16 @@ export class SdkWsServer implements SdkWsTransport {
 
   async send(message: SdkWsMessage): Promise<void> {
     await this.waitForConnection();
+    const socket = this.socket;
+    if (!socket) {
+      throw new Error("SDK WebSocket server has no active connection.");
+    }
     await new Promise<void>((resolve, reject) => {
-      this.socket?.send(`${JSON.stringify(message)}\n`, (error) => {
+      socket.send(`${JSON.stringify(message)}\n`, (error) => {
         if (error) {
           reject(error);
           return;
         }
-
         resolve();
       });
     });
@@ -247,13 +254,16 @@ export class SdkWsClient implements SdkWsTransport {
 
   async send(message: SdkWsMessage): Promise<void> {
     await this.waitForConnection();
+    const socket = this.socket;
+    if (!socket) {
+      throw new Error("SDK WebSocket client has no active connection.");
+    }
     await new Promise<void>((resolve, reject) => {
-      this.socket?.send(`${JSON.stringify(message)}\n`, (error) => {
+      socket.send(`${JSON.stringify(message)}\n`, (error) => {
         if (error) {
           reject(error);
           return;
         }
-
         resolve();
       });
     });
@@ -395,9 +405,12 @@ class SharedSdkWsChannel implements SdkWsTransport, ChannelLike {
   }
 }
 
+const MAX_PENDING_MESSAGES_PER_RUN = 1000;
+
 export class SharedSdkWsConnection {
   private socket?: WebSocket;
   private readonly channels = new Map<string, SharedSdkWsChannel>();
+  private readonly pendingMessages = new Map<string, SdkWsMessage[]>();
 
   constructor(private readonly url: string) {}
 
@@ -425,9 +438,16 @@ export class SharedSdkWsConnection {
           if (!envelope.runId || !envelope.message) {
             continue;
           }
-          this.channels
-            .get(envelope.runId)
-            ?.handleIncomingMessage(envelope.message);
+          const channel = this.channels.get(envelope.runId);
+          if (channel) {
+            channel.handleIncomingMessage(envelope.message);
+            continue;
+          }
+          const pending = this.pendingMessages.get(envelope.runId) ?? [];
+          if (pending.length < MAX_PENDING_MESSAGES_PER_RUN) {
+            pending.push(envelope.message);
+            this.pendingMessages.set(envelope.runId, pending);
+          }
         } catch (error) {
           const failure =
             error instanceof Error
@@ -489,18 +509,28 @@ export class SharedSdkWsConnection {
       this.channels.delete(runId);
     });
     this.channels.set(runId, channel);
+    const pending = this.pendingMessages.get(runId);
+    if (pending?.length) {
+      for (const message of pending) {
+        channel.handleIncomingMessage(message);
+      }
+      this.pendingMessages.delete(runId);
+    }
     return channel;
   }
 
   async sendToRun(runId: string, message: SdkWsMessage): Promise<void> {
     await this.waitForConnection();
+    const socket = this.socket;
+    if (!socket) {
+      throw new Error("Shared SDK WebSocket connection is not open.");
+    }
     await new Promise<void>((resolve, reject) => {
-      this.socket?.send(`${JSON.stringify({ runId, message })}\n`, (error) => {
+      socket.send(`${JSON.stringify({ runId, message })}\n`, (error) => {
         if (error) {
           reject(error);
           return;
         }
-
         resolve();
       });
     });
@@ -511,6 +541,7 @@ export class SharedSdkWsConnection {
       await channel.close();
     }
     this.channels.clear();
+    this.pendingMessages.clear();
 
     if (!this.socket) {
       return;

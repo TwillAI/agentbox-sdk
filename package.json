@@ -38,16 +38,12 @@
     "lint:fix": "eslint . --fix",
     "test": "vitest run",
     "test:e2e:local-docker": "vitest run test/local-docker.e2e.test.ts",
+    "test:e2e:matrix": "vitest run test/live-matrix.e2e.test.ts",
     "test:smoke": "vitest run test/smoke.test.ts",
     "test:watch": "vitest",
     "check": "npm run typecheck && npm run lint && npm run test",
     "hooks:install": "lefthook install",
-    "prepare": "if [ -d .git ]; then lefthook install; else echo 'Skipping lefthook install (no .git directory)'; fi",
-    "examples:codex": "tsx examples/basic-codex.ts",
-    "examples:opencode": "tsx examples/basic-opencode.ts",
-    "examples:claude": "tsx examples/basic-claude-code.ts",
-    "examples:multimodal": "tsx examples/multimodal-claude-code.ts",
-    "examples:modal": "tsx examples/basic-modal.ts"
+    "prepare": "if [ -d .git ]; then lefthook install; else echo 'Skipping lefthook install (no .git directory)'; fi"
   },
   "engines": {
     "node": ">=20.0.0",
@@ -56,6 +52,7 @@
   "dependencies": {
     "@daytonaio/sdk": "^0.161.0",
     "dockerode": "^4.0.10",
+    "e2b": "^2.19.0",
     "eventsource-parser": "^3.0.6",
     "modal": "^0.7.4",
     "tar-stream": "^3.1.8",
@@ -82,6 +79,7 @@
     "claude-code",
     "opencode",
     "sandbox",
+    "e2b",
     "modal",
     "daytona",
     "docker",

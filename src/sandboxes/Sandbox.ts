@@ -1,6 +1,7 @@
-import { DaytonaSandboxDriver } from "./providers/daytona";
-import { LocalDockerSandboxDriver } from "./providers/local-docker";
-import { ModalSandboxDriver } from "./providers/modal";
+import { DaytonaSandboxAdapter } from "./providers/daytona";
+import { E2bSandboxAdapter } from "./providers/e2b";
+import { LocalDockerSandboxAdapter } from "./providers/local-docker";
+import { ModalSandboxAdapter } from "./providers/modal";
 import type {
   AsyncCommandHandle,
   CommandOptions,
@@ -11,39 +12,43 @@ import type {
   SandboxOptions,
   SandboxProviderName,
 } from "./types";
-import type { SandboxDriver } from "./base";
+import type { SandboxAdapter } from "./base";
 import { UnsupportedProviderError } from "../shared/errors";
 
-function createSandboxDriver<P extends SandboxProviderName>(
+function createSandboxAdapter<P extends SandboxProviderName>(
   provider: P,
   options: SandboxOptions<P>,
-): SandboxDriver<P, SandboxOptions<P>> {
+): SandboxAdapter<P, SandboxOptions<P>> {
   switch (provider) {
     case "local-docker":
-      return new LocalDockerSandboxDriver(
+      return new LocalDockerSandboxAdapter(
         options as SandboxOptions<"local-docker">,
-      ) as unknown as SandboxDriver<P, SandboxOptions<P>>;
+      ) as unknown as SandboxAdapter<P, SandboxOptions<P>>;
     case "modal":
-      return new ModalSandboxDriver(
+      return new ModalSandboxAdapter(
         options as SandboxOptions<"modal">,
-      ) as unknown as SandboxDriver<P, SandboxOptions<P>>;
+      ) as unknown as SandboxAdapter<P, SandboxOptions<P>>;
     case "daytona":
-      return new DaytonaSandboxDriver(
+      return new DaytonaSandboxAdapter(
         options as SandboxOptions<"daytona">,
-      ) as unknown as SandboxDriver<P, SandboxOptions<P>>;
+      ) as unknown as SandboxAdapter<P, SandboxOptions<P>>;
+    case "e2b":
+      return new E2bSandboxAdapter(
+        options as SandboxOptions<"e2b">,
+      ) as unknown as SandboxAdapter<P, SandboxOptions<P>>;
     default:
       throw new UnsupportedProviderError("sandbox", provider);
   }
 }
 
 export class Sandbox<P extends SandboxProviderName = SandboxProviderName> {
-  private readonly driver: SandboxDriver<P, SandboxOptions<P>>;
+  private readonly adapter: SandboxAdapter<P, SandboxOptions<P>>;
 
   constructor(
     private readonly providerName: P,
     private readonly options: SandboxOptions<P>,
   ) {
-    this.driver = createSandboxDriver(providerName, options);
+    this.adapter = createSandboxAdapter(providerName, options);
   }
 
   get provider(): P {
@@ -55,63 +60,63 @@ export class Sandbox<P extends SandboxProviderName = SandboxProviderName> {
   }
 
   get id(): string | undefined {
-    return this.driver.id;
+    return this.adapter.id;
   }
 
   get raw(): unknown {
-    return this.driver.raw;
+    return this.adapter.raw;
   }
 
   async openPort(port: number): Promise<this> {
-    await this.driver.openPort(port);
+    await this.adapter.openPort(port);
     return this;
   }
 
   setSecret(name: string, value: string): this {
-    this.driver.setSecret(name, value);
+    this.adapter.setSecret(name, value);
     return this;
   }
 
   setSecrets(values: Record<string, string>): this {
-    this.driver.setSecrets(values);
+    this.adapter.setSecrets(values);
     return this;
   }
 
   async gitClone(options: GitCloneOptions): Promise<CommandResult> {
-    return this.driver.gitClone(options);
+    return this.adapter.gitClone(options);
   }
 
   async run(
     command: string | string[],
     options?: CommandOptions,
   ): Promise<CommandResult> {
-    return this.driver.run(command, options);
+    return this.adapter.run(command, options);
   }
 
   async runAsync(
     command: string | string[],
     options?: CommandOptions,
   ): Promise<AsyncCommandHandle> {
-    return this.driver.runAsync(command, options);
+    return this.adapter.runAsync(command, options);
   }
 
   async list(options?: SandboxListOptions): Promise<SandboxDescriptor[]> {
-    return this.driver.list(options);
+    return this.adapter.list(options);
   }
 
   async snapshot(): Promise<string | null> {
-    return this.driver.snapshot();
+    return this.adapter.snapshot();
   }
 
   async stop(): Promise<void> {
-    return this.driver.stop();
+    return this.adapter.stop();
   }
 
   async delete(): Promise<void> {
-    return this.driver.delete();
+    return this.adapter.delete();
   }
 
   async getPreviewLink(port: number): Promise<string> {
-    return this.driver.getPreviewLink(port);
+    return this.adapter.getPreviewLink(port);
   }
 }

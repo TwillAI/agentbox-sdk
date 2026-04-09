@@ -2,7 +2,7 @@ import { ModalClient } from "modal";
 import type { Image as ModalImage } from "modal";
 import type { Sandbox as ModalSandboxObject } from "modal";
 
-import { SandboxDriver } from "../base";
+import { SandboxAdapter } from "../base";
 import type {
   AsyncCommandHandle,
   CommandEvent,
@@ -22,13 +22,14 @@ type ModalRaw = {
   sandbox?: ModalSandboxObject;
 };
 
-export class ModalSandboxDriver extends SandboxDriver<
+export class ModalSandboxAdapter extends SandboxAdapter<
   "modal",
   ModalSandboxOptions,
   ModalRaw
 > {
   private readonly client: ModalClient;
   private sandbox?: ModalSandboxObject;
+  private clientClosed = false;
 
   constructor(options: ModalSandboxOptions) {
     super(options);
@@ -236,6 +237,7 @@ export class ModalSandboxDriver extends SandboxDriver<
 
   async delete(): Promise<void> {
     await this.stop();
+    await this.closeClient();
   }
 
   async openPort(port: number): Promise<void> {
@@ -276,6 +278,19 @@ export class ModalSandboxDriver extends SandboxDriver<
       "openagent.provider": this.provider,
       ...(this.options.tags ?? {}),
     };
+  }
+
+  private async closeClient(): Promise<void> {
+    if (this.clientClosed) {
+      return;
+    }
+
+    this.clientClosed = true;
+    try {
+      this.client.close();
+    } catch {
+      // Ignore client shutdown errors during cleanup.
+    }
   }
 
   private requireSandbox(): ModalSandboxObject {

@@ -101,7 +101,12 @@ function parseOptions(args: string[]): CliOptions {
 }
 
 function isSandboxProviderName(value: string): value is SandboxProviderName {
-  return value === "local-docker" || value === "modal" || value === "daytona";
+  return (
+    value === "local-docker" ||
+    value === "modal" ||
+    value === "daytona" ||
+    value === "e2b"
+  );
 }
 
 function isBuiltInImageName(value: string): value is BuiltInSandboxImageName {
@@ -112,8 +117,8 @@ function printHelp(): void {
   process.stdout.write(`openagent
 
 Usage:
-  openagent image build --provider <local-docker|modal|daytona> --preset <browser-agent|computer-use>
-  openagent image build --provider <local-docker|modal|daytona> --file <path>
+  openagent image build --provider <local-docker|modal|daytona|e2b> --preset <browser-agent|computer-use>
+  openagent image build --provider <local-docker|modal|daytona|e2b> --file <path>
 
 Options:
   --image-name <name>        Override the built artifact name
@@ -122,6 +127,7 @@ Options:
 Environment:
   Modal: MODAL_TOKEN_ID, MODAL_TOKEN_SECRET, MODAL_ENVIRONMENT?, MODAL_ENDPOINT?
   Daytona: DAYTONA_API_KEY or DAYTONA_JWT_TOKEN, DAYTONA_ORGANIZATION_ID?, DAYTONA_API_URL?, DAYTONA_TARGET?
+  E2B: E2B_API_KEY, E2B_DOMAIN?, E2B_ACCESS_TOKEN?
 `);
 }
 

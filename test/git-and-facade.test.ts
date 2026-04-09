@@ -43,6 +43,24 @@ describe("public facades", () => {
     expect(sandbox.optionsSnapshot.provider?.appName).toBe("openagent-demo");
   });
 
+  it("creates an e2b sandbox with a template reference", async () => {
+    const sandbox = new Sandbox("e2b", {
+      tags: { project: "demo" },
+      image: "openagent-browser-agent:demo123",
+      provider: {
+        apiKey: "e2b_test",
+        timeoutMs: 60_000,
+      },
+    });
+
+    await expect(sandbox.openPort(4242)).resolves.toBe(sandbox);
+    expect(sandbox.provider).toBe("e2b");
+    expect(sandbox.optionsSnapshot.image).toBe(
+      "openagent-browser-agent:demo123",
+    );
+    expect(sandbox.optionsSnapshot.provider?.timeoutMs).toBe(60_000);
+  });
+
   it("creates an agent without touching the runtime immediately", () => {
     const agent = new Agent("opencode", {
       cwd: "/workspace",

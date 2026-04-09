@@ -7,16 +7,12 @@ import type { RuntimeTarget, RuntimeLayout, TextArtifact } from "./types";
 import { shellQuote } from "../../shared/shell";
 import { spawnCommand } from "../transports/spawn";
 
-function createLayout(
-  rootDir: string,
-  env?: Record<string, string>,
-): RuntimeLayout {
-  const homeDir = env?.HOME ?? path.join(rootDir, "home");
-  const xdgConfigHome = env?.XDG_CONFIG_HOME ?? path.join(homeDir, ".config");
-  const codexDir = env?.CODEX_HOME ?? path.join(homeDir, ".codex");
+function createLayout(homeDir: string): RuntimeLayout {
+  const xdgConfigHome = path.join(homeDir, ".config");
+  const codexDir = path.join(homeDir, ".codex");
 
   return {
-    rootDir,
+    rootDir: homeDir,
     homeDir,
     xdgConfigHome,
     agentsDir: path.join(homeDir, ".agents"),
@@ -35,11 +31,7 @@ class HostRuntimeTarget implements RuntimeTarget {
     private readonly cwd: string,
     private readonly baseEnv: Record<string, string>,
   ) {
-    this.env = {
-      HOME: layout.homeDir,
-      XDG_CONFIG_HOME: layout.xdgConfigHome,
-      CODEX_HOME: layout.codexDir,
-    };
+    this.env = {};
   }
 
   async writeArtifact(artifact: TextArtifact): Promise<void> {
@@ -85,11 +77,7 @@ class SandboxRuntimeTarget implements RuntimeTarget {
     readonly layout: RuntimeLayout,
     private readonly options: AgentOptions,
   ) {
-    this.env = {
-      HOME: layout.homeDir,
-      XDG_CONFIG_HOME: layout.xdgConfigHome,
-      CODEX_HOME: layout.codexDir,
-    };
+    this.env = {};
   }
 
   async writeArtifact(artifact: TextArtifact): Promise<void> {
@@ -159,9 +147,22 @@ export async function createRuntimeTarget<P extends AgentProviderName>(
   options: AgentOptions<P>,
 ): Promise<RuntimeTarget> {
   if (options.sandbox) {
-    const layout = createLayout(
-      `/tmp/openagent/${provider}/${runId}`,
-      options.env,
+    const layout = createLayout(`/tmp/openagent/${provider}/${runId}`);
+    await options.sandbox.run(
+      [
+        `mkdir -p ${shellQuote(layout.homeDir)}`,
+        `mkdir -p ${shellQuote(layout.xdgConfigHome)}`,
+        `mkdir -p ${shellQuote(layout.agentsDir)}`,
+        `mkdir -p ${shellQuote(layout.claudeDir)}`,
+        `mkdir -p ${shellQuote(layout.opencodeDir)}`,
+        `mkdir -p ${shellQuote(layout.codexDir)}`,
+      ].join(" && "),
+      {
+        cwd: options.cwd,
+        env: {
+          ...(options.env ?? {}),
+        },
+      },
     );
     return new SandboxRuntimeTarget(provider, layout, options);
   }

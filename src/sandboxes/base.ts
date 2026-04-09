@@ -10,7 +10,7 @@ import type {
 } from "./types";
 import { buildGitCloneCommand } from "./git";
 
-export abstract class SandboxDriver<
+export abstract class SandboxAdapter<
   TProvider extends SandboxProviderName = SandboxProviderName,
   TOptions extends SandboxOptions<TProvider> = SandboxOptions<TProvider>,
   TRaw = unknown,

@@ -9,6 +9,7 @@ import {
   buildOpenCodePluginArtifacts,
 } from "../src/agents/config/hooks";
 import { buildOpenCodeMcpConfig } from "../src/agents/config/mcp";
+import { createRuntimeTarget } from "../src/agents/config/runtime";
 import { prepareSkillArtifacts } from "../src/agents/config/skills";
 import {
   buildClaudeAgentsConfig,
@@ -208,11 +209,11 @@ describe("config compilers", () => {
     const layout = {
       rootDir: "/tmp/openagent",
       homeDir: "/tmp/openagent/home",
-      xdgConfigHome: "/tmp/openagent/home/.config",
+      xdgConfigHome: "/tmp/openagent/.config",
       agentsDir: "/tmp/openagent/home/.agents",
       claudeDir: "/tmp/openagent/home/.claude",
-      opencodeDir: "/tmp/openagent/home/.config/opencode",
-      codexDir: "/tmp/openagent/home/.codex",
+      opencodeDir: "/tmp/openagent/.config/opencode",
+      codexDir: "/tmp/openagent/.codex",
     };
 
     const repoSkill = await prepareSkillArtifacts(
@@ -227,7 +228,7 @@ describe("config compilers", () => {
     );
 
     expect(repoSkill.installCommands).toEqual([
-      "npx skills add https://github.com/vercel-labs/agent-browser -g --skill agent-browser --agent opencode -y",
+      "npx skills add 'https://github.com/vercel-labs/agent-browser' -g --skill 'agent-browser' --agent 'opencode' -y",
     ]);
 
     const embeddedSkill = await prepareSkillArtifacts(
@@ -247,7 +248,7 @@ describe("config compilers", () => {
     expect(embeddedSkill.installCommands).toEqual([]);
     expect(embeddedSkill.artifacts).toEqual([
       {
-        path: "/tmp/openagent/home/.config/opencode/skills/release-helper/SKILL.md",
+        path: "/tmp/openagent/.config/opencode/skills/release-helper/SKILL.md",
         content: "# Release helper",
         executable: false,
       },
@@ -458,11 +459,11 @@ describe("config compilers", () => {
       {
         rootDir: "/tmp/openagent",
         homeDir: "/tmp/openagent/home",
-        xdgConfigHome: "/tmp/openagent/home/.config",
+        xdgConfigHome: "/tmp/openagent/.config",
         agentsDir: "/tmp/openagent/home/.agents",
         claudeDir: "/tmp/openagent/home/.claude",
-        opencodeDir: "/tmp/openagent/home/.config/opencode",
-        codexDir: "/tmp/openagent/home/.codex",
+        opencodeDir: "/tmp/openagent/.config/opencode",
+        codexDir: "/tmp/openagent/.codex",
       },
     );
 
@@ -470,9 +471,23 @@ describe("config compilers", () => {
     expect(result.agentSections.join("\n")).toContain("[agents.reviewer]");
     expect(result.artifacts.map((artifact) => artifact.path)).toEqual(
       expect.arrayContaining([
-        "/tmp/openagent/home/.codex/prompts/reviewer.md",
-        "/tmp/openagent/home/.codex/agents/reviewer.toml",
+        "/tmp/openagent/.codex/prompts/reviewer.md",
+        "/tmp/openagent/.codex/agents/reviewer.toml",
       ]),
     );
+  });
+
+  it("does not override HOME when creating runtime targets", async () => {
+    const target = await createRuntimeTarget("codex", "runtime-env-test", {
+      cwd: process.cwd(),
+    });
+
+    try {
+      expect(target.env.HOME).toBeUndefined();
+      expect(target.env.XDG_CONFIG_HOME).toBeUndefined();
+      expect(target.env.CODEX_HOME).toBeUndefined();
+    } finally {
+      await target.cleanup();
+    }
   });
 });
