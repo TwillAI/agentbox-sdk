@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import { Agent } from "../src";
 import { buildOpenCodeCommandsConfig } from "../src/agents/config/commands";
-import { buildClaudeHookSettings } from "../src/agents/config/hooks";
+import {
+  assertHooksSupported,
+  buildClaudeHookSettings,
+  buildCodexHooksFile,
+  buildOpenCodePluginArtifacts,
+} from "../src/agents/config/hooks";
 import { buildOpenCodeMcpConfig } from "../src/agents/config/mcp";
 import { prepareSkillArtifacts } from "../src/agents/config/skills";
 import {
@@ -31,19 +36,26 @@ describe("agent options config", () => {
           instructions: "Review the current changes for likely bugs.",
         },
       ],
-      hooks: [
-        {
-          event: "Stop",
-          type: "command",
-          command: "echo done",
-        },
-      ],
       commands: [
         {
           name: "review",
           template: "Review the current changes.",
         },
       ],
+      provider: {
+        hooks: {
+          Stop: [
+            {
+              hooks: [
+                {
+                  type: "command",
+                  command: "echo done",
+                },
+              ],
+            },
+          ],
+        },
+      },
     });
 
     expect(agent).toBeInstanceOf(Agent);
@@ -53,10 +65,37 @@ describe("agent options config", () => {
     const codexAgent = new Agent("codex", {
       cwd: "/workspace",
       approvalMode: "interactive",
+      provider: {
+        hooks: {
+          Stop: [
+            {
+              hooks: [
+                {
+                  type: "command",
+                  command: "echo done",
+                },
+              ],
+            },
+          ],
+        },
+      },
     });
     const openCodeAgent = new Agent("opencode", {
       cwd: "/workspace",
       approvalMode: "auto",
+      provider: {
+        plugins: [
+          {
+            name: "notify-on-idle",
+            hooks: [
+              {
+                event: "session.idle",
+                body: 'return "idle";',
+              },
+            ],
+          },
+        ],
+      },
     });
 
     expect(codexAgent).toBeInstanceOf(Agent);
@@ -65,6 +104,106 @@ describe("agent options config", () => {
 });
 
 describe("config compilers", () => {
+  it("rejects legacy shared hooks for Claude Code", () => {
+    expect(() =>
+      assertHooksSupported("claude-code", {
+        hooks: {
+          Stop: [
+            {
+              hooks: [
+                {
+                  type: "command",
+                  command: "echo done",
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    ).toThrow(
+      "Claude Code hooks must be configured on options.provider.hooks.",
+    );
+  });
+
+  it("rejects options.provider.hooks on OpenCode", () => {
+    expect(() =>
+      assertHooksSupported("opencode", {
+        provider: {
+          hooks: {
+            Stop: [
+              {
+                hooks: [
+                  {
+                    type: "command",
+                    command: "echo done",
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      }),
+    ).toThrow("OpenCode uses options.provider.plugins");
+  });
+
+  it("rejects options.provider.plugins on Codex", () => {
+    expect(() =>
+      assertHooksSupported("codex", {
+        provider: {
+          plugins: [
+            {
+              name: "notify-on-idle",
+              hooks: [
+                {
+                  event: "session.idle",
+                  body: 'return "idle";',
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    ).toThrow("OpenCode plugins are only supported for the opencode provider");
+  });
+
+  it("rejects malformed grouped hook entries", () => {
+    expect(() =>
+      assertHooksSupported("claude-code", {
+        provider: {
+          hooks: {
+            PostToolUse: {
+              matcher: "Bash",
+              hooks: [
+                {
+                  type: "command",
+                  command: "echo done",
+                },
+              ],
+            },
+          },
+        },
+      }),
+    ).toThrow("each event mapped to an array of matcher groups");
+
+    expect(() =>
+      assertHooksSupported("codex", {
+        provider: {
+          hooks: {
+            PostToolUse: {
+              matcher: "Bash",
+              hooks: [
+                {
+                  type: "command",
+                  command: "echo done",
+                },
+              ],
+            },
+          },
+        },
+      }),
+    ).toThrow("each event mapped to an array of matcher groups");
+  });
+
   it("builds repo-backed and embedded skill setup", async () => {
     const layout = {
       rootDir: "/tmp/openagent",
@@ -155,17 +294,40 @@ describe("config compilers", () => {
     });
   });
 
-  it("builds Claude hook settings", () => {
+  it("returns undefined when Claude hooks are empty", () => {
+    expect(buildClaudeHookSettings(undefined)).toBeUndefined();
+  });
+
+  it("builds native Claude hook settings", () => {
     expect(
-      buildClaudeHookSettings([
-        {
-          event: "PostToolUse",
-          matcher: "Bash|Edit",
-          type: "command",
-          command: "echo hook",
-          statusMessage: "Running hook",
-        },
-      ]),
+      buildClaudeHookSettings({
+        PostToolUse: [
+          {
+            matcher: "Bash|Edit",
+            hooks: [
+              {
+                type: "command",
+                command: "echo hook",
+                statusMessage: "Running hook",
+              },
+            ],
+          },
+        ],
+        Notification: [
+          {
+            hooks: [
+              {
+                type: "http",
+                url: "http://localhost:8080/hooks",
+                allowedEnvVars: ["HOOK_TOKEN"],
+                headers: {
+                  Authorization: "Bearer $HOOK_TOKEN",
+                },
+              },
+            ],
+          },
+        ],
+      }),
     ).toMatchObject({
       hooks: {
         PostToolUse: [
@@ -180,8 +342,86 @@ describe("config compilers", () => {
             ],
           },
         ],
+        Notification: [
+          {
+            hooks: [
+              {
+                type: "http",
+                url: "http://localhost:8080/hooks",
+                allowedEnvVars: ["HOOK_TOKEN"],
+                headers: {
+                  Authorization: "Bearer $HOOK_TOKEN",
+                },
+              },
+            ],
+          },
+        ],
       },
     });
+  });
+
+  it("builds native Codex hooks files", () => {
+    expect(
+      buildCodexHooksFile({
+        PostToolUse: [
+          {
+            matcher: "Bash",
+            hooks: [
+              {
+                type: "command",
+                command: "echo hook",
+                statusMessage: "Reviewing command output",
+                timeout: 30,
+              },
+            ],
+          },
+        ],
+      }),
+    ).toMatchObject({
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: "Bash",
+            hooks: [
+              {
+                type: "command",
+                command: "echo hook",
+                statusMessage: "Reviewing command output",
+                timeout: 30,
+              },
+            ],
+          },
+        ],
+      },
+    });
+  });
+
+  it("builds OpenCode plugin artifacts", () => {
+    expect(
+      buildOpenCodePluginArtifacts(
+        [
+          {
+            name: "session notifier",
+            preamble: 'const prefix = "notify";',
+            setup: "const initialized = true;",
+            hooks: [
+              {
+                event: "session.idle",
+                body: 'if (initialized) { return `${prefix}:${input.sessionID ?? "unknown"}`; }',
+              },
+            ],
+          },
+        ],
+        "/tmp/openagent/home/.config/opencode",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        path: "/tmp/openagent/home/.config/opencode/plugins/session-notifier.ts",
+        content: expect.stringContaining(
+          '"session.idle": async (input, output) => {',
+        ),
+      }),
+    ]);
   });
 
   it("builds OpenCode MCP config", () => {

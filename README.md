@@ -100,6 +100,87 @@ const result = await agent.run({
 console.log(result.text);
 ```
 
+## Hooks
+
+Hooks are not part of the shared cross-provider `Agent` surface because the runtimes do not share the same hook lifecycle semantics.
+
+Current support:
+
+- `claude-code`: configure native hook settings under `provider.hooks`
+- `codex`: configure native hook settings under `provider.hooks` (experimental in Codex)
+- `opencode`: configure native plugin hooks under `provider.plugins`
+
+Claude Code example:
+
+```ts
+const agent = new Agent("claude-code", {
+  sandbox,
+  cwd: "/workspace",
+  provider: {
+    hooks: {
+      PostToolUse: [
+        {
+          matcher: "Bash",
+          hooks: [
+            {
+              type: "command",
+              command: "echo done",
+            },
+          ],
+        },
+      ],
+    },
+  },
+});
+```
+
+Codex example:
+
+```ts
+const agent = new Agent("codex", {
+  sandbox,
+  cwd: "/workspace",
+  provider: {
+    hooks: {
+      PostToolUse: [
+        {
+          matcher: "Bash",
+          hooks: [
+            {
+              type: "command",
+              command: "echo done",
+              statusMessage: "Reviewing Bash output",
+            },
+          ],
+        },
+      ],
+    },
+  },
+});
+```
+
+OpenCode example:
+
+```ts
+const agent = new Agent("opencode", {
+  sandbox,
+  cwd: "/workspace",
+  provider: {
+    plugins: [
+      {
+        name: "session-notifier",
+        hooks: [
+          {
+            event: "session.idle",
+            body: 'return "session-idle";',
+          },
+        ],
+      },
+    ],
+  },
+});
+```
+
 ## Multimodal input
 
 `Agent.run()` and `Agent.stream()` accept either a plain string or an AI SDK-style array of user parts:

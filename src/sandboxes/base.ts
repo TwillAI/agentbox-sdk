@@ -19,6 +19,7 @@ export abstract class SandboxDriver<
   protected readonly secrets: Record<string, string> = {};
   protected readonly baseEnv: Record<string, string>;
   private provisioned = false;
+  private provisioning?: Promise<void>;
 
   constructor(options: TOptions) {
     this.options = options;
@@ -50,8 +51,16 @@ export abstract class SandboxDriver<
       return;
     }
 
-    await this.provision();
-    this.provisioned = true;
+    if (!this.provisioning) {
+      this.provisioning = (async () => {
+        await this.provision();
+        this.provisioned = true;
+      })().finally(() => {
+        this.provisioning = undefined;
+      });
+    }
+
+    await this.provisioning;
   }
 
   get tags(): Record<string, string> {

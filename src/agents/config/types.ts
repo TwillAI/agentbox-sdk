@@ -41,19 +41,146 @@ export interface AgentSubAgentConfig {
   model?: string;
 }
 
-export type AgentHookEvent =
+export type ClaudeCodeHookEvent =
+  | "SessionStart"
+  | "SessionEnd"
+  | "UserPromptSubmit"
   | "PreToolUse"
+  | "PermissionRequest"
+  | "PermissionDenied"
   | "PostToolUse"
-  | "Stop"
+  | "PostToolUseFailure"
   | "Notification"
-  | "SubagentStop";
+  | "SubagentStart"
+  | "SubagentStop"
+  | "Stop"
+  | "StopFailure"
+  | "TeammateIdle"
+  | "FileChanged"
+  | "WorktreeCreate"
+  | "WorktreeRemove"
+  | "PreCompact"
+  | "PostCompact"
+  | "CwdChanged"
+  | "TaskCreated"
+  | "TaskCompleted";
 
-export interface AgentHookConfig {
-  event: AgentHookEvent;
-  matcher?: string;
+export interface ClaudeCodeHookBase {
+  if?: string;
+  timeout?: number;
+  statusMessage?: string;
+  once?: boolean;
+}
+
+export interface ClaudeCodeCommandHook extends ClaudeCodeHookBase {
   type: "command";
   command: string;
+  async?: boolean;
+  shell?: "bash" | "powershell";
+}
+
+export interface ClaudeCodeHttpHook extends ClaudeCodeHookBase {
+  type: "http";
+  url: string;
+  headers?: Record<string, string>;
+  allowedEnvVars?: string[];
+}
+
+export interface ClaudeCodePromptHook extends ClaudeCodeHookBase {
+  type: "prompt";
+  prompt: string;
+  model?: string;
+}
+
+export interface ClaudeCodeAgentHook extends ClaudeCodeHookBase {
+  type: "agent";
+  prompt: string;
+  model?: string;
+}
+
+export type ClaudeCodeHookHandler =
+  | ClaudeCodeCommandHook
+  | ClaudeCodeHttpHook
+  | ClaudeCodePromptHook
+  | ClaudeCodeAgentHook;
+
+export interface ClaudeCodeHookMatcherGroup {
+  matcher?: string;
+  hooks: ClaudeCodeHookHandler[];
+}
+
+export type ClaudeCodeHooksConfig = Partial<
+  Record<ClaudeCodeHookEvent, ClaudeCodeHookMatcherGroup[]>
+>;
+
+export type ClaudeCodeHookConfig = ClaudeCodeHooksConfig;
+
+export type CodexHookEvent =
+  | "SessionStart"
+  | "PreToolUse"
+  | "PostToolUse"
+  | "UserPromptSubmit"
+  | "Stop";
+
+export interface CodexCommandHook {
+  type: "command";
+  command: string;
+  timeout?: number;
+  timeoutSec?: number;
   statusMessage?: string;
+}
+
+export interface CodexHookMatcherGroup {
+  matcher?: string;
+  hooks: CodexCommandHook[];
+}
+
+export type CodexHooksConfig = Partial<
+  Record<CodexHookEvent, CodexHookMatcherGroup[]>
+>;
+
+export type OpenCodePluginEvent =
+  | "command.executed"
+  | "file.edited"
+  | "file.watcher.updated"
+  | "installation.updated"
+  | "lsp.client.diagnostics"
+  | "lsp.updated"
+  | "message.part.removed"
+  | "message.part.updated"
+  | "message.removed"
+  | "message.updated"
+  | "permission.asked"
+  | "permission.replied"
+  | "server.connected"
+  | "session.created"
+  | "session.compacted"
+  | "session.deleted"
+  | "session.diff"
+  | "session.error"
+  | "session.idle"
+  | "session.status"
+  | "session.updated"
+  | "todo.updated"
+  | "shell.env"
+  | "tool.execute.after"
+  | "tool.execute.before"
+  | "tui.prompt.append"
+  | "tui.command.execute"
+  | "tui.toast.show"
+  | "experimental.session.compacting";
+
+export interface OpenCodePluginHookConfig {
+  event: OpenCodePluginEvent;
+  body: string;
+}
+
+export interface OpenCodePluginConfig {
+  name: string;
+  hooks: OpenCodePluginHookConfig[];
+  preamble?: string;
+  setup?: string;
+  fileExtension?: "js" | "ts";
 }
 
 export interface AgentCommandConfig {

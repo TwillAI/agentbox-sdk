@@ -7,10 +7,12 @@ import type {
 import type { Sandbox } from "../sandboxes";
 import type {
   AgentCommandConfig,
-  AgentHookConfig,
   AgentMcpConfig,
   AgentSkillConfig,
   AgentSubAgentConfig,
+  ClaudeCodeHooksConfig,
+  CodexHooksConfig,
+  OpenCodePluginConfig,
 } from "./config/types";
 
 export type AgentProviderName = "codex" | "opencode" | "claude-code";
@@ -72,7 +74,6 @@ export interface AgentOptionsBase {
   mcps?: AgentMcpConfig[];
   skills?: AgentSkillConfig[];
   subAgents?: AgentSubAgentConfig[];
-  hooks?: AgentHookConfig[];
   commands?: AgentCommandConfig[];
 }
 
@@ -81,6 +82,7 @@ export interface CodexProviderOptions {
   env?: Record<string, string>;
   brokerEndpoint?: string;
   useBroker?: boolean;
+  hooks?: CodexHooksConfig;
 }
 
 export interface OpenCodeProviderOptions {
@@ -91,12 +93,14 @@ export interface OpenCodeProviderOptions {
   port?: number;
   username?: string;
   password?: string;
+  plugins?: OpenCodePluginConfig[];
 }
 
 export interface ClaudeCodeProviderOptions {
   binary?: string;
   args?: string[];
   sessionAccessToken?: string;
+  hooks?: ClaudeCodeHooksConfig;
   permissionMode?: string;
   allowedTools?: string[];
   autoApproveTools?: boolean;

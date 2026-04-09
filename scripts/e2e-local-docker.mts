@@ -1,7 +1,7 @@
 import {
   LOCAL_DOCKER_E2E_PROVIDERS,
   runApprovalScenario,
-  runClaudeHookScenario,
+  runHookScenario,
   runSimpleScenario,
   runSkillScenario,
   runSubAgentScenario,
@@ -18,9 +18,7 @@ async function main() {
       providerResult.skills = await runSkillScenario(provider);
       providerResult.subAgents = await runSubAgentScenario(provider);
       providerResult.approval = await runApprovalScenario(provider);
-      if (provider === "claude-code") {
-        providerResult.hooks = await runClaudeHookScenario();
-      }
+      providerResult.hooks = await runHookScenario(provider);
     } catch (error) {
       providerResult.error =
         error instanceof Error ? error.stack || error.message : String(error);

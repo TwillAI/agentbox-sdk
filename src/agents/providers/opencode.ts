@@ -17,7 +17,11 @@ import {
   assertCommandsSupported,
   buildOpenCodeCommandsConfig,
 } from "../config/commands";
-import { assertHooksSupported } from "../config/hooks";
+import {
+  assertHooksSupported,
+  buildOpenCodePluginArtifacts,
+  hasConfiguredHooks,
+} from "../config/hooks";
 import { buildOpenCodeMcpConfig } from "../config/mcp";
 import { createRuntimeTarget } from "../config/runtime";
 import { installSkills, prepareSkillArtifacts } from "../config/skills";
@@ -32,6 +36,67 @@ type OpenCodeRuntime = {
   raw: unknown;
   configPath?: string;
 };
+
+const SANDBOX_OPENCODE_PORTS = Array.from(
+  { length: 10 },
+  (_, index) => 4096 + index,
+);
+const sandboxOpenCodePortPool = new WeakMap<
+  object,
+  {
+    init?: Promise<void>;
+    available: number[];
+    inUse: Set<number>;
+  }
+>();
+
+async function acquireSandboxOpenCodePort(
+  sandbox: NonNullable<AgentExecutionRequest<"opencode">["options"]["sandbox"]>,
+): Promise<number> {
+  const key = sandbox as object;
+  let pool = sandboxOpenCodePortPool.get(key);
+  if (!pool) {
+    pool = {
+      available: [...SANDBOX_OPENCODE_PORTS],
+      inUse: new Set<number>(),
+    };
+    pool.init = (async () => {
+      for (const port of SANDBOX_OPENCODE_PORTS) {
+        await sandbox.openPort(port);
+      }
+    })();
+    sandboxOpenCodePortPool.set(key, pool);
+  }
+
+  if (pool.init) {
+    await pool.init;
+    pool.init = undefined;
+  }
+
+  const port = pool.available.shift();
+  if (port === undefined) {
+    throw new Error("No available sandbox OpenCode ports.");
+  }
+  pool.inUse.add(port);
+  return port;
+}
+
+function releaseSandboxOpenCodePort(
+  sandbox: NonNullable<AgentExecutionRequest<"opencode">["options"]["sandbox"]>,
+  port: number,
+): void {
+  const pool = sandboxOpenCodePortPool.get(sandbox as object);
+  if (!pool) {
+    return;
+  }
+  if (!pool.inUse.delete(port)) {
+    return;
+  }
+  if (!pool.available.includes(port)) {
+    pool.available.push(port);
+    pool.available.sort((left, right) => left - right);
+  }
+}
 
 function toRawEvent(
   runId: string,
@@ -200,7 +265,7 @@ async function createRuntime(
       (request.options.skills?.length ?? 0) > 0 ||
       (request.options.subAgents?.length ?? 0) > 0 ||
       (request.options.commands?.length ?? 0) > 0 ||
-      (request.options.hooks?.length ?? 0) > 0)
+      hasConfiguredHooks(request.options))
   ) {
     throw new Error(
       "OpenCode serverUrl mode does not support OpenAgent-managed MCPs, skills, sub-agents, hooks, or commands. Start the runtime through OpenAgent instead.",
@@ -216,10 +281,19 @@ async function createRuntime(
   }
 
   const options = request.options;
-  assertHooksSupported(request.provider, options.hooks);
+  const plugins = assertHooksSupported(request.provider, options);
   assertCommandsSupported(request.provider, options.commands);
-  const port = options.provider?.port ?? 4096;
-  if (options.sandbox) {
+  const port =
+    options.provider?.port ??
+    (options.sandbox
+      ? await acquireSandboxOpenCodePort(options.sandbox)
+      : 4096);
+  const releasePort = () => {
+    if (options.provider?.port === undefined && options.sandbox) {
+      releaseSandboxOpenCodePort(options.sandbox, port);
+    }
+  };
+  if (options.sandbox && options.provider?.port !== undefined) {
     await options.sandbox.openPort(port);
   }
 
@@ -228,20 +302,33 @@ async function createRuntime(
     request.runId,
     options,
   );
+  const opencodeHomeDir = path.join(target.layout.rootDir, "home");
+  const opencodeXdgConfigHome = path.join(opencodeHomeDir, ".config");
+  const opencodeDir = path.join(opencodeXdgConfigHome, "opencode");
+  const opencodeLayout = {
+    ...target.layout,
+    homeDir: opencodeHomeDir,
+    xdgConfigHome: opencodeXdgConfigHome,
+    opencodeDir,
+  };
   const interactiveApproval = isInteractiveApproval(options);
   const { artifacts: skillArtifacts, installCommands } =
     await prepareSkillArtifacts(
       request.provider,
       options.skills,
-      target.layout,
+      opencodeLayout,
     );
+  const pluginArtifacts = buildOpenCodePluginArtifacts(
+    plugins,
+    opencodeLayout.opencodeDir,
+  );
 
-  for (const artifact of skillArtifacts) {
+  for (const artifact of [...skillArtifacts, ...pluginArtifacts]) {
     await target.writeArtifact(artifact);
   }
   await installSkills(target, installCommands);
 
-  const configPath = path.join(target.layout.opencodeDir, "openagent.json");
+  const configPath = path.join(opencodeLayout.opencodeDir, "openagent.json");
   const mcpConfig = buildOpenCodeMcpConfig(options.mcps);
   const commandsConfig = buildOpenCodeCommandsConfig(options.commands);
   const openCodeConfig = {
@@ -272,53 +359,104 @@ async function createRuntime(
 
   const commonEnv = {
     ...target.env,
+    HOME: opencodeHomeDir,
+    XDG_CONFIG_HOME: opencodeXdgConfigHome,
     OPENCODE_CONFIG: configPath,
+    OPENCODE_CONFIG_DIR: opencodeLayout.opencodeDir,
     OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
   };
 
   if (options.sandbox) {
-    const handle = await options.sandbox.runAsync(
-      [
-        options.provider?.binary ?? "opencode",
-        "serve",
-        "--hostname",
-        "0.0.0.0",
-        "--port",
-        String(port),
-        ...(options.provider?.args ?? []),
-      ],
-      {
-        cwd: options.cwd,
-        env: {
-          ...(options.env ?? {}),
-          ...commonEnv,
-          ...(options.provider?.password
-            ? { OPENCODE_SERVER_PASSWORD: options.provider.password }
-            : {}),
-          ...(options.provider?.username
-            ? { OPENCODE_SERVER_USERNAME: options.provider.username }
-            : {}),
-        },
-      },
-    );
-    const baseUrl = (await options.sandbox.getPreviewLink(port)).replace(
-      /\/$/,
-      "",
-    );
-    await waitForHttpReady(`${baseUrl}/global/health`, {
-      timeoutMs: 20_000,
-      init: {
-        headers: buildAuthHeaders(options),
-      },
+    const sandbox = options.sandbox;
+    const binary = options.provider?.binary ?? "opencode";
+    const pidFilePath = path.join(target.layout.rootDir, "opencode-serve.pid");
+    const logFilePath = path.join(target.layout.rootDir, "opencode-serve.log");
+    const serveEnv = {
+      ...(options.env ?? {}),
+      ...commonEnv,
+      ...(options.provider?.password
+        ? { OPENCODE_SERVER_PASSWORD: options.provider.password }
+        : {}),
+      ...(options.provider?.username
+        ? { OPENCODE_SERVER_USERNAME: options.provider.username }
+        : {}),
+    };
+    const launchCommand = [
+      `mkdir -p ${JSON.stringify(target.layout.rootDir)}`,
+      `(${[
+        `nohup ${[
+          binary,
+          "serve",
+          "--hostname",
+          "0.0.0.0",
+          "--port",
+          String(port),
+          ...(options.provider?.args ?? []),
+        ]
+          .map((part) => JSON.stringify(part))
+          .join(" ")} > ${JSON.stringify(logFilePath)} 2>&1 &`,
+        `echo $! > ${JSON.stringify(pidFilePath)}`,
+      ].join(" ")})`,
+    ].join(" && ");
+    const launchHandle = await sandbox.runAsync(launchCommand, {
+      cwd: options.cwd,
+      env: serveEnv,
     });
+    const launchResult = await launchHandle.wait();
+    if (launchResult.exitCode !== 0) {
+      releasePort();
+      await target.cleanup().catch(() => undefined);
+      throw new Error(
+        `Could not start OpenCode server: ${launchResult.combinedOutput || launchResult.stderr}`,
+      );
+    }
+    let baseUrl;
+    try {
+      baseUrl = (await sandbox.getPreviewLink(port)).replace(/\/$/, "");
+      await waitForHttpReady(`${baseUrl}/global/health`, {
+        timeoutMs: 20_000,
+        init: {
+          headers: buildAuthHeaders(options),
+        },
+      });
+    } catch (error) {
+      await sandbox
+        .run(
+          `if [ -f ${JSON.stringify(pidFilePath)} ]; then kill \"$(cat ${JSON.stringify(pidFilePath)})\" >/dev/null 2>&1 || true; rm -f ${JSON.stringify(pidFilePath)}; fi`,
+          {
+            cwd: options.cwd,
+            env: serveEnv,
+            timeoutMs: 30_000,
+          },
+        )
+        .catch(() => undefined);
+      await target.cleanup().catch(() => undefined);
+      releasePort();
+      throw error;
+    }
 
     return {
-      baseUrl,
+      baseUrl: baseUrl!,
       cleanup: async () => {
-        await handle.kill();
-        await target.cleanup();
+        await sandbox
+          .run(
+            `if [ -f ${JSON.stringify(pidFilePath)} ]; then kill \"$(cat ${JSON.stringify(pidFilePath)})\" >/dev/null 2>&1 || true; rm -f ${JSON.stringify(pidFilePath)}; fi`,
+            {
+              cwd: options.cwd,
+              env: serveEnv,
+              timeoutMs: 30_000,
+            },
+          )
+          .catch(() => undefined);
+        await target.cleanup().catch(() => undefined);
+        releasePort();
       },
-      raw: { handle, layout: target.layout },
+      raw: {
+        pidFilePath,
+        logFilePath,
+        baseUrl: baseUrl!,
+        layout: target.layout,
+      },
       configPath,
     };
   }
@@ -550,8 +688,12 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
 
     sseAbort.abort();
     await sseTask;
-    sink.complete({ text });
+    try {
+      sink.complete({ text });
+    } finally {
+      await runtime.cleanup().catch(() => undefined);
+    }
 
-    return runtime.cleanup;
+    return async () => undefined;
   }
 }

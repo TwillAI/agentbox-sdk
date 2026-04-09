@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { WebSocketServer, type RawData, type WebSocket } from "ws";
+import {
+  WebSocket,
+  WebSocketServer,
+  type RawData,
+  type WebSocket as WsSocket,
+} from "ws";
 
 import { AsyncQueue } from "../../shared/async-queue";
 import { getAvailablePort, waitFor } from "../../shared/network";
@@ -9,22 +14,68 @@ export interface SdkWsMessage {
   type: string;
 }
 
+export interface SdkWsTransport {
+  waitForConnection(timeoutMs?: number): Promise<void>;
+  send(message: SdkWsMessage): Promise<void>;
+  request(request: Record<string, unknown>): Promise<SdkWsMessage>;
+  close(): Promise<void>;
+  messages(): AsyncIterable<SdkWsMessage>;
+}
+
 export interface SdkWsServerOptions {
   host?: string;
   port?: number;
 }
 
-export class SdkWsServer {
-  private server?: WebSocketServer;
-  private socket?: WebSocket;
-  private readonly messagesQueue = new AsyncQueue<SdkWsMessage>();
-  private readonly pendingResponses = new Map<
-    string,
-    {
-      resolve: (message: SdkWsMessage) => void;
-      reject: (error?: unknown) => void;
+type PendingResponse = {
+  resolve: (message: SdkWsMessage) => void;
+  reject: (error?: unknown) => void;
+};
+
+type ChannelLike = {
+  handleIncomingMessage(message: SdkWsMessage): void;
+  handleConnectionClosed(error: Error): void;
+};
+
+function handleIncomingMessage(
+  text: string,
+  messagesQueue: AsyncQueue<SdkWsMessage>,
+  pendingResponses: Map<string, PendingResponse>,
+): void {
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    try {
+      const message = JSON.parse(line) as SdkWsMessage;
+      if (
+        message.type === "control_response" &&
+        typeof message.response === "object" &&
+        message.response !== null
+      ) {
+        const requestId = String(
+          (message.response as Record<string, unknown>).request_id ?? "",
+        );
+        const pending = pendingResponses.get(requestId);
+        if (pending) {
+          pendingResponses.delete(requestId);
+          pending.resolve(message);
+        }
+      }
+      messagesQueue.push(message);
+    } catch (error) {
+      messagesQueue.fail(error);
     }
-  >();
+  }
+}
+
+export class SdkWsServer implements SdkWsTransport {
+  private server?: WebSocketServer;
+  private socket?: WsSocket;
+  private readonly messagesQueue = new AsyncQueue<SdkWsMessage>();
+  private readonly pendingResponses = new Map<string, PendingResponse>();
   private readonly host: string;
   private port?: number;
 
@@ -99,6 +150,10 @@ export class SdkWsServer {
 
   async close(): Promise<void> {
     this.messagesQueue.finish();
+    for (const pending of this.pendingResponses.values()) {
+      pending.reject(new Error("SDK WebSocket server closed."));
+    }
+    this.pendingResponses.clear();
     this.socket?.close();
 
     if (!this.server) {
@@ -125,33 +180,358 @@ export class SdkWsServer {
   }
 
   private handleMessage(rawData: RawData): void {
-    const text = rawData.toString();
-    const lines = text
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean);
+    handleIncomingMessage(
+      rawData.toString(),
+      this.messagesQueue,
+      this.pendingResponses,
+    );
+  }
+}
 
-    for (const line of lines) {
-      try {
-        const message = JSON.parse(line) as SdkWsMessage;
-        if (
-          message.type === "control_response" &&
-          typeof message.response === "object" &&
-          message.response !== null
-        ) {
-          const requestId = String(
-            (message.response as Record<string, unknown>).request_id ?? "",
-          );
-          const pending = this.pendingResponses.get(requestId);
-          if (pending) {
-            this.pendingResponses.delete(requestId);
-            pending.resolve(message);
-          }
+export class SdkWsClient implements SdkWsTransport {
+  private socket?: WebSocket;
+  private readonly messagesQueue = new AsyncQueue<SdkWsMessage>();
+  private readonly pendingResponses = new Map<string, PendingResponse>();
+
+  constructor(private readonly url: string) {}
+
+  async start(): Promise<void> {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      return;
+    }
+
+    const socket = new WebSocket(this.url);
+    this.socket = socket;
+
+    socket.on("message", (data) => {
+      handleIncomingMessage(
+        data.toString(),
+        this.messagesQueue,
+        this.pendingResponses,
+      );
+    });
+    socket.on("close", () => {
+      if (this.socket === socket) {
+        this.socket = undefined;
+      }
+      this.messagesQueue.finish();
+    });
+    socket.on("error", (error) => {
+      this.messagesQueue.fail(error);
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        socket.off("open", handleOpen);
+        socket.off("error", handleError);
+      };
+      const handleOpen = () => {
+        cleanup();
+        resolve();
+      };
+      const handleError = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      socket.once("open", handleOpen);
+      socket.once("error", handleError);
+    });
+  }
+
+  async waitForConnection(timeoutMs = 15_000): Promise<void> {
+    await waitFor(async () => this.socket?.readyState === WebSocket.OPEN, {
+      timeoutMs,
+      intervalMs: 100,
+    });
+  }
+
+  async send(message: SdkWsMessage): Promise<void> {
+    await this.waitForConnection();
+    await new Promise<void>((resolve, reject) => {
+      this.socket?.send(`${JSON.stringify(message)}\n`, (error) => {
+        if (error) {
+          reject(error);
+          return;
         }
-        this.messagesQueue.push(message);
-      } catch (error) {
-        this.messagesQueue.fail(error);
+
+        resolve();
+      });
+    });
+  }
+
+  async request(request: Record<string, unknown>): Promise<SdkWsMessage> {
+    const requestId = randomUUID();
+    const response = new Promise<SdkWsMessage>((resolve, reject) => {
+      this.pendingResponses.set(requestId, { resolve, reject });
+    });
+
+    await this.send({
+      type: "control_request",
+      request_id: requestId,
+      request,
+    });
+
+    return response;
+  }
+
+  async close(): Promise<void> {
+    this.messagesQueue.finish();
+    for (const pending of this.pendingResponses.values()) {
+      pending.reject(new Error("SDK WebSocket client closed."));
+    }
+    this.pendingResponses.clear();
+
+    if (!this.socket) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      const socket = this.socket;
+      if (!socket) {
+        resolve();
+        return;
+      }
+      this.socket = undefined;
+      if (
+        socket.readyState === WebSocket.CLOSED ||
+        socket.readyState === WebSocket.CLOSING
+      ) {
+        resolve();
+        return;
+      }
+      socket.once("close", () => resolve());
+      socket.close();
+    });
+  }
+
+  messages(): AsyncIterable<SdkWsMessage> {
+    return this.messagesQueue;
+  }
+}
+
+class SharedSdkWsChannel implements SdkWsTransport, ChannelLike {
+  private readonly messagesQueue = new AsyncQueue<SdkWsMessage>();
+  private readonly pendingResponses = new Map<string, PendingResponse>();
+  private closed = false;
+
+  constructor(
+    private readonly connection: SharedSdkWsConnection,
+    private readonly runId: string,
+    private readonly onClose: () => void,
+  ) {}
+
+  handleIncomingMessage(message: SdkWsMessage): void {
+    if (this.closed) {
+      return;
+    }
+
+    if (
+      message.type === "control_response" &&
+      typeof message.response === "object" &&
+      message.response !== null
+    ) {
+      const requestId = String(
+        (message.response as Record<string, unknown>).request_id ?? "",
+      );
+      const pending = this.pendingResponses.get(requestId);
+      if (pending) {
+        this.pendingResponses.delete(requestId);
+        pending.resolve(message);
       }
     }
+
+    this.messagesQueue.push(message);
+  }
+
+  handleConnectionClosed(error: Error): void {
+    if (this.closed) {
+      return;
+    }
+    for (const pending of this.pendingResponses.values()) {
+      pending.reject(error);
+    }
+    this.pendingResponses.clear();
+    this.messagesQueue.fail(error);
+  }
+
+  async waitForConnection(timeoutMs = 15_000): Promise<void> {
+    await this.connection.waitForConnection(timeoutMs);
+  }
+
+  async send(message: SdkWsMessage): Promise<void> {
+    await this.connection.sendToRun(this.runId, message);
+  }
+
+  async request(request: Record<string, unknown>): Promise<SdkWsMessage> {
+    const requestId = randomUUID();
+    const response = new Promise<SdkWsMessage>((resolve, reject) => {
+      this.pendingResponses.set(requestId, { resolve, reject });
+    });
+
+    await this.send({
+      type: "control_request",
+      request_id: requestId,
+      request,
+    });
+
+    return response;
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    for (const pending of this.pendingResponses.values()) {
+      pending.reject(new Error("SDK WebSocket channel closed."));
+    }
+    this.pendingResponses.clear();
+    this.messagesQueue.finish();
+    this.onClose();
+  }
+
+  messages(): AsyncIterable<SdkWsMessage> {
+    return this.messagesQueue;
+  }
+}
+
+export class SharedSdkWsConnection {
+  private socket?: WebSocket;
+  private readonly channels = new Map<string, SharedSdkWsChannel>();
+
+  constructor(private readonly url: string) {}
+
+  async start(): Promise<void> {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      return;
+    }
+
+    const socket = new WebSocket(this.url);
+    this.socket = socket;
+
+    socket.on("message", (data) => {
+      const lines = data
+        .toString()
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+      for (const line of lines) {
+        try {
+          const envelope = JSON.parse(line) as {
+            runId?: string;
+            message?: SdkWsMessage;
+          };
+          if (!envelope.runId || !envelope.message) {
+            continue;
+          }
+          this.channels
+            .get(envelope.runId)
+            ?.handleIncomingMessage(envelope.message);
+        } catch (error) {
+          const failure =
+            error instanceof Error
+              ? error
+              : new Error("Failed to parse shared SDK message.");
+          for (const channel of this.channels.values()) {
+            channel.handleConnectionClosed(failure);
+          }
+        }
+      }
+    });
+    socket.on("close", () => {
+      if (this.socket === socket) {
+        this.socket = undefined;
+      }
+      const error = new Error("Shared SDK WebSocket connection closed.");
+      for (const channel of this.channels.values()) {
+        channel.handleConnectionClosed(error);
+      }
+    });
+    socket.on("error", (error) => {
+      for (const channel of this.channels.values()) {
+        channel.handleConnectionClosed(error);
+      }
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        socket.off("open", handleOpen);
+        socket.off("error", handleError);
+      };
+      const handleOpen = () => {
+        cleanup();
+        resolve();
+      };
+      const handleError = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      socket.once("open", handleOpen);
+      socket.once("error", handleError);
+    });
+  }
+
+  async waitForConnection(timeoutMs = 15_000): Promise<void> {
+    await waitFor(async () => this.socket?.readyState === WebSocket.OPEN, {
+      timeoutMs,
+      intervalMs: 100,
+    });
+  }
+
+  createChannel(runId: string): SdkWsTransport {
+    const existing = this.channels.get(runId);
+    if (existing) {
+      return existing;
+    }
+
+    const channel = new SharedSdkWsChannel(this, runId, () => {
+      this.channels.delete(runId);
+    });
+    this.channels.set(runId, channel);
+    return channel;
+  }
+
+  async sendToRun(runId: string, message: SdkWsMessage): Promise<void> {
+    await this.waitForConnection();
+    await new Promise<void>((resolve, reject) => {
+      this.socket?.send(`${JSON.stringify({ runId, message })}\n`, (error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve();
+      });
+    });
+  }
+
+  async close(): Promise<void> {
+    for (const channel of this.channels.values()) {
+      await channel.close();
+    }
+    this.channels.clear();
+
+    if (!this.socket) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      const socket = this.socket;
+      this.socket = undefined;
+      if (!socket) {
+        resolve();
+        return;
+      }
+      if (
+        socket.readyState === WebSocket.CLOSED ||
+        socket.readyState === WebSocket.CLOSING
+      ) {
+        resolve();
+        return;
+      }
+      socket.once("close", () => resolve());
+      socket.close();
+    });
   }
 }

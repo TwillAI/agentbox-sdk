@@ -102,6 +102,7 @@ export function buildOpenCodeMcpConfig(
 export function buildCodexConfigToml(
   mcps: AgentMcpConfig[] | undefined,
   agentSections: string[] = [],
+  enableHooks = false,
 ): string | undefined {
   const blocks: string[] = [];
 
@@ -136,6 +137,12 @@ export function buildCodexConfigToml(
     if (mcp.env && Object.keys(mcp.env).length > 0) {
       blocks.push(`env_vars = ${tomlStringArray(Object.keys(mcp.env))}`);
     }
+    blocks.push("");
+  }
+
+  if (enableHooks) {
+    blocks.push("[features]");
+    blocks.push("codex_hooks = true");
     blocks.push("");
   }
 

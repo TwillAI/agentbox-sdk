@@ -5,7 +5,7 @@ import {
   LOCAL_DOCKER_E2E_PROVIDERS,
   LOCAL_DOCKER_E2E_TIMEOUT_MS,
   runApprovalScenario,
-  runClaudeHookScenario,
+  runHookScenario,
   runImageScenario,
   runSimpleScenario,
   runSkillScenario,
@@ -74,10 +74,10 @@ describe.skipIf(!LOCAL_DOCKER_E2E_ENABLED)("local docker agent e2e", () => {
     LOCAL_DOCKER_E2E_TIMEOUT_MS,
   );
 
-  it(
-    "claude-code runs configured hooks inside the sandbox",
-    async () => {
-      const result = await runClaudeHookScenario();
+  it.each(LOCAL_DOCKER_E2E_PROVIDERS)(
+    "%s runs configured native hook support inside the sandbox",
+    async (provider) => {
+      const result = await runHookScenario(provider);
 
       expect(result.sessionId.length).toBeGreaterThan(0);
       expect(result.text).toContain("hook-complete");

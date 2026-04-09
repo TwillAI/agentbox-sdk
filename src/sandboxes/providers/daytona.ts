@@ -12,7 +12,7 @@ import type {
 } from "../types";
 import { AsyncQueue } from "../../shared/async-queue";
 import { sleep } from "../../shared/network";
-import { toShellCommand } from "../../shared/shell";
+import { shellQuote, toShellCommand } from "../../shared/shell";
 import { resolveSandboxImage, resolveSandboxResources } from "../image-utils";
 
 type DaytonaRaw = {
@@ -138,7 +138,7 @@ export class DaytonaSandboxDriver extends SandboxDriver<
     const response = await sandbox.process.executeSessionCommand(
       sessionId,
       {
-        command: toShellCommand(command),
+        command: this.buildSessionCommand(command, options),
         runAsync: true,
       },
       options?.timeoutMs ? Math.ceil(options.timeoutMs / 1000) : undefined,
@@ -149,6 +149,7 @@ export class DaytonaSandboxDriver extends SandboxDriver<
     let stdout = "";
     let stderr = "";
     let exitCode = 0;
+    let killed = false;
 
     const streamLogs = sandbox.process.getSessionCommandLogs(
       sessionId,
@@ -173,19 +174,35 @@ export class DaytonaSandboxDriver extends SandboxDriver<
 
     const completion = (async () => {
       while (true) {
-        const status = await sandbox.process.getSessionCommand(
-          sessionId,
-          commandId,
-        );
+        let status;
+        try {
+          status = await sandbox.process.getSessionCommand(
+            sessionId,
+            commandId,
+          );
+        } catch (error) {
+          if (killed) {
+            break;
+          }
+          throw error;
+        }
         if (status.exitCode !== null && status.exitCode !== undefined) {
-          exitCode = status.exitCode;
+          if (!killed) {
+            exitCode = status.exitCode;
+          }
           break;
         }
 
         await sleep(500);
       }
 
-      await streamLogs;
+      try {
+        await streamLogs;
+      } catch (error) {
+        if (!killed) {
+          throw error;
+        }
+      }
       queue.push({
         type: "exit",
         exitCode,
@@ -210,7 +227,9 @@ export class DaytonaSandboxDriver extends SandboxDriver<
       raw: { sessionId, commandId },
       wait: () => completion,
       kill: async () => {
-        await sandbox.process.deleteSession(sessionId);
+        killed = true;
+        exitCode = 130;
+        await sandbox.process.deleteSession(sessionId).catch(() => undefined);
       },
       [Symbol.asyncIterator]: () => queue[Symbol.asyncIterator](),
     };
@@ -269,6 +288,26 @@ export class DaytonaSandboxDriver extends SandboxDriver<
       "openagent.provider": this.provider,
       ...(this.options.tags ?? {}),
     };
+  }
+
+  private buildSessionCommand(
+    command: string | string[],
+    options?: CommandOptions,
+  ): string {
+    const statements: string[] = [];
+    const cwd = options?.cwd ?? this.workingDir;
+    const env = this.getMergedEnv(options?.env);
+
+    if (cwd) {
+      statements.push(`cd ${shellQuote(cwd)}`);
+    }
+
+    for (const [name, value] of Object.entries(env)) {
+      statements.push(`export ${name}=${shellQuote(value)}`);
+    }
+
+    statements.push(toShellCommand(command));
+    return statements.join(" && ");
   }
 
   private async findMatchingSandbox(): Promise<

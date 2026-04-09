@@ -25,7 +25,6 @@ Construction-time `Agent` options are for reusable environment/runtime setup:
 - `mcps`
 - `skills`
 - `subAgents`
-- `hooks`
 - `commands`
 - `provider`
 
@@ -36,7 +35,13 @@ Run-time config must stay minimal:
 - `systemPrompt`
 - `resumeSessionId`
 
-Do not move MCPs, skills, hooks, commands, or sub-agents into the run config.
+Do not move MCPs, skills, commands, or sub-agents into the run config.
+
+Hooks are provider-specific because their semantics do not line up cleanly across runtimes:
+
+- Claude Code: configure native hooks under `provider.hooks`
+- Codex: configure native hooks under `provider.hooks`
+- OpenCode: configure native plugin hooks under `provider.plugins`
 
 Keep `sessionId` as the unified public concept, even though providers map it differently internally:
 
@@ -121,7 +126,7 @@ Key expectations:
 - the script should exercise the real `Agent` and `Sandbox` abstractions
 - it should produce comparable evidence across providers
 - shared feature coverage should include simple runs plus skills, sub-agents, and interactive approvals
-- Claude-only feature coverage should include hooks, because hooks are not supported for Codex or OpenCode in this package
+- provider-native hook coverage should exercise Claude hooks, Codex hooks, and OpenCode plugin hooks
 - CI should build its own Docker image from the repo and rely on GitHub Actions secrets instead of host-specific auth folders where possible
 
 ## When Editing

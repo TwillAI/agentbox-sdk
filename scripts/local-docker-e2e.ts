@@ -325,7 +325,10 @@ export async function runApprovalScenario(
       }
 
       const result = await run.finished;
-      const outputFileContents = await readSandboxFile(sandbox, outputFile);
+      const outputFileContents = await readSandboxFileEventually(
+        sandbox,
+        outputFile,
+      );
 
       return {
         provider,
@@ -342,41 +345,105 @@ export async function runApprovalScenario(
   );
 }
 
-export async function runClaudeHookScenario(): Promise<HookScenarioResult> {
-  const provider = "claude-code";
+export async function runHookScenario(
+  provider: LocalDockerProvider,
+): Promise<HookScenarioResult> {
   const triggerFile = `/workspace/hook-trigger-${randomUUID()}.txt`;
   const triggerText = `trigger-${randomUUID()}`;
   const hookFile = `/workspace/hook-${randomUUID()}.txt`;
   const hookText = `hook-${randomUUID()}`;
   const finalText = `hook-complete-${randomUUID()}`;
+  const codexHookCommand = [
+    buildNodeWriteCommand(triggerFile, triggerText),
+    buildNodeWriteCommand(hookFile, hookText),
+  ].join(" && ");
 
   return withPreparedSandbox(
     provider,
     "hooks",
     async ({ sandbox, version }) => {
-      const agent = new Agent(provider, {
-        sandbox,
-        cwd: "/workspace",
-        env: COMMON_SANDBOX_ENV,
-        hooks: [
-          {
-            event: "PostToolUse",
-            matcher: "Bash",
-            type: "command",
-            command: buildNodeWriteCommand(hookFile, hookText),
-          },
-        ],
-      });
+      const agent =
+        provider === "opencode"
+          ? new Agent("opencode", {
+              sandbox,
+              cwd: "/workspace",
+              env: COMMON_SANDBOX_ENV,
+              provider: {
+                plugins: [
+                  {
+                    name: "openagent-hook-marker",
+                    hooks: [
+                      {
+                        event: "tool.execute.after",
+                        body: [
+                          'const { writeFile } = await import("node:fs/promises");',
+                          `await writeFile(${JSON.stringify(hookFile)}, ${JSON.stringify(hookText)});`,
+                        ].join("\n"),
+                      },
+                    ],
+                  },
+                ],
+              },
+            })
+          : provider === "codex"
+            ? new Agent("codex", {
+                sandbox,
+                cwd: "/workspace",
+                env: COMMON_SANDBOX_ENV,
+                provider: {
+                  hooks: {
+                    UserPromptSubmit: [
+                      {
+                        hooks: [
+                          {
+                            type: "command",
+                            command: codexHookCommand,
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                },
+              })
+            : new Agent("claude-code", {
+                sandbox,
+                cwd: "/workspace",
+                env: COMMON_SANDBOX_ENV,
+                provider: {
+                  hooks: {
+                    PostToolUse: [
+                      {
+                        matcher: "Bash",
+                        hooks: [
+                          {
+                            type: "command",
+                            command: buildNodeWriteCommand(hookFile, hookText),
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                },
+              });
       const result = await agent.run({
-        input: [
-          "Use the Bash tool for this task.",
-          "Run this exact command and do not change it:",
-          buildNodeWriteCommand(triggerFile, triggerText),
-          `After the command succeeds, reply with exactly ${finalText} and nothing else.`,
-        ].join("\n"),
+        input:
+          provider === "codex"
+            ? `Reply with exactly ${finalText} and nothing else.`
+            : [
+                "Use the Bash tool for this task.",
+                "Run this exact command and do not change it:",
+                buildNodeWriteCommand(triggerFile, triggerText),
+                `After the command succeeds, reply with exactly ${finalText} and nothing else.`,
+              ].join("\n"),
       });
-      const hookFileContents = await readSandboxFile(sandbox, hookFile);
-      const triggerFileContents = await readSandboxFile(sandbox, triggerFile);
+      const hookFileContents = await readSandboxFileEventually(
+        sandbox,
+        hookFile,
+      );
+      const triggerFileContents = await readSandboxFileEventually(
+        sandbox,
+        triggerFile,
+      );
 
       return {
         provider,
@@ -406,6 +473,33 @@ export async function readSandboxFile(
   }
 
   return result.stdout.trim();
+}
+
+export async function readSandboxFileEventually(
+  sandbox: Sandbox<"local-docker">,
+  targetPath: string,
+  options?: {
+    attempts?: number;
+    delayMs?: number;
+  },
+): Promise<string> {
+  const attempts = options?.attempts ?? 10;
+  const delayMs = options?.delayMs ?? 250;
+
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await readSandboxFile(sandbox, targetPath);
+    } catch (error) {
+      lastError = error;
+      if (attempt === attempts - 1) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  throw lastError;
 }
 
 function loadDotEnvFile(fileUrl: URL): Record<string, string> {

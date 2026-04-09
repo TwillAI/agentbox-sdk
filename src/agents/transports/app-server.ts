@@ -1,4 +1,5 @@
 import { createParser, type EventSourceMessage } from "eventsource-parser";
+import { WebSocket } from "ws";
 
 import { AsyncQueue } from "../../shared/async-queue";
 
@@ -73,6 +74,77 @@ type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (reason?: unknown) => void;
 };
+
+export interface JsonRpcWebSocketTransport {
+  source: AsyncIterable<string>;
+  send: (line: string) => Promise<void>;
+  close: () => Promise<void>;
+  raw: WebSocket;
+}
+
+export async function connectJsonRpcWebSocket(
+  url: string,
+): Promise<JsonRpcWebSocketTransport> {
+  const notifications = new AsyncQueue<string>();
+  const socket = new WebSocket(url);
+
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      socket.off("open", handleOpen);
+      socket.off("error", handleError);
+    };
+    const handleOpen = () => {
+      cleanup();
+      resolve();
+    };
+    const handleError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    socket.once("open", handleOpen);
+    socket.once("error", handleError);
+  });
+
+  socket.on("message", (data) => {
+    notifications.push(data.toString());
+  });
+  socket.on("close", () => {
+    notifications.finish();
+  });
+  socket.on("error", (error) => {
+    notifications.fail(error);
+  });
+
+  return {
+    source: notifications,
+    send: async (line: string) => {
+      await new Promise<void>((resolve, reject) => {
+        socket.send(line, (error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+
+          resolve();
+        });
+      });
+    },
+    close: async () => {
+      await new Promise<void>((resolve) => {
+        if (
+          socket.readyState === WebSocket.CLOSED ||
+          socket.readyState === WebSocket.CLOSING
+        ) {
+          resolve();
+          return;
+        }
+        socket.once("close", () => resolve());
+        socket.close();
+      });
+    },
+    raw: socket,
+  };
+}
 
 export class JsonRpcLineClient<TNotification = unknown> {
   private readonly pending = new Map<number, PendingRequest>();
