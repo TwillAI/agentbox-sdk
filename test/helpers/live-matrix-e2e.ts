@@ -14,7 +14,7 @@ import { buildSandboxImage } from "../../src/sandbox-images/build";
 
 export type LiveMatrixSandboxProvider = Extract<
   SandboxProviderName,
-  "local-docker" | "modal" | "daytona" | "e2b"
+  "local-docker" | "modal" | "daytona" | "e2b" | "vercel"
 >;
 
 export type LiveMatrixAgentProvider = AgentProviderName;
@@ -57,6 +57,7 @@ export const LIVE_MATRIX_SANDBOX_PROVIDERS = [
   "modal",
   "daytona",
   "e2b",
+  "vercel",
 ] as const satisfies readonly LiveMatrixSandboxProvider[];
 
 export const LIVE_MATRIX_AGENT_PROVIDERS = [
@@ -75,6 +76,9 @@ const OPENCODE_CONFIG_CONTENT = buildOpenCodeConfigContent();
 const LOCAL_DOCKER_OPENCODE_PORT = 4096;
 const MODAL_OPENCODE_PORT = 4096;
 const MODAL_CODEX_PORT = 43181;
+const VERCEL_OPENCODE_PORT = 4096;
+const VERCEL_CODEX_PORT = 43181;
+const VERCEL_CLAUDE_CODE_PORT = 43180;
 const IMAGE_BUILD_SUFFIX = randomUUID().slice(0, 8);
 const imageCache = new Map<LiveMatrixSandboxProvider, Promise<string>>();
 
@@ -146,82 +150,90 @@ export async function runSimpleStreamMatrixScenario(
   const sandbox = createSandboxForCombination(combination, image);
 
   try {
-    const version = await prepareSandboxForCombination(combination, sandbox);
-    const sessions = Array.from(
-      { length: LIVE_MATRIX_CONCURRENT_SESSION_COUNT },
-      (_, index) => {
-        const expectedText = `matrix-ok-${combination.sandboxProvider}-${combination.agentProvider}-${index + 1}-${randomUUID()}`;
-        const agent = createAgentForCombination(combination, sandbox);
-        const run = agent.stream({
-          input: `Reply with exactly ${expectedText} and nothing else.`,
-          model: getModelForCombination(combination.agentProvider),
-        });
-        void run.finished.catch(() => undefined);
-
-        return {
-          expectedText,
-          run,
-          eventTypes: [] as NormalizedAgentEvent["type"][],
-          streamedText: "",
-        };
-      },
-    );
-
-    const abortAllRuns = async () => {
-      await Promise.allSettled(sessions.map((session) => session.run.abort()));
-    };
-
-    await Promise.all(
-      sessions.map((session, index) =>
-        withTimeout(
-          `${formatLiveMatrixLabel(combination)} session ${index + 1}`,
-          () => session.run.sessionIdReady,
-          Math.min(LIVE_MATRIX_E2E_TIMEOUT_MS, 120_000),
-          () => session.run.abort(),
-        ),
-      ),
-    );
-
-    let completedSessions: LiveMatrixSessionResult[];
-    try {
-      completedSessions = await withTimeout(
-        `${formatLiveMatrixLabel(combination)} concurrent run`,
-        () =>
-          Promise.all(
-            sessions.map(async (session) => {
-              for await (const event of session.run) {
-                session.eventTypes.push(event.type);
-                if (event.type === "text.delta") {
-                  session.streamedText += event.delta;
-                }
-              }
-              const result = await session.run.finished;
-              return {
-                sessionId: result.sessionId,
-                expectedText: session.expectedText,
-                text: result.text.trim(),
-                streamedText: session.streamedText.trim(),
-                eventTypes: [...new Set(session.eventTypes)],
-              };
-            }),
-          ),
-        LIVE_MATRIX_E2E_TIMEOUT_MS,
-        abortAllRuns,
-      );
-    } catch (error) {
-      await abortAllRuns();
-      throw error;
-    }
-
-    return {
-      ...combination,
-      image,
-      version,
-      sessions: completedSessions,
-    };
+    return await runScenarioWithSandbox(combination, sandbox, image);
   } finally {
     await sandbox.delete().catch(() => undefined);
   }
+}
+
+async function runScenarioWithSandbox(
+  combination: LiveMatrixCombination,
+  sandbox: Sandbox<LiveMatrixSandboxProvider>,
+  image: string,
+): Promise<LiveMatrixScenarioResult> {
+  const version = await prepareSandboxForCombination(combination, sandbox);
+  const sessions = Array.from(
+    { length: LIVE_MATRIX_CONCURRENT_SESSION_COUNT },
+    (_, index) => {
+      const expectedText = `matrix-ok-${combination.sandboxProvider}-${combination.agentProvider}-${index + 1}-${randomUUID()}`;
+      const agent = createAgentForCombination(combination, sandbox);
+      const run = agent.stream({
+        input: `Reply with exactly ${expectedText} and nothing else.`,
+        model: getModelForCombination(combination.agentProvider),
+      });
+      void run.finished.catch(() => undefined);
+
+      return {
+        expectedText,
+        run,
+        eventTypes: [] as NormalizedAgentEvent["type"][],
+        streamedText: "",
+      };
+    },
+  );
+
+  const abortAllRuns = async () => {
+    await Promise.allSettled(sessions.map((session) => session.run.abort()));
+  };
+
+  await Promise.all(
+    sessions.map((session, index) =>
+      withTimeout(
+        `${formatLiveMatrixLabel(combination)} session ${index + 1}`,
+        () => session.run.sessionIdReady,
+        Math.min(LIVE_MATRIX_E2E_TIMEOUT_MS, 120_000),
+        () => session.run.abort(),
+      ),
+    ),
+  );
+
+  let completedSessions: LiveMatrixSessionResult[];
+  try {
+    completedSessions = await withTimeout(
+      `${formatLiveMatrixLabel(combination)} concurrent run`,
+      () =>
+        Promise.all(
+          sessions.map(async (session) => {
+            for await (const event of session.run) {
+              session.eventTypes.push(event.type);
+              if (event.type === "text.delta") {
+                session.streamedText += event.delta;
+              }
+            }
+            const result = await session.run.finished;
+            return {
+              sessionId: result.sessionId,
+              expectedText: session.expectedText,
+              text: result.text.trim(),
+              streamedText: session.streamedText.trim(),
+              eventTypes: [...new Set(session.eventTypes)],
+            };
+          }),
+        ),
+      LIVE_MATRIX_E2E_TIMEOUT_MS,
+      abortAllRuns,
+    );
+  } catch (error) {
+    await abortAllRuns();
+    throw error;
+  }
+
+  return {
+    ...combination,
+    image,
+    version,
+    sessions: completedSessions,
+  };
 }
 
 function buildLiveMatrixPlan(): {
@@ -267,6 +279,17 @@ function getSandboxSkipReason(
   if (sandboxProvider === "daytona") {
     if (!ROOT_ENV.DAYTONA_API_KEY && !ROOT_ENV.DAYTONA_JWT_TOKEN) {
       return "requires DAYTONA_API_KEY or DAYTONA_JWT_TOKEN.";
+    }
+    return null;
+  }
+
+  if (sandboxProvider === "vercel") {
+    if (
+      !ROOT_ENV.VERCEL_TOKEN ||
+      !ROOT_ENV.VERCEL_TEAM_ID ||
+      !ROOT_ENV.VERCEL_PROJECT_ID
+    ) {
+      return "requires VERCEL_TOKEN, VERCEL_TEAM_ID, and VERCEL_PROJECT_ID.";
     }
     return null;
   }
@@ -361,6 +384,13 @@ async function resolveSandboxImage(
       });
     }
 
+    if (sandboxProvider === "vercel") {
+      if (ROOT_ENV.AGENTBOX_VERCEL_SNAPSHOT_ID) {
+        return ROOT_ENV.AGENTBOX_VERCEL_SNAPSHOT_ID;
+      }
+      return buildVercelMatrixSnapshot();
+    }
+
     return buildSandboxImage({
       provider: "e2b",
       preset: "browser-agent",
@@ -446,6 +476,37 @@ function createSandboxForCombination(
           ? { apiUrl: ROOT_ENV.DAYTONA_API_URL }
           : {}),
         ...(ROOT_ENV.DAYTONA_TARGET ? { target: ROOT_ENV.DAYTONA_TARGET } : {}),
+      },
+    });
+  }
+
+  if (combination.sandboxProvider === "vercel") {
+    // Vercel sandboxes are capped at 5 tags total. The shared `tags` block
+    // already has 5 entries, and the adapter auto-adds `agentbox.provider`,
+    // which would push us to 6 and fail at create time. Drop `runner` since
+    // `scope: "e2e"` already conveys it.
+    const { runner: _runner, ...vercelTags } = tags;
+    void _runner;
+    return new Sandbox("vercel", {
+      workingDir: "/workspace",
+      tags: vercelTags,
+      resources: {
+        cpu: 2,
+        memoryMiB: 4096,
+      },
+      provider: {
+        runtime: "node24",
+        snapshotId: image,
+        timeoutMs: 30 * 60_000,
+        ports: getVercelPortsForAgent(combination.agentProvider),
+        ...(ROOT_ENV.VERCEL_TOKEN ? { token: ROOT_ENV.VERCEL_TOKEN } : {}),
+        ...(ROOT_ENV.VERCEL_TEAM_ID ? { teamId: ROOT_ENV.VERCEL_TEAM_ID } : {}),
+        ...(ROOT_ENV.VERCEL_PROJECT_ID
+          ? { projectId: ROOT_ENV.VERCEL_PROJECT_ID }
+          : {}),
+        ...(ROOT_ENV.VERCEL_PROTECTION_BYPASS
+          ? { protectionBypass: ROOT_ENV.VERCEL_PROTECTION_BYPASS }
+          : {}),
       },
     });
   }
@@ -600,6 +661,81 @@ function getModalPortsForAgent(
   }
 
   return [43180];
+}
+
+function getVercelPortsForAgent(
+  agentProvider: LiveMatrixAgentProvider,
+): number[] {
+  if (agentProvider === "codex") {
+    return [VERCEL_CODEX_PORT];
+  }
+
+  if (agentProvider === "opencode") {
+    return [VERCEL_OPENCODE_PORT];
+  }
+
+  // claude-code uses an SDK WebSocket relay on REMOTE_SDK_RELAY_PORT (43180)
+  return [VERCEL_CLAUDE_CODE_PORT];
+}
+
+async function buildVercelMatrixSnapshot(): Promise<string> {
+  if (
+    !ROOT_ENV.VERCEL_TOKEN ||
+    !ROOT_ENV.VERCEL_TEAM_ID ||
+    !ROOT_ENV.VERCEL_PROJECT_ID
+  ) {
+    throw new Error(
+      "Vercel matrix snapshot build requires VERCEL_TOKEN, VERCEL_TEAM_ID, and VERCEL_PROJECT_ID.",
+    );
+  }
+
+  const log = (chunk: string) => logImageBuildProgress("vercel", chunk);
+
+  const prep = new Sandbox("vercel", {
+    workingDir: "/workspace",
+    tags: {
+      scope: "e2e",
+      runner: "live-matrix",
+      role: "snapshot-build",
+      run: IMAGE_BUILD_SUFFIX,
+    },
+    resources: { cpu: 2, memoryMiB: 4096 },
+    provider: {
+      runtime: "node24",
+      timeoutMs: 30 * 60_000,
+      token: ROOT_ENV.VERCEL_TOKEN,
+      teamId: ROOT_ENV.VERCEL_TEAM_ID,
+      projectId: ROOT_ENV.VERCEL_PROJECT_ID,
+      ...(ROOT_ENV.VERCEL_PROTECTION_BYPASS
+        ? { protectionBypass: ROOT_ENV.VERCEL_PROTECTION_BYPASS }
+        : {}),
+    },
+  });
+
+  try {
+    log("provisioning prep sandbox");
+    const install = await prep.run(
+      "sudo npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai",
+      { timeoutMs: 5 * 60_000 },
+    );
+    if (install.exitCode !== 0) {
+      throw new Error(
+        `Failed to install agent CLIs in Vercel prep sandbox: ${
+          install.stderr || install.combinedOutput
+        }`,
+      );
+    }
+    log("agent CLIs installed");
+
+    const snapshotId = await prep.snapshot();
+    if (!snapshotId) {
+      throw new Error("Vercel prep sandbox returned a null snapshot id.");
+    }
+    log(`snapshot ready ${snapshotId}`);
+    return snapshotId;
+  } finally {
+    await prep.delete().catch(() => undefined);
+  }
 }
 
 function buildOpenCodeConfigContent(): string | undefined {

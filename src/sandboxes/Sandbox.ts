@@ -2,6 +2,7 @@ import { DaytonaSandboxAdapter } from "./providers/daytona";
 import { E2bSandboxAdapter } from "./providers/e2b";
 import { LocalDockerSandboxAdapter } from "./providers/local-docker";
 import { ModalSandboxAdapter } from "./providers/modal";
+import { VercelSandboxAdapter } from "./providers/vercel";
 import type {
   AsyncCommandHandle,
   CommandOptions,
@@ -32,6 +33,10 @@ function createSandboxAdapter<P extends SandboxProviderName>(
     case "daytona":
       return new DaytonaSandboxAdapter(
         options as SandboxOptions<"daytona">,
+      ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
+    case "vercel":
+      return new VercelSandboxAdapter(
+        options as SandboxOptions<"vercel">,
       ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
     case "e2b":
       return new E2bSandboxAdapter(
@@ -119,5 +124,20 @@ export class Sandbox<P extends SandboxProviderName = SandboxProviderName> {
 
   async getPreviewLink(port: number): Promise<string> {
     return this.adapter.getPreviewLink(port);
+  }
+
+  get previewHeaders(): Record<string, string> {
+    return this.adapter.previewHeaders;
+  }
+
+  async uploadFile(
+    content: Buffer | string,
+    targetPath: string,
+  ): Promise<void> {
+    return this.adapter.uploadFile(content, targetPath);
+  }
+
+  async downloadFile(sourcePath: string): Promise<Buffer> {
+    return this.adapter.downloadFile(sourcePath);
   }
 }

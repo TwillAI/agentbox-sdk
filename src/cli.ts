@@ -105,6 +105,7 @@ function isSandboxProviderName(value: string): value is SandboxProviderName {
     value === "local-docker" ||
     value === "modal" ||
     value === "daytona" ||
+    value === "vercel" ||
     value === "e2b"
   );
 }
@@ -117,8 +118,8 @@ function printHelp(): void {
   process.stdout.write(`agentbox
 
 Usage:
-  agentbox image build --provider <local-docker|modal|daytona|e2b> --preset <browser-agent|computer-use>
-  agentbox image build --provider <local-docker|modal|daytona|e2b> --file <path>
+  agentbox image build --provider <local-docker|modal|daytona|vercel|e2b> --preset <browser-agent|computer-use>
+  agentbox image build --provider <local-docker|modal|daytona|vercel|e2b> --file <path>
 
 Options:
   --image-name <name>        Override the built artifact name
@@ -127,6 +128,7 @@ Options:
 Environment:
   Modal: MODAL_TOKEN_ID, MODAL_TOKEN_SECRET, MODAL_ENVIRONMENT?, MODAL_ENDPOINT?
   Daytona: DAYTONA_API_KEY or DAYTONA_JWT_TOKEN, DAYTONA_ORGANIZATION_ID?, DAYTONA_API_URL?, DAYTONA_TARGET?
+  Vercel: VERCEL_TOKEN, VERCEL_TEAM_ID, VERCEL_PROJECT_ID
   E2B: E2B_API_KEY, E2B_DOMAIN?, E2B_ACCESS_TOKEN?
 `);
 }

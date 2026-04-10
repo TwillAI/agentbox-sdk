@@ -51,6 +51,27 @@ describe.skipIf(!smokeEnabled)("optional provider smoke tests", () => {
     expect(Array.isArray(sandboxes)).toBe(true);
   });
 
+  it("can list Vercel sandboxes when credentials are present", async () => {
+    if (
+      !process.env.VERCEL_TOKEN ||
+      !process.env.VERCEL_TEAM_ID ||
+      !process.env.VERCEL_PROJECT_ID
+    ) {
+      return;
+    }
+
+    const sandbox = new Sandbox("vercel", {
+      provider: {
+        token: process.env.VERCEL_TOKEN,
+        teamId: process.env.VERCEL_TEAM_ID,
+        projectId: process.env.VERCEL_PROJECT_ID,
+      },
+    });
+
+    const sandboxes = await sandbox.list();
+    expect(Array.isArray(sandboxes)).toBe(true);
+  });
+
   it("can list E2B sandboxes when credentials are present", async () => {
     if (!process.env.E2B_API_KEY) {
       return;

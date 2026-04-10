@@ -32,7 +32,7 @@ await sandbox.delete();
 Providers are mix-and-match:
 
 - **Agents** — [`claude-code`](./src/agents/providers/claude-code.ts), [`opencode`](./src/agents/providers/opencode.ts), [`codex`](./src/agents/providers/codex.ts)
-- **Sandboxes** — [`local-docker`](./src/sandboxes/providers/local-docker.ts), [`e2b`](./src/sandboxes/providers/e2b.ts), [`modal`](./src/sandboxes/providers/modal.ts), [`daytona`](./src/sandboxes/providers/daytona.ts)
+- **Sandboxes** — [`local-docker`](./src/sandboxes/providers/local-docker.ts), [`e2b`](./src/sandboxes/providers/e2b.ts), [`modal`](./src/sandboxes/providers/modal.ts), [`daytona`](./src/sandboxes/providers/daytona.ts), [`vercel`](./src/sandboxes/providers/vercel.ts)
 
 Swap either one and your app code stays the same.
 
@@ -124,16 +124,19 @@ new Agent("codex", { sandbox, cwd: "/workspace", approvalMode: "auto" });
 
 ## Sandboxes
 
-Four sandbox providers are supported. Each gives you an isolated environment with the same interface:
+Five sandbox providers are supported. Each gives you an isolated environment with the same interface:
 
-| Provider       | What it is             | Auth                                    |
-| -------------- | ---------------------- | --------------------------------------- |
-| `local-docker` | Local Docker container | Docker daemon                           |
-| `e2b`          | Cloud micro-VM         | `E2B_API_KEY`                           |
-| `modal`        | Cloud container        | `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET` |
-| `daytona`      | Cloud dev environment  | `DAYTONA_API_KEY`                       |
+| Provider       | What it is             | Auth                                                    |
+| -------------- | ---------------------- | ------------------------------------------------------- |
+| `local-docker` | Local Docker container | Docker daemon                                           |
+| `e2b`          | Cloud micro-VM         | `E2B_API_KEY`                                           |
+| `modal`        | Cloud container        | `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET`                 |
+| `daytona`      | Cloud dev environment  | `DAYTONA_API_KEY`                                       |
+| `vercel`       | Ephemeral cloud VM     | `VERCEL_TOKEN` + `VERCEL_TEAM_ID` + `VERCEL_PROJECT_ID` |
 
 Every sandbox supports: `run()`, `runAsync()`, `gitClone()`, `openPort()`, `getPreviewLink()`, `snapshot()`, `stop()`, `delete()`.
+
+Vercel sandboxes use runtime snapshots instead of pre-built images — call `sandbox.snapshot()` to capture state and pass the returned id via `provider.snapshotId` on the next run.
 
 ## Skills
 
@@ -348,6 +351,7 @@ The [`examples/`](./examples) directory has short, runnable scripts that each de
 | [`multimodal.ts`](./examples/multimodal.ts)                     | Send images to the agent      |
 | [`custom-image.ts`](./examples/custom-image.ts)                 | Build a custom sandbox image  |
 | [`cloud-sandbox.ts`](./examples/cloud-sandbox.ts)               | Use E2B, Modal, or Daytona    |
+| [`basic-vercel.ts`](./examples/basic-vercel.ts)                 | Use a Vercel sandbox          |
 | [`git-clone.ts`](./examples/git-clone.ts)                       | Clone a repo into the sandbox |
 
 All examples import from `"agentbox-sdk"` like a normal dependency. Run them with:

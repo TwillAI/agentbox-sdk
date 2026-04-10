@@ -27,11 +27,17 @@ import { installSkills, prepareSkillArtifacts } from "../config/skills";
 import { buildOpenCodeSubagentConfig } from "../config/subagents";
 import { fetchJson, streamSse } from "../transports/app-server";
 import { spawnCommand, waitForHttpReady } from "../transports/spawn";
-import { getAvailablePort } from "../../shared/network";
+import { getAvailablePort, sleep } from "../../shared/network";
 import { shellQuote } from "../../shared/shell";
 
 type OpenCodeRuntime = {
   baseUrl: string;
+  /**
+   * Headers to attach to every request hitting `baseUrl`. Sandbox-backed
+   * runtimes pass through `sandbox.previewHeaders` here so providers like
+   * Vercel can inject their Deployment Protection bypass token.
+   */
+  previewHeaders: Record<string, string>;
   cleanup: () => Promise<void>;
   raw: unknown;
 };
@@ -220,6 +226,7 @@ async function ensureSandboxOpenCodeServer(
   const port = SANDBOX_OPENCODE_PORT;
 
   await sandbox.openPort(port);
+  const previewHeaders = sandbox.previewHeaders;
 
   const healthCheck = await sandbox.run(
     `curl -fsS http://127.0.0.1:${port}/global/health >/dev/null 2>&1`,
@@ -230,6 +237,7 @@ async function ensureSandboxOpenCodeServer(
     const baseUrl = (await sandbox.getPreviewLink(port)).replace(/\/$/, "");
     return {
       baseUrl,
+      previewHeaders,
       cleanup: async () => {},
       raw: { baseUrl, port, reused: true },
     };
@@ -314,13 +322,39 @@ async function ensureSandboxOpenCodeServer(
     );
   }
 
+  // Poll opencode readiness from INSIDE the sandbox via curl localhost.
+  // We can't poll the preview URL because some sandbox proxies (Vercel's
+  // in particular) return a synthetic 200 OK with an empty body for
+  // requests to ports whose listeners haven't started accepting
+  // connections yet — a trivial fetch-based readiness check would get a
+  // false positive while opencode is still doing its first-run DB
+  // migration, and the subsequent POST /session would race the migration
+  // and come back with the same empty 200.
+  const readyDeadline = Date.now() + SANDBOX_OPENCODE_READY_TIMEOUT_MS;
+  let ready = false;
+  while (Date.now() < readyDeadline) {
+    const probe = await sandbox.run(
+      `curl -fsS http://127.0.0.1:${port}/global/health >/dev/null 2>&1`,
+      { cwd: options.cwd, timeoutMs: 5_000 },
+    );
+    if (probe.exitCode === 0) {
+      ready = true;
+      break;
+    }
+    await sleep(500);
+  }
+  if (!ready) {
+    await target.cleanup().catch(() => undefined);
+    throw new Error(
+      `OpenCode server did not become ready within ${SANDBOX_OPENCODE_READY_TIMEOUT_MS}ms.`,
+    );
+  }
+
   const baseUrl = (await sandbox.getPreviewLink(port)).replace(/\/$/, "");
-  await waitForHttpReady(`${baseUrl}/global/health`, {
-    timeoutMs: SANDBOX_OPENCODE_READY_TIMEOUT_MS,
-  });
 
   return {
     baseUrl,
+    previewHeaders,
     cleanup: async () => {
       await target.cleanup().catch(() => undefined);
     },
@@ -394,6 +428,7 @@ async function createLocalRuntime(
 
   return {
     baseUrl,
+    previewHeaders: {},
     cleanup: async () => {
       await processHandle.kill();
       await target.cleanup();
@@ -441,7 +476,10 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
             `${runtime.baseUrl}/session`,
             {
               method: "POST",
-              headers: { "content-type": "application/json" },
+              headers: {
+                "content-type": "application/json",
+                ...runtime.previewHeaders,
+              },
               body: JSON.stringify({
                 title: `AgentBox ${request.runId}`,
               }),
@@ -458,6 +496,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
       sseTask = (async () => {
         try {
           for await (const event of streamSse(`${runtime.baseUrl}/event`, {
+            headers: runtime.previewHeaders,
             signal: sseAbort.signal,
           })) {
             let payload: unknown = event.data;
@@ -502,7 +541,10 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
                   `${runtime.baseUrl}/session/${sessionId}/permissions/${permissionEvent.requestId}`,
                   {
                     method: "POST",
-                    headers: { "content-type": "application/json" },
+                    headers: {
+                      "content-type": "application/json",
+                      ...runtime.previewHeaders,
+                    },
                     body: JSON.stringify({
                       response:
                         response.decision === "allow"
@@ -551,7 +593,10 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
         `${runtime.baseUrl}/session/${sessionId}/message`,
         {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: {
+            "content-type": "application/json",
+            ...runtime.previewHeaders,
+          },
           body: JSON.stringify({
             ...(request.run.model
               ? { model: toOpenCodeModel(request.run.model) }

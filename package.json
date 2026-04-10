@@ -55,6 +55,7 @@
   },
   "dependencies": {
     "@daytonaio/sdk": "^0.161.0",
+    "@vercel/sandbox": "2.0.0-beta.13",
     "dockerode": "^4.0.10",
     "e2b": "^2.19.0",
     "eventsource-parser": "^3.0.6",
@@ -88,6 +89,7 @@
     "modal",
     "daytona",
     "docker",
+    "vercel",
     "typescript",
     "bun"
   ]

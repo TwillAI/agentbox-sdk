@@ -64,6 +64,11 @@ export async function buildSandboxImage(
       return buildDaytonaSnapshot(definition, options);
     case "e2b":
       return buildE2bTemplate(definition, options);
+    default:
+      throw new Error(
+        `Image building is not supported for provider "${options.provider}". ` +
+          `Vercel sandboxes use runtime snapshots instead — see Sandbox.snapshot().`,
+      );
   }
 }
 
