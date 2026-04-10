@@ -36,6 +36,7 @@
     }
   },
   "scripts": {
+    "dev": "tsup src/index.ts src/agents/index.ts src/sandboxes/index.ts src/events/index.ts src/cli.ts --format esm --dts --clean --watch",
     "build": "tsup src/index.ts src/agents/index.ts src/sandboxes/index.ts src/events/index.ts src/cli.ts --format esm --dts --clean",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings=0",
