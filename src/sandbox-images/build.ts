@@ -247,6 +247,17 @@ async function buildDaytonaSnapshot(
 
   const snapshotName =
     options.imageName ?? buildDaytonaSnapshotName(definition);
+
+  try {
+    const existing = await client.snapshot.get(snapshotName);
+    if (existing.state === "active") {
+      options.log?.(`Reusing existing Daytona snapshot ${existing.name}`);
+      return existing.name;
+    }
+  } catch {
+    // Snapshot does not exist yet — fall through to create.
+  }
+
   const snapshot = await client.snapshot.create(
     {
       name: snapshotName,
