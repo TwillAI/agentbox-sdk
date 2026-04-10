@@ -216,8 +216,12 @@ describe.skipIf(!enabled)("Vercel Sandbox E2E", () => {
 
   // ── openPort / getPreviewLink ────────────────────────────────
 
-  it("openPort: is a no-op (does not throw)", async () => {
+  it("openPort: is a no-op and does not actually register the port", async () => {
+    // Vercel ports must be declared at create time via `provider.ports`.
+    // `openPort()` is accepted for API parity but cannot retroactively
+    // register a port with the SDK — `getPreviewLink` should still throw.
     await expect(sandbox.openPort(3000)).resolves.toBe(sandbox);
+    await expect(sandbox.getPreviewLink(3000)).rejects.toThrow();
   });
 
   it("getPreviewLink: throws for ports not declared at create time", async () => {

@@ -138,6 +138,17 @@ Every sandbox supports: `run()`, `runAsync()`, `gitClone()`, `openPort()`, `getP
 
 Vercel sandboxes use runtime snapshots instead of pre-built images — call `sandbox.snapshot()` to capture state and pass the returned id via `provider.snapshotId` on the next run.
 
+Vercel also requires ports to be declared at create time via `provider.ports` — `openPort()` is a no-op at runtime, so any port the agent (or your own code) will listen on must be listed up front:
+
+```ts
+const sandbox = new Sandbox("vercel", {
+  provider: {
+    snapshotId: process.env.VERCEL_SNAPSHOT_ID!,
+    ports: [4096], // e.g. opencode; codex/claude-code use 43180
+  },
+});
+```
+
 ## Skills
 
 Attach GitHub repos as agent skills. They're cloned into the sandbox and surfaced to the agent:

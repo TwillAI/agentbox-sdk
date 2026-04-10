@@ -111,10 +111,6 @@ export class VercelSandboxAdapter extends SandboxAdapter<
 > {
   private sandbox?: VercelSandbox;
 
-  constructor(options: VercelSandboxOptions) {
-    super(options);
-  }
-
   get provider(): "vercel" {
     return "vercel";
   }
