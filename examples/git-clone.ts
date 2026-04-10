@@ -21,7 +21,7 @@ const agent = new Agent("claude-code", {
 });
 
 const result = await agent.run({
-  model: "claude-sonnet-4-6",
+  model: "sonnet",
   input:
     "Read the codebase and write a brief architecture overview to /workspace/express/ARCHITECTURE.md",
 });

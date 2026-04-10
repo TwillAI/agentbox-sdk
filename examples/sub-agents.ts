@@ -24,7 +24,7 @@ const agent = new Agent("claude-code", {
 });
 
 const result = await agent.run({
-  model: "claude-sonnet-4-6",
+  model: "sonnet",
   input: [
     "Create a simple user authentication module in /workspace/auth.ts,",
     "then delegate to the reviewer sub-agent to review it.",

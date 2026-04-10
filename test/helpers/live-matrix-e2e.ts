@@ -572,7 +572,7 @@ function getModelForCombination(
   }
 
   if (agentProvider === "claude-code") {
-    return "claude-sonnet-4-6";
+    return "sonnet";
   }
 
   if (ROOT_ENV.ANTHROPIC_API_KEY) {

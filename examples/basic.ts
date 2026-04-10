@@ -13,7 +13,7 @@ const result = await new Agent("claude-code", {
   cwd: "/workspace",
   approvalMode: "auto",
 }).run({
-  model: "claude-sonnet-4-6",
+  model: "sonnet",
   input: "Create a hello world Express server in /workspace/server.ts",
 });
 

@@ -18,7 +18,7 @@ const run = new Agent("claude-code", {
   cwd: "/workspace",
   approvalMode: "auto",
 }).stream({
-  model: "claude-sonnet-4-6",
+  model: "sonnet",
   input: "Create a hello world Express server in /workspace/server.ts",
 });
 
@@ -78,7 +78,7 @@ const agent = new Agent("claude-code", {
 });
 
 const result = await agent.run({
-  model: "claude-sonnet-4-6",
+  model: "sonnet",
   input:
     "Explain the project structure and write a summary to /workspace/OVERVIEW.md",
 });
@@ -93,7 +93,7 @@ await sandbox.delete();
 
 ```ts
 const run = agent.stream({
-  model: "claude-sonnet-4-6",
+  model: "sonnet",
   input: "Write a fizzbuzz in Python",
 });
 
@@ -112,9 +112,9 @@ Three agent providers are supported. Each wraps a CLI that runs inside the sandb
 
 | Provider      | CLI        | Model format                                    |
 | ------------- | ---------- | ----------------------------------------------- |
-| `claude-code` | `claude`   | `claude-sonnet-4-6`                             |
+| `claude-code` | `claude`   | `sonnet`, `opus`, `haiku`                       |
 | `opencode`    | `opencode` | `anthropic/claude-sonnet-4-6`, `openai/gpt-4.1` |
-| `codex`       | `codex`    | `gpt-5-codex`                                   |
+| `codex`       | `codex`    | `gpt-5.3-codex`, `gpt-5.4`                      |
 
 ```ts
 new Agent("claude-code", { sandbox, cwd: "/workspace", approvalMode: "auto" });
@@ -241,7 +241,7 @@ Pass images and files alongside text:
 import { pathToFileURL } from "node:url";
 
 const result = await agent.run({
-  model: "claude-sonnet-4-6",
+  model: "sonnet",
   input: [
     { type: "text", text: "Describe this mockup and suggest improvements." },
     { type: "image", image: pathToFileURL("/workspace/mockup.png") },

@@ -38,7 +38,7 @@ const agent = new Agent("claude-code", {
 });
 
 const result = await agent.run({
-  model: "claude-sonnet-4-6",
+  model: "sonnet",
   input:
     "Use Playwright to take a screenshot of https://example.com and save it to /workspace/screenshot.png",
 });

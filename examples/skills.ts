@@ -23,7 +23,7 @@ const agent = new Agent("claude-code", {
 });
 
 const result = await agent.run({
-  model: "claude-sonnet-4-6",
+  model: "sonnet",
   input: "Browse https://example.com and tell me what the page says.",
 });
 

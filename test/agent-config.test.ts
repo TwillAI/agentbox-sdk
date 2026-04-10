@@ -282,7 +282,7 @@ describe("config compilers", () => {
           description: "Review code",
           instructions: "Review the diff for likely bugs.",
           tools: ["bash", "read"],
-          model: "claude-opus-4-1",
+          model: "opus",
         },
       ]),
     ).toMatchObject({
@@ -290,7 +290,7 @@ describe("config compilers", () => {
         description: "Review code",
         prompt: "Review the diff for likely bugs.",
         tools: ["bash", "read"],
-        model: "claude-opus-4-1",
+        model: "opus",
       },
     });
   });

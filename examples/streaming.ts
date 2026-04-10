@@ -15,7 +15,7 @@ const agent = new Agent("claude-code", {
 });
 
 const run = agent.stream({
-  model: "claude-sonnet-4-6",
+  model: "sonnet",
   input:
     "Write a fizzbuzz function in Python and save it to /workspace/fizzbuzz.py",
 });

@@ -21,7 +21,7 @@ const rl = readline.createInterface({
 });
 
 const run = agent.stream({
-  model: "claude-sonnet-4-6",
+  model: "sonnet",
   input:
     "Install express and create a hello world server in /workspace/server.ts",
 });
