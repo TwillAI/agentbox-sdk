@@ -3,17 +3,6 @@ name: Local Docker E2E
 on:
   workflow_dispatch:
   workflow_call:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/local-docker-e2e.yml"
-      - "docker/e2e/**"
-      - "package.json"
-      - "package-lock.json"
-      - "src/**"
-      - "test/**"
-      - "test/helpers/local-docker-e2e.ts"
 
 jobs:
   local-docker-e2e:
