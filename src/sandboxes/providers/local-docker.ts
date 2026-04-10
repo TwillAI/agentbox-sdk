@@ -18,7 +18,7 @@ import { readNodeStream } from "../../shared/streams";
 import { toShellCommand } from "../../shared/shell";
 import { resolveSandboxImage, resolveSandboxResources } from "../image-utils";
 
-type DockerRaw = {
+export type DockerRaw = {
   client: Docker;
   container?: Docker.Container;
 };
@@ -399,7 +399,7 @@ export class LocalDockerSandboxAdapter extends SandboxAdapter<
 
   private getLabels(): Record<string, string> {
     return {
-      "openagent.provider": this.provider,
+      "agentbox.provider": this.provider,
       ...(this.options.tags ?? {}),
     };
   }
@@ -412,7 +412,7 @@ export class LocalDockerSandboxAdapter extends SandboxAdapter<
 
   private toDockerLabelFilters(tags?: Record<string, string>): string[] {
     const labels = {
-      "openagent.provider": this.provider,
+      "agentbox.provider": this.provider,
       ...(tags ?? {}),
     };
 

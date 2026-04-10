@@ -85,7 +85,7 @@ function buildThreadParams(
     model: request.run.model ?? null,
     approvalPolicy: isInteractiveApproval(options) ? "untrusted" : "never",
     sandbox: buildCodexSandboxMode(options),
-    serviceName: "openagent",
+    serviceName: "agentbox",
     ephemeral: true,
     experimentalRawEvents: true,
   };
@@ -776,7 +776,7 @@ async function createRuntime(
     instructionsFilePath = path.join(
       target.layout.codexDir,
       "prompts",
-      "openagent-system.md",
+      "agentbox-system.md",
     );
     artifacts.push({
       path: instructionsFilePath,
@@ -944,7 +944,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
           ) {
             reject(
               new Error(
-                "Codex tool/requestUserInput approvals are not yet supported by OpenAgent.",
+                "Codex tool/requestUserInput approvals are not yet supported by AgentBox.",
               ),
             );
             return;
@@ -1004,8 +1004,8 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       if (!runtime.client) {
         await client.request("initialize", {
           clientInfo: {
-            title: "OpenAgent",
-            name: "OpenAgent",
+            title: "AgentBox",
+            name: "AgentBox",
             version: "0.1.0",
           },
           capabilities: {

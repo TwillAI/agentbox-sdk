@@ -111,7 +111,7 @@ function toPluginFileName(name: string, extension: "js" | "ts"): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return `${base || "openagent-plugin"}.${extension}`;
+  return `${base || "agentbox-plugin"}.${extension}`;
 }
 
 function toPluginExportName(name: string): string {
@@ -120,10 +120,10 @@ function toPluginExportName(name: string): string {
     .split(/\s+/)
     .filter(Boolean)
     .map((part) => part[0]!.toUpperCase() + part.slice(1));
-  const identifier = parts.join("") || "OpenAgentPlugin";
+  const identifier = parts.join("") || "AgentBoxPlugin";
   return /^[A-Za-z_]/.test(identifier)
     ? identifier
-    : `OpenAgentPlugin${identifier}`;
+    : `AgentBoxPlugin${identifier}`;
 }
 
 function indentBlock(input: string, spaces: number): string {

@@ -4,16 +4,16 @@ import os from "node:os";
 import path from "node:path";
 import { deflateSync } from "node:zlib";
 
-import { Agent, Sandbox, type AgentProviderName } from "../src";
-import type { NormalizedAgentEvent, PermissionRequestedEvent } from "../src";
+import { Agent, Sandbox, type AgentProviderName } from "../../src";
+import type { NormalizedAgentEvent, PermissionRequestedEvent } from "../../src";
 
 export type LocalDockerProvider = AgentProviderName;
 
 export const LOCAL_DOCKER_E2E_ENABLED =
-  process.env.OPENAGENT_RUN_LOCAL_DOCKER_E2E === "1";
+  process.env.AGENTBOX_RUN_LOCAL_DOCKER_E2E === "1";
 
 export const LOCAL_DOCKER_E2E_TIMEOUT_MS = Number.parseInt(
-  process.env.OPENAGENT_LOCAL_DOCKER_E2E_TIMEOUT_MS ?? "180000",
+  process.env.AGENTBOX_LOCAL_DOCKER_E2E_TIMEOUT_MS ?? "180000",
   10,
 );
 
@@ -68,7 +68,7 @@ export type HookScenarioResult = BaseScenarioResult & {
   triggerFileContents: string;
 };
 
-const ROOT_ENV = loadDotEnvFile(new URL("../.env", import.meta.url));
+const ROOT_ENV = loadDotEnvFile(new URL("../../.env", import.meta.url));
 const HOST_HOME = os.homedir();
 const HOST_AUTH_PATHS = {
   codex: path.join(HOST_HOME, ".codex"),
@@ -368,7 +368,7 @@ export async function runHookScenario(
               provider: {
                 plugins: [
                   {
-                    name: "openagent-hook-marker",
+                    name: "agentbox-hook-marker",
                     hooks: [
                       {
                         event: "tool.execute.after",
@@ -532,7 +532,7 @@ function createSandbox(
   provider: LocalDockerProvider,
   scenario: string,
 ): Sandbox<"local-docker"> {
-  const image = ROOT_ENV.OPENAGENT_E2E_DOCKER_IMAGE ?? "openagent-e2e";
+  const image = ROOT_ENV.AGENTBOX_E2E_DOCKER_IMAGE ?? "agentbox-e2e";
 
   return new Sandbox("local-docker", {
     workingDir: "/workspace",
@@ -618,8 +618,8 @@ function assertProviderPrerequisites(provider: LocalDockerProvider): void {
 }
 
 function buildOpenCodeConfigContent(): string | undefined {
-  if (ROOT_ENV.OPENAGENT_E2E_OPENCODE_CONFIG_CONTENT) {
-    return ROOT_ENV.OPENAGENT_E2E_OPENCODE_CONFIG_CONTENT;
+  if (ROOT_ENV.AGENTBOX_E2E_OPENCODE_CONFIG_CONTENT) {
+    return ROOT_ENV.AGENTBOX_E2E_OPENCODE_CONFIG_CONTENT;
   }
 
   const providerConfig = {

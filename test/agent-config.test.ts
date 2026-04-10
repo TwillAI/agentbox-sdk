@@ -207,13 +207,13 @@ describe("config compilers", () => {
 
   it("builds repo-backed and embedded skill setup", async () => {
     const layout = {
-      rootDir: "/tmp/openagent",
-      homeDir: "/tmp/openagent/home",
-      xdgConfigHome: "/tmp/openagent/.config",
-      agentsDir: "/tmp/openagent/home/.agents",
-      claudeDir: "/tmp/openagent/home/.claude",
-      opencodeDir: "/tmp/openagent/.config/opencode",
-      codexDir: "/tmp/openagent/.codex",
+      rootDir: "/tmp/agentbox",
+      homeDir: "/tmp/agentbox/home",
+      xdgConfigHome: "/tmp/agentbox/.config",
+      agentsDir: "/tmp/agentbox/home/.agents",
+      claudeDir: "/tmp/agentbox/home/.claude",
+      opencodeDir: "/tmp/agentbox/.config/opencode",
+      codexDir: "/tmp/agentbox/.codex",
     };
 
     const repoSkill = await prepareSkillArtifacts(
@@ -248,7 +248,7 @@ describe("config compilers", () => {
     expect(embeddedSkill.installCommands).toEqual([]);
     expect(embeddedSkill.artifacts).toEqual([
       {
-        path: "/tmp/openagent/.config/opencode/skills/release-helper/SKILL.md",
+        path: "/tmp/agentbox/.config/opencode/skills/release-helper/SKILL.md",
         content: "# Release helper",
         executable: false,
       },
@@ -413,11 +413,11 @@ describe("config compilers", () => {
             ],
           },
         ],
-        "/tmp/openagent/home/.config/opencode",
+        "/tmp/agentbox/home/.config/opencode",
       ),
     ).toEqual([
       expect.objectContaining({
-        path: "/tmp/openagent/home/.config/opencode/plugins/session-notifier.ts",
+        path: "/tmp/agentbox/home/.config/opencode/plugins/session-notifier.ts",
         content: expect.stringContaining(
           '"session.idle": async (input, output) => {',
         ),
@@ -457,13 +457,13 @@ describe("config compilers", () => {
         },
       ],
       {
-        rootDir: "/tmp/openagent",
-        homeDir: "/tmp/openagent/home",
-        xdgConfigHome: "/tmp/openagent/.config",
-        agentsDir: "/tmp/openagent/home/.agents",
-        claudeDir: "/tmp/openagent/home/.claude",
-        opencodeDir: "/tmp/openagent/.config/opencode",
-        codexDir: "/tmp/openagent/.codex",
+        rootDir: "/tmp/agentbox",
+        homeDir: "/tmp/agentbox/home",
+        xdgConfigHome: "/tmp/agentbox/.config",
+        agentsDir: "/tmp/agentbox/home/.agents",
+        claudeDir: "/tmp/agentbox/home/.claude",
+        opencodeDir: "/tmp/agentbox/.config/opencode",
+        codexDir: "/tmp/agentbox/.codex",
       },
     );
 
@@ -471,8 +471,8 @@ describe("config compilers", () => {
     expect(result.agentSections.join("\n")).toContain("[agents.reviewer]");
     expect(result.artifacts.map((artifact) => artifact.path)).toEqual(
       expect.arrayContaining([
-        "/tmp/openagent/.codex/prompts/reviewer.md",
-        "/tmp/openagent/.codex/agents/reviewer.toml",
+        "/tmp/agentbox/.codex/prompts/reviewer.md",
+        "/tmp/agentbox/.codex/agents/reviewer.toml",
       ]),
     );
   });

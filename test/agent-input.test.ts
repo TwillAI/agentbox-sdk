@@ -111,9 +111,7 @@ describe("multimodal input helpers", () => {
   });
 
   it("reads file URLs and infers common image media types", async () => {
-    const tempDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), "openagent-input-"),
-    );
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "agentbox-input-"));
     tempDirs.push(tempDir);
     const imagePath = path.join(tempDir, "diagram.png");
     await fs.writeFile(imagePath, Buffer.from([1, 2, 3]));
@@ -134,7 +132,7 @@ describe("multimodal input helpers", () => {
 
   it("maps Codex remote and local images to app-server prompt parts", async () => {
     const tempDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), "openagent-codex-input-"),
+      path.join(os.tmpdir(), "agentbox-codex-input-"),
     );
     tempDirs.push(tempDir);
     const imagePath = path.join(tempDir, "diagram.png");

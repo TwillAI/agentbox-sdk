@@ -15,7 +15,7 @@ import { AsyncQueue } from "../../shared/async-queue";
 import { toShellCommand } from "../../shared/shell";
 import { resolveSandboxImage, resolveSandboxResources } from "../image-utils";
 
-type E2bRaw = {
+export type E2bRaw = {
   sandbox?: E2bSandbox;
 };
 
@@ -374,7 +374,7 @@ export class E2bSandboxAdapter extends SandboxAdapter<
 
   private getMetadata(): Record<string, string> {
     return {
-      "openagent.provider": this.provider,
+      "agentbox.provider": this.provider,
       ...(this.options.tags ?? {}),
     };
   }

@@ -81,7 +81,7 @@ class SandboxRuntimeTarget implements RuntimeTarget {
   }
 
   async writeArtifact(artifact: TextArtifact): Promise<void> {
-    const marker = `__OPENAGENT_${Math.random().toString(36).slice(2)}__`;
+    const marker = `__AGENTBOX_${Math.random().toString(36).slice(2)}__`;
     const command = `mkdir -p ${shellQuote(
       path.posix.dirname(artifact.path),
     )} && cat > ${shellQuote(artifact.path)} <<'${marker}'
@@ -147,7 +147,7 @@ export async function createRuntimeTarget<P extends AgentProviderName>(
   options: AgentOptions<P>,
 ): Promise<RuntimeTarget> {
   if (options.sandbox) {
-    const layout = createLayout(`/tmp/openagent/${provider}/${runId}`);
+    const layout = createLayout(`/tmp/agentbox/${provider}/${runId}`);
     await options.sandbox.run(
       [
         `mkdir -p ${shellQuote(layout.homeDir)}`,
@@ -168,7 +168,7 @@ export async function createRuntimeTarget<P extends AgentProviderName>(
   }
 
   const rootDir = await mkdtemp(
-    path.join(os.tmpdir(), `openagent-${provider}-`),
+    path.join(os.tmpdir(), `agentbox-${provider}-`),
   );
   const layout = createLayout(rootDir);
   await mkdir(layout.homeDir, { recursive: true });

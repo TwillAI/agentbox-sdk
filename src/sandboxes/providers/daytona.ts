@@ -15,7 +15,7 @@ import { sleep } from "../../shared/network";
 import { shellQuote, toShellCommand } from "../../shared/shell";
 import { resolveSandboxImage, resolveSandboxResources } from "../image-utils";
 
-type DaytonaRaw = {
+export type DaytonaRaw = {
   client: Daytona;
   sandbox?: DaytonaSandboxObject;
 };
@@ -133,7 +133,7 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
   ): Promise<AsyncCommandHandle> {
     await this.ensureProvisioned();
     const sandbox = this.requireSandbox();
-    const sessionId = `openagent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const sessionId = `agentbox-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     await sandbox.process.createSession(sessionId);
 
     const response = await sandbox.process.executeSessionCommand(
@@ -296,7 +296,7 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
 
   private getLabels(): Record<string, string> {
     return {
-      "openagent.provider": this.provider,
+      "agentbox.provider": this.provider,
       ...(this.options.tags ?? {}),
     };
   }

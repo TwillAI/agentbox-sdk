@@ -114,11 +114,11 @@ function isBuiltInImageName(value: string): value is BuiltInSandboxImageName {
 }
 
 function printHelp(): void {
-  process.stdout.write(`openagent
+  process.stdout.write(`agentbox
 
 Usage:
-  openagent image build --provider <local-docker|modal|daytona|e2b> --preset <browser-agent|computer-use>
-  openagent image build --provider <local-docker|modal|daytona|e2b> --file <path>
+  agentbox image build --provider <local-docker|modal|daytona|e2b> --preset <browser-agent|computer-use>
+  agentbox image build --provider <local-docker|modal|daytona|e2b> --file <path>
 
 Options:
   --image-name <name>        Override the built artifact name

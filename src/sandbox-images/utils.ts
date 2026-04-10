@@ -38,7 +38,7 @@ export function sandboxImageDefinitionToDockerfile(
 
 export function buildSandboxImageReference(
   image: SandboxImageDefinition,
-  prefix = "openagent",
+  prefix = "agentbox",
 ): string {
   const hash = createHash("sha256")
     .update(JSON.stringify(image))
@@ -61,7 +61,7 @@ export function buildDaytonaSnapshotName(
 
 export function buildE2bTemplateReference(
   image: SandboxImageDefinition,
-  prefix = "openagent",
+  prefix = "agentbox",
 ): string {
   const hash = createHash("sha256")
     .update(JSON.stringify(image))

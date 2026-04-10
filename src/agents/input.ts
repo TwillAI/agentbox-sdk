@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { OpenAgentError } from "../shared/errors";
+import { AgentBoxError } from "../shared/errors";
 import type {
   AgentProviderName,
   DataContent,
@@ -125,7 +125,7 @@ export async function validateProviderUserInput(
   if (provider === "codex") {
     const unsupportedPart = parts.find((part) => part.type === "file");
     if (unsupportedPart) {
-      throw new OpenAgentError(
+      throw new AgentBoxError(
         `The codex provider does not yet support "${unsupportedPart.type}" input parts through codex app-server. Codex currently supports text and image input items.`,
         {
           code: "UNSUPPORTED_INPUT_PART",
@@ -144,7 +144,7 @@ export async function validateProviderUserInput(
     for (const part of parts) {
       if (part.type === "image") {
         if (!CLAUDE_IMAGE_MEDIA_TYPES.has(part.mediaType)) {
-          throw new OpenAgentError(
+          throw new AgentBoxError(
             `Claude Code only supports image inputs with one of these media types: ${Array.from(CLAUDE_IMAGE_MEDIA_TYPES).join(", ")}.`,
             {
               code: "UNSUPPORTED_INPUT_MEDIA_TYPE",
@@ -163,7 +163,7 @@ export async function validateProviderUserInput(
           part.mediaType !== "application/pdf" &&
           !isClaudeTextLikeMediaType(part.mediaType)
         ) {
-          throw new OpenAgentError(
+          throw new AgentBoxError(
             `Claude Code only supports PDF and text-like file inputs. Received "${part.mediaType}".`,
             {
               code: "UNSUPPORTED_INPUT_MEDIA_TYPE",
@@ -181,7 +181,7 @@ export async function validateProviderUserInput(
           part.mediaType !== "application/pdf" &&
           isClaudeTextLikeMediaType(part.mediaType)
         ) {
-          throw new OpenAgentError(
+          throw new AgentBoxError(
             "Claude Code text-like file inputs must be provided as inline data, not a remote URL.",
             {
               code: "UNSUPPORTED_INPUT_SOURCE",
@@ -287,7 +287,7 @@ export function mapToClaudeUserContent(
     }
 
     if (!isClaudeTextLikeMediaType(part.mediaType)) {
-      throw new OpenAgentError(
+      throw new AgentBoxError(
         `Claude Code cannot map file inputs with media type "${part.mediaType}".`,
         {
           code: "UNSUPPORTED_INPUT_MEDIA_TYPE",
@@ -352,7 +352,7 @@ export function joinTextParts(
   return parts
     .map((part) => {
       if (part.type !== "text") {
-        throw new OpenAgentError(
+        throw new AgentBoxError(
           `Cannot join "${part.type}" input parts into a text-only prompt.`,
           {
             code: "UNSUPPORTED_INPUT_PART",
@@ -464,7 +464,7 @@ async function resolveBinaryContent(
     };
   }
 
-  throw new OpenAgentError("Unsupported input content type.", {
+  throw new AgentBoxError("Unsupported input content type.", {
     code: "UNSUPPORTED_INPUT_SOURCE",
     details: {
       kind: options.kind,
@@ -517,7 +517,7 @@ async function resolveUrlContent(
     };
   }
 
-  throw new OpenAgentError(
+  throw new AgentBoxError(
     `Unsupported input URL protocol "${url.protocol}" for ${options.kind} parts.`,
     {
       code: "UNSUPPORTED_INPUT_SOURCE",
@@ -547,7 +547,7 @@ function resolveMediaType(
     return inferredMediaType;
   }
 
-  throw new OpenAgentError(
+  throw new AgentBoxError(
     `Could not determine a media type for the ${options.kind} input part.`,
     {
       code: "MISSING_INPUT_MEDIA_TYPE",
@@ -587,7 +587,7 @@ function parseDataUrl(value: string): {
 } {
   const separatorIndex = value.indexOf(",");
   if (separatorIndex === -1) {
-    throw new OpenAgentError("Invalid data URL input.", {
+    throw new AgentBoxError("Invalid data URL input.", {
       code: "INVALID_INPUT_DATA_URL",
     });
   }

@@ -10,7 +10,7 @@ import {
   runSimpleScenario,
   runSkillScenario,
   runSubAgentScenario,
-} from "../scripts/local-docker-e2e";
+} from "./helpers/local-docker-e2e";
 
 describe.skipIf(!LOCAL_DOCKER_E2E_ENABLED)("local docker agent e2e", () => {
   it.each(LOCAL_DOCKER_E2E_PROVIDERS)(

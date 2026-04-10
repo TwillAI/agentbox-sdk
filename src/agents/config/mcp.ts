@@ -177,7 +177,7 @@ export function buildClaudeMcpArtifact(
   }
 
   return {
-    path: path.join(claudeDir, "openagent-mcp.json"),
+    path: path.join(claudeDir, "agentbox-mcp.json"),
     content,
   };
 }

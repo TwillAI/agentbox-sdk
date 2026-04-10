@@ -115,7 +115,7 @@ async function buildLocalDockerImage(
 ): Promise<string> {
   const client = new Docker();
   const tag =
-    options.imageName ?? buildSandboxImageReference(definition, "openagent");
+    options.imageName ?? buildSandboxImageReference(definition, "agentbox");
   const pack = tar.pack();
   pack.entry(
     { name: "Dockerfile" },
@@ -182,8 +182,8 @@ async function buildModalImage(
   try {
     const appName =
       options.modalAppName ??
-      getBuildEnv(options, "OPENAGENT_MODAL_APP_NAME") ??
-      "openagent-images";
+      getBuildEnv(options, "AGENTBOX_MODAL_APP_NAME") ??
+      "agentbox-images";
     const app = await client.apps.fromName(appName, {
       createIfMissing: true,
       environment: getBuildEnv(options, "MODAL_ENVIRONMENT"),

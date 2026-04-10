@@ -11,6 +11,7 @@ import type {
   SandboxListOptions,
   SandboxOptions,
   SandboxProviderName,
+  SandboxRaw,
 } from "./types";
 import type { SandboxAdapter } from "./base";
 import { UnsupportedProviderError } from "../shared/errors";
@@ -18,31 +19,31 @@ import { UnsupportedProviderError } from "../shared/errors";
 function createSandboxAdapter<P extends SandboxProviderName>(
   provider: P,
   options: SandboxOptions<P>,
-): SandboxAdapter<P, SandboxOptions<P>> {
+): SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>> {
   switch (provider) {
     case "local-docker":
       return new LocalDockerSandboxAdapter(
         options as SandboxOptions<"local-docker">,
-      ) as unknown as SandboxAdapter<P, SandboxOptions<P>>;
+      ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
     case "modal":
       return new ModalSandboxAdapter(
         options as SandboxOptions<"modal">,
-      ) as unknown as SandboxAdapter<P, SandboxOptions<P>>;
+      ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
     case "daytona":
       return new DaytonaSandboxAdapter(
         options as SandboxOptions<"daytona">,
-      ) as unknown as SandboxAdapter<P, SandboxOptions<P>>;
+      ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
     case "e2b":
       return new E2bSandboxAdapter(
         options as SandboxOptions<"e2b">,
-      ) as unknown as SandboxAdapter<P, SandboxOptions<P>>;
+      ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
     default:
       throw new UnsupportedProviderError("sandbox", provider);
   }
 }
 
 export class Sandbox<P extends SandboxProviderName = SandboxProviderName> {
-  private readonly adapter: SandboxAdapter<P, SandboxOptions<P>>;
+  private readonly adapter: SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
 
   constructor(
     private readonly providerName: P,
@@ -63,7 +64,7 @@ export class Sandbox<P extends SandboxProviderName = SandboxProviderName> {
     return this.adapter.id;
   }
 
-  get raw(): unknown {
+  get raw(): SandboxRaw<P> | undefined {
     return this.adapter.raw;
   }
 

@@ -1,4 +1,4 @@
-export class OpenAgentError extends Error {
+export class AgentBoxError extends Error {
   readonly code?: string;
   readonly details?: unknown;
 
@@ -7,13 +7,13 @@ export class OpenAgentError extends Error {
     options?: { code?: string; cause?: unknown; details?: unknown },
   ) {
     super(message, { cause: options?.cause });
-    this.name = "OpenAgentError";
+    this.name = "AgentBoxError";
     this.code = options?.code;
     this.details = options?.details;
   }
 }
 
-export class UnsupportedProviderError extends OpenAgentError {
+export class UnsupportedProviderError extends AgentBoxError {
   constructor(kind: "agent" | "sandbox", provider: string) {
     super(`Unsupported ${kind} provider "${provider}".`, {
       code: "UNSUPPORTED_PROVIDER",
@@ -29,7 +29,7 @@ export function invariant(
   options?: { code?: string; details?: unknown },
 ): asserts condition {
   if (!condition) {
-    throw new OpenAgentError(message, {
+    throw new AgentBoxError(message, {
       code: options?.code ?? "INVARIANT_VIOLATION",
       details: options?.details,
     });

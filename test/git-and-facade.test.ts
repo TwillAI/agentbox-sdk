@@ -34,19 +34,19 @@ describe("public facades", () => {
         cpu: 1,
         memoryMiB: 2048,
       },
-      provider: { appName: "openagent-demo" },
+      provider: { appName: "agentbox-demo" },
     });
 
     expect(sandbox.provider).toBe("modal");
     expect(sandbox.optionsSnapshot.image).toBe("im-demo-image");
     expect(sandbox.optionsSnapshot.resources?.memoryMiB).toBe(2048);
-    expect(sandbox.optionsSnapshot.provider?.appName).toBe("openagent-demo");
+    expect(sandbox.optionsSnapshot.provider?.appName).toBe("agentbox-demo");
   });
 
   it("creates an e2b sandbox with a template reference", async () => {
     const sandbox = new Sandbox("e2b", {
       tags: { project: "demo" },
-      image: "openagent-browser-agent:demo123",
+      image: "agentbox-browser-agent:demo123",
       provider: {
         apiKey: "e2b_test",
         timeoutMs: 60_000,
@@ -56,7 +56,7 @@ describe("public facades", () => {
     await expect(sandbox.openPort(4242)).resolves.toBe(sandbox);
     expect(sandbox.provider).toBe("e2b");
     expect(sandbox.optionsSnapshot.image).toBe(
-      "openagent-browser-agent:demo123",
+      "agentbox-browser-agent:demo123",
     );
     expect(sandbox.optionsSnapshot.provider?.timeoutMs).toBe(60_000);
   });
@@ -71,7 +71,7 @@ describe("public facades", () => {
 
   it("opens a local-docker port", async () => {
     const sandbox = new Sandbox("local-docker", {
-      image: "openagent-e2e",
+      image: "agentbox-e2e",
     });
 
     await sandbox.openPort(4096);

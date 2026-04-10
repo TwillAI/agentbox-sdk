@@ -52,7 +52,7 @@ type SharedRemoteHostConnection = {
 };
 
 const REMOTE_SDK_RELAY_PORT = 43180;
-const REMOTE_SDK_RELAY_PATH = "/tmp/openagent/claude-code/relay.mjs";
+const REMOTE_SDK_RELAY_PATH = "/tmp/agentbox/claude-code/relay.mjs";
 const sharedRemoteConnectionBySandbox = new WeakMap<
   object,
   Promise<SharedRemoteHostConnection>
@@ -719,7 +719,7 @@ async function ensureRemoteRelay(
     content: createRemoteSdkRelayScript(),
   });
 
-  const relayLogPath = "/tmp/openagent/claude-code/relay.log";
+  const relayLogPath = "/tmp/agentbox/claude-code/relay.log";
   const relayHandle = await sandbox.runAsync(
     [
       `mkdir -p ${shellQuote(path.posix.dirname(REMOTE_SDK_RELAY_PATH))}`,

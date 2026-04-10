@@ -17,10 +17,10 @@
     "verbatimModuleSyntax": true,
     "baseUrl": ".",
     "paths": {
-      "openagent": ["./src/index.ts"],
-      "openagent/agents": ["./src/agents/index.ts"],
-      "openagent/events": ["./src/events/index.ts"],
-      "openagent/sandboxes": ["./src/sandboxes/index.ts"]
+      "agentbox-sdk": ["./src/index.ts"],
+      "agentbox-sdk/agents": ["./src/agents/index.ts"],
+      "agentbox-sdk/events": ["./src/events/index.ts"],
+      "agentbox-sdk/sandboxes": ["./src/sandboxes/index.ts"]
     },
     "outDir": "dist",
     "rootDir": "."

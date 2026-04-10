@@ -9,7 +9,7 @@ import {
   formatLiveMatrixLabel,
   logLiveMatrixPlan,
   runSimpleStreamMatrixScenario,
-} from "../scripts/live-matrix-e2e";
+} from "./helpers/live-matrix-e2e";
 
 if (LIVE_MATRIX_E2E_ENABLED) {
   logLiveMatrixPlan();

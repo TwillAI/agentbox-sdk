@@ -17,7 +17,7 @@ import { pipeReadableStream, readStreamAsText } from "../../shared/streams";
 import { toShellCommand } from "../../shared/shell";
 import { resolveSandboxImage, resolveSandboxResources } from "../image-utils";
 
-type ModalRaw = {
+export type ModalRaw = {
   client: ModalClient;
   sandbox?: ModalSandboxObject;
 };
@@ -64,7 +64,7 @@ export class ModalSandboxAdapter extends SandboxAdapter<
       return;
     }
 
-    const appName = this.options.provider?.appName ?? "openagent";
+    const appName = this.options.provider?.appName ?? "agentbox";
     const app = await this.client.apps.fromName(appName, {
       createIfMissing: true,
       environment: this.options.provider?.environment,
@@ -275,7 +275,7 @@ export class ModalSandboxAdapter extends SandboxAdapter<
 
   private getTags(): Record<string, string> {
     return {
-      "openagent.provider": this.provider,
+      "agentbox.provider": this.provider,
       ...(this.options.tags ?? {}),
     };
   }

@@ -1,6 +1,6 @@
-# OpenAgent Guide
+# AgentBox Guide
 
-OpenAgent is a Bun-friendly TypeScript package for running coding agents and sandbox providers through a swappable API.
+AgentBox is a Bun-friendly TypeScript package for running coding agents and sandbox providers through a swappable API.
 
 ## Purpose
 
@@ -100,7 +100,7 @@ Provider-specific settings belong under `provider`.
 - `src/events/` — normalized and raw event types
 - `examples/` — small usage examples
 - `test/` — unit and smoke tests
-- `scripts/` — repo-level helper scripts like Docker E2E checks
+- `test/helpers/` — reusable E2E scenario helpers shared across test files
 
 ## Commands
 

@@ -2,11 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import { Sandbox } from "../src";
 
-const smokeEnabled = process.env.OPENAGENT_RUN_SMOKE_TESTS === "1";
+const smokeEnabled = process.env.AGENTBOX_RUN_SMOKE_TESTS === "1";
 
 describe.skipIf(!smokeEnabled)("optional provider smoke tests", () => {
   it("can reach an OpenCode app server when a URL is provided", async () => {
-    const serverUrl = process.env.OPENAGENT_OPENCODE_URL;
+    const serverUrl = process.env.AGENTBOX_OPENCODE_URL;
     if (!serverUrl) {
       return;
     }
@@ -26,7 +26,7 @@ describe.skipIf(!smokeEnabled)("optional provider smoke tests", () => {
       provider: {
         tokenId: process.env.MODAL_TOKEN_ID,
         tokenSecret: process.env.MODAL_TOKEN_SECRET,
-        appName: "openagent-smoke",
+        appName: "agentbox-smoke",
       },
     });
 

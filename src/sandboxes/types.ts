@@ -146,3 +146,13 @@ export type SandboxOptionsMap = {
 export type SandboxOptions<
   P extends SandboxProviderName = SandboxProviderName,
 > = SandboxOptionsMap[P];
+
+export type SandboxRawMap = {
+  "local-docker": import("./providers/local-docker").DockerRaw;
+  modal: import("./providers/modal").ModalRaw;
+  daytona: import("./providers/daytona").DaytonaRaw;
+  e2b: import("./providers/e2b").E2bRaw;
+};
+
+export type SandboxRaw<P extends SandboxProviderName = SandboxProviderName> =
+  SandboxRawMap[P];

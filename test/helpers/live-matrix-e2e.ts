@@ -8,9 +8,9 @@ import {
   Sandbox,
   type AgentProviderName,
   type SandboxProviderName,
-} from "../src";
-import type { NormalizedAgentEvent } from "../src";
-import { buildSandboxImage } from "../src/sandbox-images/build";
+} from "../../src";
+import type { NormalizedAgentEvent } from "../../src";
+import { buildSandboxImage } from "../../src/sandbox-images/build";
 
 export type LiveMatrixSandboxProvider = Extract<
   SandboxProviderName,
@@ -43,10 +43,10 @@ export type LiveMatrixScenarioResult = LiveMatrixCombination & {
 };
 
 export const LIVE_MATRIX_E2E_ENABLED =
-  process.env.OPENAGENT_RUN_MATRIX_E2E === "1";
+  process.env.AGENTBOX_RUN_MATRIX_E2E === "1";
 
 export const LIVE_MATRIX_E2E_TIMEOUT_MS = Number.parseInt(
-  process.env.OPENAGENT_MATRIX_E2E_TIMEOUT_MS ?? "480000",
+  process.env.AGENTBOX_MATRIX_E2E_TIMEOUT_MS ?? "480000",
   10,
 );
 
@@ -65,7 +65,7 @@ export const LIVE_MATRIX_AGENT_PROVIDERS = [
   "claude-code",
 ] as const satisfies readonly LiveMatrixAgentProvider[];
 
-const ROOT_ENV = loadDotEnvFile(new URL("../.env", import.meta.url));
+const ROOT_ENV = loadDotEnvFile(new URL("../../.env", import.meta.url));
 const HOST_HOME = os.homedir();
 const HOST_AUTH_PATHS = {
   codex: path.join(HOST_HOME, ".codex"),
@@ -310,7 +310,7 @@ function getAgentSkipReason(
 
   return OPENCODE_CONFIG_CONTENT
     ? null
-    : "requires OPENAI_API_KEY, ANTHROPIC_API_KEY, or OPENAGENT_E2E_OPENCODE_CONFIG_CONTENT.";
+    : "requires OPENAI_API_KEY, ANTHROPIC_API_KEY, or AGENTBOX_E2E_OPENCODE_CONFIG_CONTENT.";
 }
 
 async function resolveSandboxImage(
@@ -323,29 +323,29 @@ async function resolveSandboxImage(
 
   const build = (async () => {
     if (sandboxProvider === "local-docker") {
-      if (ROOT_ENV.OPENAGENT_E2E_DOCKER_IMAGE) {
-        return ROOT_ENV.OPENAGENT_E2E_DOCKER_IMAGE;
+      if (ROOT_ENV.AGENTBOX_E2E_DOCKER_IMAGE) {
+        return ROOT_ENV.AGENTBOX_E2E_DOCKER_IMAGE;
       }
       return buildSandboxImage({
         provider: "local-docker",
         preset: "browser-agent",
-        imageName: "openagent-browser-agent:matrix-e2e",
+        imageName: "agentbox-browser-agent:matrix-e2e",
         env: ROOT_ENV,
         log: (chunk) => logImageBuildProgress(sandboxProvider, chunk),
       });
     }
 
     if (sandboxProvider === "modal") {
-      if (ROOT_ENV.OPENAGENT_MODAL_IMAGE) {
-        return ROOT_ENV.OPENAGENT_MODAL_IMAGE;
+      if (ROOT_ENV.AGENTBOX_MODAL_IMAGE) {
+        return ROOT_ENV.AGENTBOX_MODAL_IMAGE;
       }
       return buildSandboxImage({
         provider: "modal",
         preset: "browser-agent",
         modalAppName:
           ROOT_ENV.MODAL_APP_NAME ??
-          ROOT_ENV.OPENAGENT_MODAL_APP_NAME ??
-          "openagent-images",
+          ROOT_ENV.AGENTBOX_MODAL_APP_NAME ??
+          "agentbox-images",
         env: ROOT_ENV,
         log: (chunk) => logImageBuildProgress(sandboxProvider, chunk),
       });
@@ -364,7 +364,7 @@ async function resolveSandboxImage(
     return buildSandboxImage({
       provider: "e2b",
       preset: "browser-agent",
-      imageName: `openagent-browser-agent-matrix-e2e:${IMAGE_BUILD_SUFFIX}`,
+      imageName: `agentbox-browser-agent-matrix-e2e:${IMAGE_BUILD_SUFFIX}`,
       env: ROOT_ENV,
       log: (chunk) => logImageBuildProgress(sandboxProvider, chunk),
     });
@@ -412,7 +412,7 @@ function createSandboxForCombination(
         memoryMiB: 4096,
       },
       provider: {
-        appName: ROOT_ENV.MODAL_APP_NAME ?? "openagent-matrix",
+        appName: ROOT_ENV.MODAL_APP_NAME ?? "agentbox-matrix",
         ...(ROOT_ENV.MODAL_TOKEN_ID
           ? { tokenId: ROOT_ENV.MODAL_TOKEN_ID }
           : {}),
@@ -431,7 +431,7 @@ function createSandboxForCombination(
       tags,
       idleTimeoutMs: 30 * 60_000,
       provider: {
-        name: `openagent-matrix-${combination.agentProvider}-${randomUUID().slice(0, 8)}`,
+        name: `agentbox-matrix-${combination.agentProvider}-${randomUUID().slice(0, 8)}`,
         language: "typescript",
         ...(ROOT_ENV.DAYTONA_API_KEY
           ? { apiKey: ROOT_ENV.DAYTONA_API_KEY }
@@ -603,8 +603,8 @@ function getModalPortsForAgent(
 }
 
 function buildOpenCodeConfigContent(): string | undefined {
-  if (ROOT_ENV.OPENAGENT_E2E_OPENCODE_CONFIG_CONTENT) {
-    return ROOT_ENV.OPENAGENT_E2E_OPENCODE_CONFIG_CONTENT;
+  if (ROOT_ENV.AGENTBOX_E2E_OPENCODE_CONFIG_CONTENT) {
+    return ROOT_ENV.AGENTBOX_E2E_OPENCODE_CONFIG_CONTENT;
   }
 
   const providerConfig = {

@@ -195,7 +195,7 @@ function buildOpenCodeConfig(
     ...(mcpConfig ? { mcp: mcpConfig } : {}),
     ...(commandsConfig ? { command: commandsConfig } : {}),
     agent: {
-      openagent: {
+      agentbox: {
         mode: "primary",
         prompt: request.run.systemPrompt ?? "",
         permission: buildOpenCodePermissionConfig(interactiveApproval),
@@ -260,7 +260,7 @@ async function ensureSandboxOpenCodeServer(
     await target.writeArtifact(artifact);
   }
 
-  const configPath = path.join(target.layout.opencodeDir, "openagent.json");
+  const configPath = path.join(target.layout.opencodeDir, "agentbox.json");
   const openCodeConfig = buildOpenCodeConfig(request, interactiveApproval);
   await target.writeArtifact({
     path: configPath,
@@ -357,7 +357,7 @@ async function createLocalRuntime(
     await target.writeArtifact(artifact);
   }
 
-  const configPath = path.join(target.layout.opencodeDir, "openagent.json");
+  const configPath = path.join(target.layout.opencodeDir, "agentbox.json");
   const openCodeConfig = buildOpenCodeConfig(request, interactiveApproval);
   await target.writeArtifact({
     path: configPath,
@@ -443,7 +443,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
               method: "POST",
               headers: { "content-type": "application/json" },
               body: JSON.stringify({
-                title: `OpenAgent ${request.runId}`,
+                title: `AgentBox ${request.runId}`,
               }),
             },
           );
@@ -550,7 +550,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
             ...(request.run.model
               ? { model: toOpenCodeModel(request.run.model) }
               : {}),
-            agent: "openagent",
+            agent: "agentbox",
             parts: mapToOpenCodeParts(inputParts),
           }),
         },

@@ -1,5 +1,5 @@
 {
-  "name": "openagent",
+  "name": "agentbox-sdk",
   "version": "0.1.0",
   "description": "Swappable coding agents and sandbox providers for Bun and TypeScript.",
   "license": "MIT",
@@ -11,7 +11,7 @@
     "images"
   ],
   "bin": {
-    "openagent": "./dist/cli.js"
+    "agentbox": "./dist/cli.js"
   },
   "exports": {
     ".": {
@@ -74,6 +74,7 @@
     "vitest": "^3.1.2"
   },
   "keywords": [
+    "agentbox",
     "agents",
     "codex",
     "claude-code",

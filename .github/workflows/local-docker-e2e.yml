@@ -13,16 +13,15 @@ on:
       - "package-lock.json"
       - "src/**"
       - "test/**"
-      - "scripts/local-docker-e2e.ts"
-      - "scripts/e2e-local-docker.mts"
+      - "test/helpers/local-docker-e2e.ts"
 
 jobs:
   local-docker-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      OPENAGENT_RUN_LOCAL_DOCKER_E2E: "1"
-      OPENAGENT_E2E_DOCKER_IMAGE: "openagent-e2e"
+      AGENTBOX_RUN_LOCAL_DOCKER_E2E: "1"
+      AGENTBOX_E2E_DOCKER_IMAGE: "agentbox-e2e"
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
@@ -50,7 +49,7 @@ jobs:
         run: npm ci
 
       - name: Build local Docker E2E image
-        run: docker build -t "${OPENAGENT_E2E_DOCKER_IMAGE}" -f docker/e2e/Dockerfile .
+        run: docker build -t "${AGENTBOX_E2E_DOCKER_IMAGE}" -f docker/e2e/Dockerfile .
 
       - name: Run local Docker E2E suite
         run: npm run test:e2e:local-docker
