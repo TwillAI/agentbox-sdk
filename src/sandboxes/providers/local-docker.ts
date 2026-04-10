@@ -92,6 +92,7 @@ export class LocalDockerSandboxAdapter extends SandboxAdapter<
         AutoRemove: this.options.provider?.autoRemove ?? false,
         Binds: this.options.provider?.binds,
         NetworkMode: this.options.provider?.networkMode,
+        ExtraHosts: ["host.docker.internal:host-gateway"],
         ...(portBindings ? { PortBindings: portBindings } : {}),
         ...(resources?.cpu
           ? { NanoCpus: Math.round(resources.cpu * 1_000_000_000) }
