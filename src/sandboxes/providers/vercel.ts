@@ -68,6 +68,29 @@ function describeVercelApiError(error: unknown, action: string): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
+async function wrapVercelApiError<T>(
+  action: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    throw describeVercelApiError(error, action);
+  }
+}
+
+function buildTimeoutSignal(
+  timeoutMs: number | undefined,
+): AbortSignal | undefined {
+  if (!timeoutMs || timeoutMs <= 0) return undefined;
+  return AbortSignal.timeout(timeoutMs);
+}
+
+// `CommandOptions.pty` is not supported by the Vercel Sandbox SDK —
+// `RunCommandParams` has no PTY flag. Callers that request it (e.g.
+// claude-code) continue to work because they do not strictly require a
+// TTY; we silently run non-PTY, matching daytona's behavior.
+
 function getCredentials(options: VercelSandboxOptions) {
   const token = options.provider?.token ?? process.env.VERCEL_TOKEN;
   const teamId = options.provider?.teamId ?? process.env.VERCEL_TEAM_ID;
@@ -137,37 +160,40 @@ export class VercelSandboxAdapter extends SandboxAdapter<
       ...(provider?.ports?.length ? { ports: provider.ports } : {}),
     };
 
-    let sandbox: VercelSandbox & AsyncDisposable;
-    if (snapshotId) {
-      // Snapshot sources carry their own runtime; the Vercel SDK rejects
-      // `runtime` alongside a snapshot source, so we don't forward it here.
-      sandbox = await VercelSandbox.create({
-        ...base,
-        source: { type: "snapshot", snapshotId },
-      });
-    } else if (provider?.gitSource) {
-      const git = provider.gitSource;
-      const source = {
-        type: "git" as const,
-        url: git.url,
-        depth: git.depth,
-        revision: git.revision,
-        ...(git.username && git.password
-          ? { username: git.username, password: git.password }
-          : {}),
-      };
-      sandbox = await VercelSandbox.create({ ...base, runtime, source });
-    } else {
-      sandbox = await VercelSandbox.create({ ...base, runtime });
-    }
+    const sandbox = await wrapVercelApiError("create sandbox", () => {
+      if (snapshotId) {
+        // Snapshot sources carry their own runtime; the Vercel SDK rejects
+        // `runtime` alongside a snapshot source, so we don't forward it here.
+        return VercelSandbox.create({
+          ...base,
+          source: { type: "snapshot", snapshotId },
+        });
+      }
+      if (provider?.gitSource) {
+        const git = provider.gitSource;
+        const source = {
+          type: "git" as const,
+          url: git.url,
+          depth: git.depth,
+          revision: git.revision,
+          ...(git.username && git.password
+            ? { username: git.username, password: git.password }
+            : {}),
+        };
+        return VercelSandbox.create({ ...base, runtime, source });
+      }
+      return VercelSandbox.create({ ...base, runtime });
+    });
 
     this.sandbox = sandbox;
     if (this.workingDir !== "/vercel/sandbox") {
-      await sandbox.runCommand({
-        cmd: "mkdir",
-        args: ["-p", this.workingDir],
-        sudo: true,
-      });
+      await wrapVercelApiError("create working directory", () =>
+        sandbox.runCommand({
+          cmd: "mkdir",
+          args: ["-p", this.workingDir],
+          sudo: true,
+        }),
+      );
     }
   }
 
@@ -178,12 +204,17 @@ export class VercelSandboxAdapter extends SandboxAdapter<
     await this.ensureProvisioned();
     const sandbox = this.requireSandbox();
 
-    const result = await sandbox.runCommand({
-      cmd: "sh",
-      args: ["-lc", toShellCommand(command)],
-      cwd: options?.cwd ?? this.workingDir,
-      env: this.getMergedEnv(options?.env),
-    });
+    const signal = buildTimeoutSignal(options?.timeoutMs);
+
+    const result = await wrapVercelApiError("run command", () =>
+      sandbox.runCommand({
+        cmd: "sh",
+        args: ["-lc", toShellCommand(command)],
+        cwd: options?.cwd ?? this.workingDir,
+        env: this.getMergedEnv(options?.env),
+        ...(signal ? { signal } : {}),
+      }),
+    );
 
     const [stdout, stderr] = await Promise.all([
       result.stdout(),
@@ -206,13 +237,18 @@ export class VercelSandboxAdapter extends SandboxAdapter<
     await this.ensureProvisioned();
     const sandbox = this.requireSandbox();
 
-    const cmd = await sandbox.runCommand({
-      cmd: "sh",
-      args: ["-lc", toShellCommand(command)],
-      cwd: options?.cwd ?? this.workingDir,
-      env: this.getMergedEnv(options?.env),
-      detached: true,
-    });
+    const signal = buildTimeoutSignal(options?.timeoutMs);
+
+    const cmd = await wrapVercelApiError("start async command", () =>
+      sandbox.runCommand({
+        cmd: "sh",
+        args: ["-lc", toShellCommand(command)],
+        cwd: options?.cwd ?? this.workingDir,
+        env: this.getMergedEnv(options?.env),
+        detached: true,
+        ...(signal ? { signal } : {}),
+      }),
+    );
 
     const queue = new AsyncQueue<CommandEvent>();
     let stdout = "";
@@ -271,44 +307,32 @@ export class VercelSandboxAdapter extends SandboxAdapter<
   }
 
   async list(options?: SandboxListOptions): Promise<SandboxDescriptor[]> {
-    const credentials = getCredentials(this.options);
     const filterTags = options?.tags ?? this.getTags();
-    let result;
-    try {
-      result = await VercelSandbox.list({
-        ...credentials,
-        tags: pickFirstTag(filterTags),
-      });
-    } catch (error) {
-      throw describeVercelApiError(error, "list sandboxes");
-    }
+    const sandboxes = await this.listSandboxesByTags(filterTags);
 
-    return result.sandboxes
-      .filter(
-        (s: { tags?: Record<string, string> }) =>
-          matchesAllTags(s.tags, filterTags),
-      )
-      .map(
-        (s: {
-          name: string;
-          status: string;
-          createdAt: number;
-          tags?: Record<string, string>;
-        }) => ({
-          provider: this.provider,
-          id: s.name,
-          state: s.status,
-          tags: s.tags ?? {},
-          createdAt: new Date(s.createdAt).toISOString(),
-          raw: s,
-        }),
-      );
+    return sandboxes.map(
+      (s: {
+        name: string;
+        status: string;
+        createdAt: number;
+        tags?: Record<string, string>;
+      }) => ({
+        provider: this.provider,
+        id: s.name,
+        state: s.status,
+        tags: s.tags ?? {},
+        createdAt: new Date(s.createdAt).toISOString(),
+        raw: s,
+      }),
+    );
   }
 
   async snapshot(): Promise<string | null> {
     await this.ensureProvisioned();
     const sandbox = this.requireSandbox();
-    const snap = await sandbox.snapshot();
+    const snap = await wrapVercelApiError("snapshot sandbox", () =>
+      sandbox.snapshot(),
+    );
     return snap.snapshotId;
   }
 
@@ -318,7 +342,7 @@ export class VercelSandboxAdapter extends SandboxAdapter<
       return;
     }
 
-    await sandbox.stop();
+    await wrapVercelApiError("stop sandbox", () => sandbox.stop());
     this.sandbox = undefined;
   }
 
@@ -366,29 +390,38 @@ export class VercelSandboxAdapter extends SandboxAdapter<
     };
   }
 
+  private async listSandboxesByTags(
+    tags: Record<string, string>,
+  ): Promise<
+    Array<{
+      name: string;
+      status: string;
+      createdAt: number;
+      tags?: Record<string, string>;
+    }>
+  > {
+    const credentials = getCredentials(this.options);
+    const result = await wrapVercelApiError("list sandboxes", () =>
+      VercelSandbox.list({
+        ...credentials,
+        tags: pickFirstTag(tags),
+      }),
+    );
+    return result.sandboxes.filter(
+      (s: { tags?: Record<string, string> }) => matchesAllTags(s.tags, tags),
+    );
+  }
+
   private async findExistingSandbox(): Promise<VercelSandbox | undefined> {
     const credentials = getCredentials(this.options);
-    const fullTags = this.getTags();
-    let result;
-    try {
-      result = await VercelSandbox.list({
-        ...credentials,
-        tags: pickFirstTag(fullTags),
-      });
-    } catch (error) {
-      throw describeVercelApiError(error, "list sandboxes");
-    }
-    const match = result.sandboxes.find(
-      (s: {
-        name: string;
-        status: string;
-        tags?: Record<string, string>;
-      }) => s.status === "running" && matchesAllTags(s.tags, fullTags),
-    );
+    const sandboxes = await this.listSandboxesByTags(this.getTags());
+    const match = sandboxes.find((s) => s.status === "running");
     if (!match) {
       return undefined;
     }
-    return VercelSandbox.get({ ...credentials, name: match.name });
+    return wrapVercelApiError("get sandbox", () =>
+      VercelSandbox.get({ ...credentials, name: match.name }),
+    );
   }
 
   private requireSandbox(): VercelSandbox {

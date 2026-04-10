@@ -220,9 +220,11 @@ describe.skipIf(!enabled)("Vercel Sandbox E2E", () => {
     await expect(sandbox.openPort(3000)).resolves.toBe(sandbox);
   });
 
-  it("getPreviewLink: returns a URL for a declared port", async () => {
-    // Vercel sandboxes require ports declared at creation time.
-    // Create a dedicated sandbox with port 8080 exposed.
+  it("getPreviewLink: throws for ports not declared at create time", async () => {
+    // Vercel sandboxes require ports to be declared at creation time via
+    // `provider.ports`. This sandbox intentionally omits `provider.ports`,
+    // so port 8080 is never registered with the SDK — we expect
+    // `getPreviewLink(8080)` to throw.
     const portSandbox = new Sandbox("vercel", {
       tags: { suite: "e2e-port" },
       provider: {
@@ -232,14 +234,10 @@ describe.skipIf(!enabled)("Vercel Sandbox E2E", () => {
       },
     });
 
-    // Provision by running a command — this triggers Sandbox.create
-    // but we need ports declared. The SDK accepts ports in create().
-    // Since our adapter doesn't expose ports in create, we test that
-    // domain() throws for undeclared ports (expected behavior).
+    // Force provisioning via a no-op command.
     const r = await portSandbox.run("echo ok");
     expect(r.exitCode).toBe(0);
 
-    // Undeclared ports should throw
     await expect(portSandbox.getPreviewLink(8080)).rejects.toThrow();
 
     await portSandbox.stop();
