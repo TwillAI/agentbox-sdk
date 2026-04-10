@@ -6,6 +6,12 @@ import type {
 
 export type AISDKEvent =
   | { type: "response-start"; id: string; provider: string }
+  | {
+      type: "message-injected";
+      id: string;
+      provider: string;
+      content: string;
+    }
   | { type: "text-delta"; id: string; provider: string; textDelta: string }
   | { type: "reasoning-delta"; id: string; provider: string; textDelta: string }
   | {
@@ -60,6 +66,13 @@ export function toAISDKEvent(event: NormalizedAgentEvent): AISDKEvent | null {
         type: "response-start",
         id: event.runId,
         provider: event.provider,
+      };
+    case "message.injected":
+      return {
+        type: "message-injected",
+        id: event.runId,
+        provider: event.provider,
+        content: event.content,
       };
     case "text.delta":
       return {

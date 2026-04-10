@@ -22,7 +22,9 @@ import type {
   AgentOptions,
   AgentRunSink,
   AgentPermissionResponse,
+  UserContent,
 } from "./types";
+import { normalizeUserInput } from "./input";
 
 function buildAgentOptionsSystemAppendix(
   options: AgentOptions,
@@ -136,6 +138,7 @@ class AgentRunController implements AgentRun, AgentRunSink {
       reject: (reason?: unknown) => void;
     }
   >();
+  private messageHandler?: (content: UserContent) => Promise<void>;
   private text = "";
   private settled = false;
   readonly finished: Promise<AgentResult>;
@@ -232,6 +235,36 @@ class AgentRunController implements AgentRun, AgentRunSink {
 
     this.pushEvent(event);
     return response;
+  }
+
+  onMessage(handler: (content: UserContent) => Promise<void>): void {
+    this.messageHandler = handler;
+  }
+
+  async sendMessage(content: UserContent): Promise<void> {
+    if (this.settled) {
+      throw new Error("Cannot send a message on a settled agent run.");
+    }
+    if (!this.messageHandler) {
+      throw new Error(
+        "This provider does not support sending messages during a run.",
+      );
+    }
+
+    const textContent = normalizeUserInput(content)
+      .filter((p) => p.type === "text")
+      .map((p) => p.text)
+      .join("");
+
+    this.pushEvent(
+      createNormalizedEvent(
+        "message.injected",
+        { provider: this.provider, runId: this.id },
+        { content: textContent || "(non-text content)" },
+      ),
+    );
+
+    await this.messageHandler(content);
   }
 
   async respondToPermission(response: AgentPermissionResponse): Promise<void> {

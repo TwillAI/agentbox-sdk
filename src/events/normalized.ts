@@ -7,6 +7,7 @@ import type {
 export type NormalizedAgentEventType =
   | "run.started"
   | "message.started"
+  | "message.injected"
   | "text.delta"
   | "reasoning.delta"
   | "tool.call.started"
@@ -33,6 +34,11 @@ export interface RunStartedEvent extends NormalizedAgentEventBase {
 
 export interface MessageStartedEvent extends NormalizedAgentEventBase {
   type: "message.started";
+}
+
+export interface MessageInjectedEvent extends NormalizedAgentEventBase {
+  type: "message.injected";
+  content: string;
 }
 
 export interface TextDeltaEvent extends NormalizedAgentEventBase {
@@ -101,6 +107,7 @@ export interface RunErrorEvent extends NormalizedAgentEventBase {
 export type NormalizedAgentEvent =
   | RunStartedEvent
   | MessageStartedEvent
+  | MessageInjectedEvent
   | TextDeltaEvent
   | ReasoningDeltaEvent
   | ToolCallStartedEvent

@@ -526,6 +526,12 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
         }
       })();
 
+      sink.onMessage(async () => {
+        console.warn(
+          "[agentbox] sendMessage is not yet supported for the opencode provider. Use resumeSessionId for follow-ups instead.",
+        );
+      });
+
       sink.setSessionId(sessionId);
       sink.emitRaw(
         toRawEvent(

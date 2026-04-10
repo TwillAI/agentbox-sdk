@@ -10,11 +10,13 @@ import type {
   AgentExecutionRequest,
   AgentProviderAdapter,
   AgentRunSink,
+  UserContent,
 } from "../types";
 import { isInteractiveApproval } from "../approval";
 import {
   joinTextParts,
   mapToCodexPromptParts,
+  normalizeUserInput,
   type ResolvedImagePart,
   validateProviderUserInput,
 } from "../input";
@@ -925,6 +927,37 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
 
     let rootThreadId: string | undefined;
     let turnId: string | undefined;
+    let pendingTurns = 1;
+
+    const sendTurn = async (content: UserContent) => {
+      if (!rootThreadId) {
+        throw new Error("Cannot send message before thread is started.");
+      }
+      const parts = normalizeUserInput(content);
+      const text = parts
+        .filter((p) => p.type === "text")
+        .map((p) => p.text)
+        .join("");
+      const inputItems: Array<Record<string, unknown>> = [];
+      if (text.trim().length > 0) {
+        inputItems.push({ type: "text", text, text_elements: [] });
+      }
+      pendingTurns++;
+      const sandboxPolicy = buildTurnSandboxPolicy(request.options);
+      await client.request<{ turn?: { id?: string } }>("turn/start", {
+        threadId: rootThreadId,
+        input: inputItems,
+        approvalPolicy: isInteractiveApproval(request.options)
+          ? "untrusted"
+          : "never",
+        ...(sandboxPolicy ? { sandboxPolicy } : {}),
+        model: request.run.model ?? null,
+        effort: null,
+        outputSchema: null,
+      });
+    };
+
+    sink.onMessage(sendTurn);
 
     const completion = new Promise<{
       text?: string;
@@ -988,8 +1021,11 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
             (!message.params?.threadId ||
               message.params.threadId === rootThreadId)
           ) {
-            resolve({ text: finalText, turnId, threadId: rootThreadId });
-            return;
+            pendingTurns--;
+            if (pendingTurns <= 0) {
+              resolve({ text: finalText, turnId, threadId: rootThreadId });
+              return;
+            }
           }
 
           if (message.method === "error" && !shouldIgnoreCodexError(message)) {
@@ -997,6 +1033,8 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
             return;
           }
         }
+
+        reject(new Error("Codex transport closed before run completed."));
       })().catch(reject);
     });
 

@@ -140,6 +140,7 @@ export interface AgentRun extends AsyncIterable<NormalizedAgentEvent> {
   rawEvents(): AsyncIterable<RawAgentEvent>;
   toAISDKEvents(): AsyncIterable<AISDKEvent>;
   respondToPermission(response: AgentPermissionResponse): Promise<void>;
+  sendMessage(content: UserContent): Promise<void>;
   abort(): Promise<void>;
   readonly finished: Promise<AgentResult>;
 }
@@ -153,6 +154,7 @@ export interface AgentRunSink {
   requestPermission(
     event: PermissionRequestedEvent,
   ): Promise<AgentPermissionResponse>;
+  onMessage(handler: (content: UserContent) => Promise<void>): void;
   complete(result?: { text?: string }): void;
   fail(error: unknown): void;
 }

@@ -9,6 +9,7 @@ import type {
   AgentExecutionRequest,
   AgentProviderAdapter,
   AgentRunSink,
+  UserContent,
 } from "../types";
 import { shouldAutoApproveClaudeTools } from "../approval";
 import { mapToClaudeUserContent, validateProviderUserInput } from "../input";
@@ -1132,7 +1133,23 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     let sessionId = "";
     let accumulatedText = "";
     let usedStreaming = false;
+    let pendingMessages = 1;
     const autoApproveTools = shouldAutoApproveClaudeTools(request.options);
+
+    sink.onMessage(async (content: UserContent) => {
+      pendingMessages++;
+      const parts = await validateProviderUserInput(request.provider, content);
+      const mapped = mapToClaudeUserContent(parts);
+      accumulatedText = "";
+      usedStreaming = false;
+      await runtime.transport.send({
+        type: "user",
+        message: { role: "user", content: mapped },
+        parent_tool_use_id: null,
+        session_id: sessionId || request.run.resumeSessionId || "",
+        uuid: randomUUID(),
+      });
+    });
 
     const completion = new Promise<{ text: string }>((resolve, reject) => {
       void (async () => {
@@ -1257,7 +1274,12 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
           if (message.type === "result") {
             const subtype = String(message.subtype ?? "success");
             if (subtype === "success") {
-              resolve({ text: accumulatedText });
+              pendingMessages--;
+              if (pendingMessages <= 0) {
+                resolve({ text: accumulatedText });
+                return;
+              }
+              continue;
             } else {
               reject(
                 new Error(
@@ -1282,6 +1304,8 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
             return;
           }
         }
+
+        reject(new Error("Claude Code transport closed before run completed."));
       })().catch(reject);
     });
 
