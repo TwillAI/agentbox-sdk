@@ -286,10 +286,24 @@ export class ModalSandboxAdapter extends SandboxAdapter<
     }
 
     this.clientClosed = true;
+
+    const swallowGrpcShutdown = (reason: unknown) => {
+      if (
+        reason instanceof Error &&
+        reason.message.includes("Channel has been shut down")
+      ) {
+        return;
+      }
+      throw reason;
+    };
+    process.on("unhandledRejection", swallowGrpcShutdown);
     try {
       this.client.close();
+      await new Promise((resolve) => setTimeout(resolve, 250));
     } catch {
       // Ignore client shutdown errors during cleanup.
+    } finally {
+      process.off("unhandledRejection", swallowGrpcShutdown);
     }
   }
 
