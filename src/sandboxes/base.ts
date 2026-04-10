@@ -46,6 +46,24 @@ export abstract class SandboxAdapter<
   abstract openPort(port: number): Promise<void>;
   abstract getPreviewLink(port: number): Promise<string>;
 
+  async uploadFile(
+    _content: Buffer | string,
+    _targetPath: string,
+  ): Promise<void> {
+    void _content;
+    void _targetPath;
+    throw new Error(
+      `uploadFile is not supported by the ${this.provider} provider.`,
+    );
+  }
+
+  async downloadFile(_sourcePath: string): Promise<Buffer> {
+    void _sourcePath;
+    throw new Error(
+      `downloadFile is not supported by the ${this.provider} provider.`,
+    );
+  }
+
   protected async ensureProvisioned(): Promise<void> {
     if (this.provisioned) {
       return;
@@ -69,6 +87,15 @@ export abstract class SandboxAdapter<
 
   get workingDir(): string {
     return this.options.workingDir ?? "/workspace";
+  }
+
+  /**
+   * Headers that callers should attach to HTTP / WebSocket requests they make
+   * against this sandbox's preview URL. Default is empty; providers like
+   * Vercel override this to inject Deployment Protection bypass tokens.
+   */
+  get previewHeaders(): Record<string, string> {
+    return {};
   }
 
   getMergedEnv(extra?: Record<string, string>): Record<string, string> {

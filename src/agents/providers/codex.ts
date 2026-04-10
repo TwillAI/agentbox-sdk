@@ -502,13 +502,16 @@ function toRemoteCodexWebSocketUrl(url: string): string {
   return parsed.toString();
 }
 
-async function connectRemoteCodexAppServer(url: string) {
+async function connectRemoteCodexAppServer(
+  url: string,
+  headers: Record<string, string> = {},
+) {
   const startedAt = Date.now();
   let lastError: unknown;
 
   while (Date.now() - startedAt < 30_000) {
     try {
-      return await connectJsonRpcWebSocket(url);
+      return await connectJsonRpcWebSocket(url, { headers });
     } catch (error) {
       lastError = error;
       await sleep(250);
@@ -696,6 +699,7 @@ async function createRuntime(
 
       const transport = await connectRemoteCodexAppServer(
         toRemoteCodexWebSocketUrl(previewUrl),
+        sandbox.previewHeaders,
       );
       return {
         source: transport.source,

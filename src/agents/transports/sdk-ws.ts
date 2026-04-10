@@ -200,14 +200,17 @@ export class SdkWsClient implements SdkWsTransport {
   private readonly messagesQueue = new AsyncQueue<SdkWsMessage>();
   private readonly pendingResponses = new Map<string, PendingResponse>();
 
-  constructor(private readonly url: string) {}
+  constructor(
+    private readonly url: string,
+    private readonly headers: Record<string, string> = {},
+  ) {}
 
   async start(): Promise<void> {
     if (this.socket?.readyState === WebSocket.OPEN) {
       return;
     }
 
-    const socket = new WebSocket(this.url);
+    const socket = new WebSocket(this.url, { headers: this.headers });
     this.socket = socket;
 
     socket.on("message", (data) => {
@@ -412,14 +415,17 @@ export class SharedSdkWsConnection {
   private readonly channels = new Map<string, SharedSdkWsChannel>();
   private readonly pendingMessages = new Map<string, SdkWsMessage[]>();
 
-  constructor(private readonly url: string) {}
+  constructor(
+    private readonly url: string,
+    private readonly headers: Record<string, string> = {},
+  ) {}
 
   async start(): Promise<void> {
     if (this.socket?.readyState === WebSocket.OPEN) {
       return;
     }
 
-    const socket = new WebSocket(this.url);
+    const socket = new WebSocket(this.url, { headers: this.headers });
     this.socket = socket;
 
     socket.on("message", (data) => {

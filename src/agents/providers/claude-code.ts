@@ -612,12 +612,13 @@ function buildLocalSdkUrl(
 
 async function connectRemoteTransport(
   url: string,
+  headers: Record<string, string> = {},
 ): Promise<SharedSdkWsConnection> {
   const startedAt = Date.now();
   let lastError: unknown;
 
   while (Date.now() - startedAt < 30_000) {
-    const client = new SharedSdkWsConnection(url);
+    const client = new SharedSdkWsConnection(url, headers);
     try {
       await Promise.race([
         client.start(),
@@ -640,11 +641,14 @@ async function connectRemoteTransport(
   );
 }
 
-async function canConnectToRemoteRelay(previewUrl: string): Promise<boolean> {
+async function canConnectToRemoteRelay(
+  previewUrl: string,
+  headers: Record<string, string> = {},
+): Promise<boolean> {
   const parsed = new URL(toWebSocketUrl(previewUrl));
   parsed.searchParams.set("role", "claude");
   parsed.searchParams.set("runId", "__probe__");
-  const client = new SharedSdkWsConnection(parsed.toString());
+  const client = new SharedSdkWsConnection(parsed.toString(), headers);
   try {
     await Promise.race([
       client.start(),
@@ -686,7 +690,7 @@ async function ensureSharedRemoteConnection(
 
   const created = (async () => {
     const url = toSharedHostWebSocketUrl(previewUrl);
-    const connection = await connectRemoteTransport(url);
+    const connection = await connectRemoteTransport(url, sandbox.previewHeaders);
     return { previewUrl, connection };
   })();
 
@@ -706,8 +710,9 @@ async function ensureRemoteRelay(
   const sandbox = request.options.sandbox!;
   await sandbox.openPort(REMOTE_SDK_RELAY_PORT);
   const previewUrl = await sandbox.getPreviewLink(REMOTE_SDK_RELAY_PORT);
+  const previewHeaders = sandbox.previewHeaders;
 
-  if (await canConnectToRemoteRelay(previewUrl)) {
+  if (await canConnectToRemoteRelay(previewUrl, previewHeaders)) {
     return {
       relayPort: REMOTE_SDK_RELAY_PORT,
       relayPath: REMOTE_SDK_RELAY_PATH,
@@ -744,7 +749,7 @@ async function ensureRemoteRelay(
 
   const startedAt = Date.now();
   while (Date.now() - startedAt < 30_000) {
-    if (await canConnectToRemoteRelay(previewUrl)) {
+    if (await canConnectToRemoteRelay(previewUrl, previewHeaders)) {
       return {
         relayPort: REMOTE_SDK_RELAY_PORT,
         relayPath: REMOTE_SDK_RELAY_PATH,

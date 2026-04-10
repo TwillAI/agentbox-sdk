@@ -18,7 +18,22 @@ export async function fetchJson<T>(
     throw new Error(`Request to ${url} failed with ${response.status}.`);
   }
 
-  return (await response.json()) as T;
+  const text = await response.text();
+  if (text.length === 0) {
+    throw new Error(
+      `Request to ${url} returned status ${response.status} with an empty body.`,
+    );
+  }
+
+  try {
+    return JSON.parse(text) as T;
+  } catch (error) {
+    const preview = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+    const cause = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Could not parse JSON response from ${url} (status ${response.status}): ${cause}. Body: ${preview}`,
+    );
+  }
 }
 
 export async function* streamSse(
@@ -84,9 +99,10 @@ export interface JsonRpcWebSocketTransport {
 
 export async function connectJsonRpcWebSocket(
   url: string,
+  options?: { headers?: Record<string, string> },
 ): Promise<JsonRpcWebSocketTransport> {
   const notifications = new AsyncQueue<string>();
-  const socket = new WebSocket(url);
+  const socket = new WebSocket(url, { headers: options?.headers });
 
   await new Promise<void>((resolve, reject) => {
     const cleanup = () => {

@@ -1,4 +1,9 @@
-export type SandboxProviderName = "local-docker" | "modal" | "daytona" | "e2b";
+export type SandboxProviderName =
+  | "local-docker"
+  | "modal"
+  | "daytona"
+  | "vercel"
+  | "e2b";
 
 export interface CommandOptions {
   cwd?: string;
@@ -102,6 +107,37 @@ export interface DaytonaProviderOptions {
   public?: boolean;
 }
 
+export interface VercelGitSource {
+  url: string;
+  depth?: number;
+  revision?: string;
+  username?: string;
+  password?: string;
+}
+
+export interface VercelProviderOptions {
+  token?: string;
+  teamId?: string;
+  projectId?: string;
+  runtime?: string;
+  snapshotId?: string;
+  timeoutMs?: number;
+  gitSource?: VercelGitSource;
+  /**
+   * Ports to declare at sandbox creation time. The Vercel SDK requires ports
+   * to be known upfront; runtime-opened ports are not supported. Max 4.
+   */
+  ports?: number[];
+  /**
+   * Vercel Deployment Protection bypass token. When set, every request the
+   * agent transports send through the sandbox preview URL will include
+   * `x-vercel-protection-bypass: <token>`. Required when the linked Vercel
+   * project has Deployment Protection enabled — without it, POST requests
+   * to sandbox-exposed ports come back 200 + empty body.
+   */
+  protectionBypass?: string;
+}
+
 export interface E2bProviderOptions {
   apiKey?: string;
   accessToken?: string;
@@ -132,6 +168,10 @@ export interface DaytonaSandboxOptions extends SandboxOptionsBase {
   provider?: DaytonaProviderOptions;
 }
 
+export interface VercelSandboxOptions extends SandboxOptionsBase {
+  provider?: VercelProviderOptions;
+}
+
 export interface E2bSandboxOptions extends SandboxOptionsBase {
   provider?: E2bProviderOptions;
 }
@@ -140,6 +180,7 @@ export type SandboxOptionsMap = {
   "local-docker": LocalDockerSandboxOptions;
   modal: ModalSandboxOptions;
   daytona: DaytonaSandboxOptions;
+  vercel: VercelSandboxOptions;
   e2b: E2bSandboxOptions;
 };
 
@@ -151,6 +192,7 @@ export type SandboxRawMap = {
   "local-docker": import("./providers/local-docker").DockerRaw;
   modal: import("./providers/modal").ModalRaw;
   daytona: import("./providers/daytona").DaytonaRaw;
+  vercel: import("./providers/vercel").VercelRaw;
   e2b: import("./providers/e2b").E2bRaw;
 };
 
