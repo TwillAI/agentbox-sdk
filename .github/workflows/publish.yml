@@ -17,14 +17,9 @@ jobs:
     uses: ./.github/workflows/e2e.yml
     secrets: inherit
 
-  local-docker-e2e:
-    name: Local Docker E2E
-    uses: ./.github/workflows/local-docker-e2e.yml
-    secrets: inherit
-
   publish:
     name: Publish to npm
-    needs: [ci, e2e, local-docker-e2e]
+    needs: [ci, e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: read

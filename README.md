@@ -1,6 +1,8 @@
 # AgentBox
 
-Run agents inside sandboxes. One API, any provider.
+Run coding agents inside sandboxes. One API, any provider.
+
+Unlike wrappers that shell out to CLIs in non-interactive mode (e.g. `claude --print`), AgentBox launches each agent as a **server process** inside the sandbox and communicates over WebSocket or HTTP. This preserves the full interactive capabilities of each agent — approval flows, tool-use control, streaming events.
 
 ```ts
 import { Agent, Sandbox } from "agentbox-sdk";
@@ -335,18 +337,18 @@ new Agent("opencode", {
 
 The [`examples/`](./examples) directory has short, runnable scripts that each demonstrate one feature:
 
-| Example                                                         | What it shows                  |
-| --------------------------------------------------------------- | ------------------------------ |
-| [`basic.ts`](./examples/basic.ts)                               | Minimal agent + sandbox        |
-| [`streaming.ts`](./examples/streaming.ts)                       | Stream and handle events       |
-| [`interactive-approval.ts`](./examples/interactive-approval.ts) | Approve tool calls from stdin  |
-| [`skills.ts`](./examples/skills.ts)                             | Attach a GitHub skill          |
-| [`sub-agents.ts`](./examples/sub-agents.ts)                     | Delegate to sub-agents         |
-| [`mcp-server.ts`](./examples/mcp-server.ts)                     | Connect an MCP server          |
-| [`multimodal.ts`](./examples/multimodal.ts)                     | Send images to the agent       |
-| [`custom-image.ts`](./examples/custom-image.ts)                 | Build a custom sandbox image   |
-| [`cloud-sandbox.ts`](./examples/cloud-sandbox.ts)               | Use E2B, Modal, or Daytona     |
-| [`git-clone.ts`](./examples/git-clone.ts)                       | Clone a repo into the sandbox  |
+| Example                                                         | What it shows                 |
+| --------------------------------------------------------------- | ----------------------------- |
+| [`basic.ts`](./examples/basic.ts)                               | Minimal agent + sandbox       |
+| [`streaming.ts`](./examples/streaming.ts)                       | Stream and handle events      |
+| [`interactive-approval.ts`](./examples/interactive-approval.ts) | Approve tool calls from stdin |
+| [`skills.ts`](./examples/skills.ts)                             | Attach a GitHub skill         |
+| [`sub-agents.ts`](./examples/sub-agents.ts)                     | Delegate to sub-agents        |
+| [`mcp-server.ts`](./examples/mcp-server.ts)                     | Connect an MCP server         |
+| [`multimodal.ts`](./examples/multimodal.ts)                     | Send images to the agent      |
+| [`custom-image.ts`](./examples/custom-image.ts)                 | Build a custom sandbox image  |
+| [`cloud-sandbox.ts`](./examples/cloud-sandbox.ts)               | Use E2B, Modal, or Daytona    |
+| [`git-clone.ts`](./examples/git-clone.ts)                       | Clone a repo into the sandbox |
 
 All examples import from `"agentbox-sdk"` like a normal dependency. Run them with:
 
@@ -388,7 +390,6 @@ npm install /path/to/agentbox-sdk-0.1.0.tgz
 npm test                                              # fast, no real providers
 AGENTBOX_RUN_SMOKE_TESTS=1 npm run test:smoke         # live smoke tests
 AGENTBOX_RUN_MATRIX_E2E=1 npm run test:e2e:matrix     # provider matrix
-AGENTBOX_RUN_LOCAL_DOCKER_E2E=1 npm run test:e2e:local-docker  # local Docker e2e
 ```
 
 Live test suites are opt-in because they provision real infrastructure.

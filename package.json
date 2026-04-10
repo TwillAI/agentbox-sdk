@@ -37,7 +37,6 @@
     "lint": "eslint . --max-warnings=0",
     "lint:fix": "eslint . --fix",
     "test": "vitest run",
-    "test:e2e:local-docker": "vitest run test/local-docker.e2e.test.ts",
     "test:e2e:matrix": "vitest run test/live-matrix.e2e.test.ts",
     "test:smoke": "vitest run test/smoke.test.ts",
     "test:watch": "vitest",

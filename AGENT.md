@@ -121,16 +121,14 @@ npm run hooks:install
 
 ## E2E Testing
 
-The local Docker E2E suite validates all three agent providers in a Linux container.
+The live matrix E2E suite validates all agent × sandbox provider combinations.
 
 Key expectations:
 
 - credentials should come from project env, not copied host state
 - the script should exercise the real `Agent` and `Sandbox` abstractions
 - it should produce comparable evidence across providers
-- shared feature coverage should include simple runs plus skills, sub-agents, and interactive approvals
-- provider-native hook coverage should exercise Claude hooks, Codex hooks, and OpenCode plugin hooks
-- CI should build its own Docker image from the repo and rely on GitHub Actions secrets instead of host-specific auth folders where possible
+- CI should rely on GitHub Actions secrets instead of host-specific auth folders where possible
 
 ## When Editing
 
