@@ -917,7 +917,6 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
     );
     const runtime = await createRuntime(request, inputParts);
     sink.setRaw(runtime.raw);
-    sink.setAbort(runtime.cleanup);
     sink.emitEvent(
       createNormalizedEvent("run.started", {
         provider: request.provider,
@@ -936,6 +935,40 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
     let rootThreadId: string | undefined;
     let turnId: string | undefined;
     let pendingTurns = 1;
+
+    // Abort handler: first issue `turn/interrupt` so codex writes a
+    // proper "interrupted" status into the rollout (without this, a
+    // subsequent `thread/resume` makes the model continue the aborted
+    // response instead of treating it as finished). Then unconditionally
+    // tear down the transport so the run unwinds within a bounded time
+    // — we cannot rely on `turn/completed` arriving on the event stream
+    // after an interrupt, and leaving the transport open would strand
+    // the caller's event loop, keeping the run's isRunning state stuck
+    // and blocking the next user message.
+    sink.setAbort(async () => {
+      const threadIdAtAbort = rootThreadId;
+      const turnIdAtAbort = turnId;
+      if (threadIdAtAbort && turnIdAtAbort) {
+        try {
+          await Promise.race([
+            client.request("turn/interrupt", {
+              threadId: threadIdAtAbort,
+              turnId: turnIdAtAbort,
+            }),
+            new Promise((_, reject) =>
+              setTimeout(
+                () =>
+                  reject(new Error("codex turn/interrupt timed out")),
+                3_000,
+              ),
+            ),
+          ]);
+        } catch {
+          // Best-effort; fall through to hard cleanup regardless.
+        }
+      }
+      await runtime.cleanup().catch(() => undefined);
+    });
 
     const sendTurn = async (content: UserContent) => {
       if (!rootThreadId) {

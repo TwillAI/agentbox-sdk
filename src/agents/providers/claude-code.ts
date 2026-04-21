@@ -30,7 +30,6 @@ import {
   type SdkWsTransport,
 } from "../transports/sdk-ws";
 import { spawnCommand } from "../transports/spawn";
-import { linesFromTextChunks } from "../../shared/streams";
 import type { AsyncCommandHandle, CommandResult } from "../../sandboxes";
 
 type ClaudeRuntime = {
@@ -878,44 +877,6 @@ async function createRuntime(
   return createLocalRuntime(request, prepared);
 }
 
-function buildDirectClaudeArgs(
-  buildArgs: (sdkUrl: string) => string[],
-  prompt: string,
-): string[] {
-  const args = buildArgs("ws://127.0.0.1:9/");
-  const directArgs: string[] = [];
-
-  for (let index = 0; index < args.length; index += 1) {
-    const current = args[index];
-    if (current === undefined) {
-      continue;
-    }
-    if (current === "--sdk-url" || current === "--input-format") {
-      index += 1;
-      continue;
-    }
-    directArgs.push(current);
-  }
-
-  if (!directArgs.includes("--verbose")) {
-    const printIndex = directArgs.indexOf("--print");
-    if (printIndex === -1) {
-      directArgs.unshift("--verbose");
-    } else {
-      directArgs.splice(printIndex + 1, 0, "--verbose");
-    }
-  }
-
-  const promptIndex = directArgs.lastIndexOf("-p");
-  if (promptIndex !== -1 && promptIndex + 1 < directArgs.length) {
-    directArgs[promptIndex + 1] = prompt;
-  } else {
-    directArgs.push("-p", prompt);
-  }
-
-  return directArgs;
-}
-
 export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code"> {
   async execute(
     request: AgentExecutionRequest<"claude-code">,
@@ -927,205 +888,42 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     );
     const userContent = mapToClaudeUserContent(inputParts);
 
-    if (
-      request.options.sandbox?.provider === "e2b" &&
-      typeof userContent === "string" &&
-      !request.run.systemPrompt &&
-      !request.options.subAgents?.length
-    ) {
-      const prepared = await prepareClaudeRuntime(request);
-      const args = buildDirectClaudeArgs(prepared.buildArgs, userContent);
-      const handle = await request.options.sandbox.runAsync(
-        [request.options.provider?.binary ?? "claude", ...args],
-        {
-          cwd: request.options.cwd,
-          env: {
-            ...prepared.env,
-            IS_SANDBOX: "1",
-          },
-          timeoutMs: 0,
-        },
-      );
+    let sessionId = "";
+    let accumulatedText = "";
+    let usedStreaming = false;
+    let pendingMessages = 1;
+    const autoApproveTools = shouldAutoApproveClaudeTools(request.options);
 
-      sink.setRaw({
-        handle,
-        layout: prepared.target.layout,
-        mode: "e2b-direct",
-      });
-      sink.setAbort(async () => {
-        await handle.kill().catch(() => undefined);
-        await handle.wait().catch(() => undefined);
-        await prepared.target.cleanup().catch(() => undefined);
-      });
-      sink.emitEvent(
-        createNormalizedEvent("run.started", {
-          provider: request.provider,
-          runId: request.runId,
-        }),
-      );
+    // Register `onMessage` synchronously so callers can send follow-up
+    // messages as soon as they have the run handle, even while the runtime
+    // (sandbox + relay + WebSocket) is still coming up. Messages that arrive
+    // before the transport is connected are queued and flushed once it is.
+    type ClaudeTransport = Awaited<ReturnType<typeof createRuntime>>["transport"];
+    const transportRef: { current?: ClaudeTransport } = {};
+    const queuedSends: Array<Parameters<ClaudeTransport["send"]>[0]> = [];
 
-      const completion = new Promise<{ text: string }>((resolve, reject) => {
-        let accumulatedText = "";
-
-        async function* stdoutChunks() {
-          for await (const event of handle) {
-            if (event.type === "stdout" && event.chunk) {
-              yield event.chunk;
-            }
-          }
-        }
-
-        void (async () => {
-          for await (const line of linesFromTextChunks(stdoutChunks())) {
-            const trimmed = line.trim();
-            if (!trimmed) {
-              continue;
-            }
-
-            let message: SdkWsMessage;
-            try {
-              message = JSON.parse(trimmed) as SdkWsMessage;
-            } catch {
-              continue;
-            }
-
-            sink.emitRaw(toRawEvent(request.runId, message, message.type));
-
-            if (message.type === "system" && message.subtype === "init") {
-              const sessionId = String(message.session_id ?? "");
-              if (sessionId) {
-                sink.setSessionId(sessionId);
-              }
-              sink.emitEvent(
-                createNormalizedEvent("message.started", {
-                  provider: request.provider,
-                  runId: request.runId,
-                }),
-              );
-              continue;
-            }
-
-            if (message.type === "stream_event") {
-              const delta = extractStreamDelta(message);
-              if (delta) {
-                accumulatedText += delta;
-                sink.emitEvent(
-                  createNormalizedEvent(
-                    "text.delta",
-                    {
-                      provider: request.provider,
-                      runId: request.runId,
-                    },
-                    { delta },
-                  ),
-                );
-              }
-              continue;
-            }
-
-            if (message.type === "assistant") {
-              const text = extractAssistantText(message);
-              if (text) {
-                accumulatedText = text;
-                sink.emitEvent(
-                  createNormalizedEvent(
-                    "text.delta",
-                    {
-                      provider: request.provider,
-                      runId: request.runId,
-                    },
-                    { delta: text },
-                  ),
-                );
-              }
-
-              sink.emitEvent(
-                createNormalizedEvent(
-                  "message.completed",
-                  {
-                    provider: request.provider,
-                    runId: request.runId,
-                  },
-                  { text },
-                ),
-              );
-              continue;
-            }
-
-            if (message.type === "result") {
-              if (String(message.subtype ?? "success") === "success") {
-                resolve({ text: accumulatedText });
-              } else {
-                reject(
-                  new Error(
-                    String(
-                      message.result ??
-                        message.error ??
-                        "Claude Code run failed.",
-                    ),
-                  ),
-                );
-              }
-              return;
-            }
-
-            if (
-              message.type === "auth_status" &&
-              message.authenticated === false
-            ) {
-              reject(
-                new Error("Claude Code reported an authentication failure."),
-              );
-              return;
-            }
-
-            if (message.type === "control_request") {
-              reject(
-                new Error(
-                  "Claude Code direct E2B mode does not yet support interactive control requests.",
-                ),
-              );
-              return;
-            }
-          }
-
-          const result = await handle.wait().catch((error) => error);
-          reject(
-            new Error(
-              result instanceof Error
-                ? String(result)
-                : "Claude Code direct E2B mode ended before returning a result.",
-            ),
-          );
-        })().catch(reject);
-      });
-
-      try {
-        const { text } = await completion;
-        await handle.wait().catch(() => undefined);
-        sink.emitEvent(
-          createNormalizedEvent(
-            "run.completed",
-            { provider: request.provider, runId: request.runId },
-            { text },
-          ),
-        );
-        sink.complete({ text });
-      } catch (error) {
-        await handle.kill().catch(() => undefined);
-        await handle.wait().catch(() => undefined);
-        sink.fail(error);
-      } finally {
-        await prepared.target.cleanup().catch(() => undefined);
-      }
-
-      return async () => {
-        await handle.kill().catch(() => undefined);
-        await handle.wait().catch(() => undefined);
+    sink.onMessage(async (content: UserContent) => {
+      pendingMessages++;
+      const parts = await validateProviderUserInput(request.provider, content);
+      const mapped = mapToClaudeUserContent(parts);
+      accumulatedText = "";
+      usedStreaming = false;
+      const payload = {
+        type: "user" as const,
+        message: { role: "user" as const, content: mapped },
+        parent_tool_use_id: null,
+        session_id: sessionId || request.run.resumeSessionId || "",
+        uuid: randomUUID(),
       };
-    }
+      if (transportRef.current) {
+        await transportRef.current.send(payload);
+      } else {
+        queuedSends.push(payload);
+      }
+    });
 
     const runtime = await createRuntime(request);
+    transportRef.current = runtime.transport;
     sink.setRaw(runtime.raw);
     sink.setAbort(runtime.cleanup);
     sink.emitEvent(
@@ -1134,27 +932,6 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         runId: request.runId,
       }),
     );
-
-    let sessionId = "";
-    let accumulatedText = "";
-    let usedStreaming = false;
-    let pendingMessages = 1;
-    const autoApproveTools = shouldAutoApproveClaudeTools(request.options);
-
-    sink.onMessage(async (content: UserContent) => {
-      pendingMessages++;
-      const parts = await validateProviderUserInput(request.provider, content);
-      const mapped = mapToClaudeUserContent(parts);
-      accumulatedText = "";
-      usedStreaming = false;
-      await runtime.transport.send({
-        type: "user",
-        message: { role: "user", content: mapped },
-        parent_tool_use_id: null,
-        session_id: sessionId || request.run.resumeSessionId || "",
-        uuid: randomUUID(),
-      });
-    });
 
     const completion = new Promise<{ text: string }>((resolve, reject) => {
       void (async () => {
@@ -1340,6 +1117,9 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
           runId: request.runId,
         }),
       );
+      for (const queued of queuedSends.splice(0)) {
+        await runtime.transport.send(queued);
+      }
       const { text } = await completion;
       sink.emitEvent(
         createNormalizedEvent(

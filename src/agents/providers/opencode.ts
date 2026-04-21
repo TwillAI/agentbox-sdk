@@ -10,9 +10,14 @@ import type {
   AgentExecutionRequest,
   AgentProviderAdapter,
   AgentRunSink,
+  UserContent,
 } from "../types";
 import { isInteractiveApproval } from "../approval";
-import { mapToOpenCodeParts, validateProviderUserInput } from "../input";
+import {
+  mapToOpenCodeParts,
+  validateProviderUserInput,
+  type OpenCodePromptPart,
+} from "../input";
 import {
   assertCommandsSupported,
   buildOpenCodeCommandsConfig,
@@ -455,9 +460,51 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
       request.provider,
       request.run.input,
     );
+
+    let pendingMessages = 0;
+    let finalText = "";
+    let dispatchError: unknown;
+    let resolveAllDone!: () => void;
+    const allDone = new Promise<void>((resolve) => {
+      resolveAllDone = resolve;
+    });
+    const checkDone = () => {
+      if (pendingMessages === 0) {
+        resolveAllDone();
+      }
+    };
+
+    // The session POST endpoint is only known once the remote OpenCode server
+    // is up and we've created (or resumed) a session. We install `onMessage`
+    // synchronously here so that callers can call `run.sendMessage(...)` as
+    // soon as they have a handle on the run, even if startup takes a while.
+    // Incoming messages are buffered and flushed once `sendToSession` is
+    // wired up below.
+    let sendToSession: ((parts: OpenCodePromptPart[]) => void) | undefined;
+    const queuedParts: OpenCodePromptPart[][] = [];
+
+    sink.onMessage(async (content: UserContent) => {
+      pendingMessages++;
+      try {
+        const parts = await validateProviderUserInput(request.provider, content);
+        const mapped = mapToOpenCodeParts(parts);
+        if (sendToSession) {
+          sendToSession(mapped);
+        } else {
+          queuedParts.push(mapped);
+        }
+      } catch (error) {
+        pendingMessages--;
+        if (!dispatchError) {
+          dispatchError = error;
+        }
+        checkDone();
+        throw error;
+      }
+    });
+
     const runtime = await createRuntime(request);
     sink.setRaw(runtime.raw);
-    sink.setAbort(runtime.cleanup);
     sink.emitEvent(
       createNormalizedEvent("run.started", {
         provider: request.provider,
@@ -467,6 +514,56 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
 
     const sseAbort = new AbortController();
     let sseTask: Promise<void> | undefined;
+    // AbortController wired into every POST /session/:id/message fetch so a
+    // Stop from the caller actually tears down the long-polling message
+    // request. Without this, the HTTP POST silently keeps streaming even
+    // after `run.abort()` because opencode's message endpoint doesn't
+    // return until the turn finishes on the server side.
+    const dispatchAbort = new AbortController();
+    // Populated once the opencode session exists (either freshly created
+    // or resumed). The abort handler closes over this ref and reads the
+    // current value at call time.
+    let capturedSessionId: string | undefined;
+
+    // Abort handler: prefer opencode's `POST /session/:id/abort` so the
+    // server terminates the turn cleanly and stops billing tokens. Then
+    // abort any in-flight POST /message so the adapter unwinds instead
+    // of hanging on the long-polling fetch. We deliberately avoid
+    // `runtime.cleanup()` here because the opencode server is shared
+    // across runs (see `ensureSandboxOpenCodeServer`); tearing it down
+    // would break subsequent chats.
+    sink.setAbort(async () => {
+      const sessionIdAtAbort = capturedSessionId;
+      if (sessionIdAtAbort) {
+        try {
+          await Promise.race([
+            fetchJson<boolean>(
+              `${runtime.baseUrl}/session/${sessionIdAtAbort}/abort`,
+              {
+                method: "POST",
+                headers: {
+                  "content-type": "application/json",
+                  ...runtime.previewHeaders,
+                },
+              },
+            ),
+            new Promise((_, reject) =>
+              setTimeout(
+                () =>
+                  reject(
+                    new Error("opencode POST /session/abort timed out"),
+                  ),
+                3_000,
+              ),
+            ),
+          ]);
+        } catch {
+          // Best-effort; still abort the pending fetch below so the
+          // run doesn't hang even if the abort RPC failed.
+        }
+      }
+      dispatchAbort.abort();
+    });
 
     try {
       const interactiveApproval = isInteractiveApproval(request.options);
@@ -568,12 +665,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
         }
       })();
 
-      sink.onMessage(async () => {
-        console.warn(
-          "[agentbox] sendMessage is not yet supported for the opencode provider. Use resumeSessionId for follow-ups instead.",
-        );
-      });
-
+      capturedSessionId = sessionId;
       sink.setSessionId(sessionId);
       sink.emitRaw(
         toRawEvent(
@@ -589,47 +681,87 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
         }),
       );
 
-      const response = await fetchJson<unknown>(
-        `${runtime.baseUrl}/session/${sessionId}/message`,
-        {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            ...runtime.previewHeaders,
-          },
-          body: JSON.stringify({
-            ...(request.run.model
-              ? { model: toOpenCodeModel(request.run.model) }
-              : {}),
-            agent: "agentbox",
-            parts: mapToOpenCodeParts(inputParts),
-          }),
-        },
-      );
-
-      const rawResponse = toRawEvent(
-        request.runId,
-        response,
-        "message.response",
-      );
-      sink.emitRaw(rawResponse);
-      for (const event of normalizeRawAgentEvent(rawResponse)) {
-        sink.emitEvent(event);
-      }
-
-      const text = extractText(response);
-      if (text) {
-        sink.emitEvent(
-          createNormalizedEvent(
-            "text.delta",
+      const dispatchMessage = async (
+        parts: OpenCodePromptPart[],
+      ): Promise<void> => {
+        try {
+          const response = await fetchJson<unknown>(
+            `${runtime.baseUrl}/session/${sessionId}/message`,
             {
-              provider: request.provider,
-              runId: request.runId,
+              method: "POST",
+              signal: dispatchAbort.signal,
+              headers: {
+                "content-type": "application/json",
+                ...runtime.previewHeaders,
+              },
+              body: JSON.stringify({
+                ...(request.run.model
+                  ? { model: toOpenCodeModel(request.run.model) }
+                  : {}),
+                agent: "agentbox",
+                parts,
+              }),
             },
-            { delta: text },
-          ),
-        );
+          );
+
+          const rawResponse = toRawEvent(
+            request.runId,
+            response,
+            "message.response",
+          );
+          sink.emitRaw(rawResponse);
+          for (const event of normalizeRawAgentEvent(rawResponse)) {
+            sink.emitEvent(event);
+          }
+
+          const text = extractText(response);
+          if (text) {
+            finalText = text;
+            sink.emitEvent(
+              createNormalizedEvent(
+                "text.delta",
+                {
+                  provider: request.provider,
+                  runId: request.runId,
+                },
+                { delta: text },
+              ),
+            );
+          }
+        } catch (error) {
+          if (!dispatchError) {
+            dispatchError = error;
+          }
+        } finally {
+          pendingMessages--;
+          checkDone();
+        }
+      };
+
+      // OpenCode queues concurrent POSTs to `/session/:id/message` (see
+      // https://github.com/sst/opencode/issues/931), so mid-run injections can
+      // reuse the same endpoint as the initial turn. Each POST resolves with
+      // its own turn's assistant response.
+      sendToSession = (parts) => {
+        void dispatchMessage(parts);
+      };
+
+      // Flush any messages that arrived via `run.sendMessage(...)` before the
+      // session was ready. They now become additional queued turns alongside
+      // the initial input.
+      for (const queued of queuedParts.splice(0)) {
+        sendToSession(queued);
       }
+
+      pendingMessages++;
+      void dispatchMessage(mapToOpenCodeParts(inputParts));
+
+      await allDone;
+
+      if (dispatchError) {
+        throw dispatchError;
+      }
+
       sink.emitEvent(
         createNormalizedEvent(
           "run.completed",
@@ -637,13 +769,13 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"opencode"> {
             provider: request.provider,
             runId: request.runId,
           },
-          { text },
+          { text: finalText },
         ),
       );
 
       sseAbort.abort();
       await sseTask;
-      sink.complete({ text });
+      sink.complete({ text: finalText });
     } finally {
       sseAbort.abort();
       if (sseTask) {
