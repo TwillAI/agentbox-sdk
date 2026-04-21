@@ -12,6 +12,7 @@ import { asError, UnsupportedProviderError } from "../shared/errors";
 import { ClaudeCodeAgentAdapter } from "./providers/claude-code";
 import { CodexAgentAdapter } from "./providers/codex";
 import { OpenCodeAgentAdapter } from "./providers/opencode";
+import { AGENT_RESERVED_PORTS } from "./ports";
 import type {
   AgentExecutionRequest,
   AgentProviderAdapter,
@@ -109,10 +110,14 @@ function prepareAgentOptions<P extends AgentProviderName>(
   provider: P,
   options: AgentOptions<P>,
 ): AgentOptions<P> {
-  if (provider === "opencode") {
-    const openCodeOptions = options as AgentOptions<"opencode">;
-    const port = 4096;
-    openCodeOptions.sandbox?.openPort(port);
+  const ports = AGENT_RESERVED_PORTS[provider] ?? [];
+  for (const port of ports) {
+    // Best-effort: fire-and-forget. Most providers mutate options synchronously
+    // and return a resolved promise; we rely on that to ensure the ports are
+    // staged before the sandbox is first provisioned. Failures (e.g. a Modal
+    // sandbox that's already running without the port) are surfaced later via
+    // `openPort` itself with an actionable error message.
+    void options.sandbox?.openPort(port);
   }
 
   return options;

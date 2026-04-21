@@ -16,6 +16,7 @@ import { AsyncQueue } from "../../shared/async-queue";
 import { pipeReadableStream, readStreamAsText } from "../../shared/streams";
 import { toShellCommand } from "../../shared/shell";
 import { resolveSandboxImage, resolveSandboxResources } from "../image-utils";
+import { collectAllAgentReservedPorts } from "../../agents/ports";
 
 export type ModalRaw = {
   client: ModalClient;
@@ -72,6 +73,8 @@ export class ModalSandboxAdapter extends SandboxAdapter<
     const image = await this.resolveModalImage();
     const resources = resolveSandboxResources(this.options.resources);
 
+    const unencryptedPorts = this.resolveDefaultUnencryptedPorts();
+
     const sandbox = await this.client.sandboxes.create(app, image, {
       cpu: resources?.cpu,
       memoryMiB: resources?.memoryMiB,
@@ -81,12 +84,39 @@ export class ModalSandboxAdapter extends SandboxAdapter<
       command: this.options.provider?.command ?? ["sleep", "infinity"],
       env: this.getMergedEnv(),
       encryptedPorts: this.options.provider?.encryptedPorts,
-      unencryptedPorts: this.options.provider?.unencryptedPorts,
+      unencryptedPorts,
       verbose: this.options.provider?.verbose,
     });
 
     await sandbox.setTags(this.getTags());
     this.sandbox = sandbox;
+  }
+
+  /**
+   * Modal requires ports to be declared at sandbox creation time — a running
+   * sandbox cannot gain new tunnels. To make `openPort` work predictably
+   * across providers, we pre-declare all well-known agent-harness ports on
+   * every Modal sandbox we create, unless the caller has explicitly pinned
+   * them to a specific (possibly empty) list.
+   */
+  private resolveDefaultUnencryptedPorts(): number[] | undefined {
+    const declared = this.options.provider?.unencryptedPorts;
+    const encrypted = new Set(this.options.provider?.encryptedPorts ?? []);
+    const reserved = collectAllAgentReservedPorts().filter(
+      (port) => !encrypted.has(port),
+    );
+
+    if (declared === undefined) {
+      return reserved.length > 0 ? reserved : undefined;
+    }
+
+    // Caller passed an explicit list — honor it but still include reserved
+    // agent ports so agentbox's own harnesses keep working out of the box.
+    const merged = new Set<number>(declared);
+    for (const port of reserved) {
+      merged.add(port);
+    }
+    return Array.from(merged);
   }
 
   async run(
@@ -246,9 +276,35 @@ export class ModalSandboxAdapter extends SandboxAdapter<
       return;
     }
 
-    provider.unencryptedPorts = provider.unencryptedPorts?.includes(port)
-      ? provider.unencryptedPorts
-      : [...(provider.unencryptedPorts ?? []), port];
+    const alreadyDeclared = provider.unencryptedPorts?.includes(port) ?? false;
+    if (!alreadyDeclared) {
+      provider.unencryptedPorts = [...(provider.unencryptedPorts ?? []), port];
+    }
+
+    // If the sandbox is already running we can't retroactively punch a new
+    // tunnel. Verify the port was declared at provisioning time; otherwise
+    // surface a clear, actionable error instead of silently proceeding to a
+    // downstream failure like "Modal sandbox does not expose port ...".
+    if (!this.sandbox) {
+      return;
+    }
+
+    try {
+      const tunnels = await this.sandbox.tunnels();
+      if (tunnels[port]) {
+        return;
+      }
+    } catch {
+      return;
+    }
+
+    throw new Error(
+      `Modal sandbox is already running and cannot expose port ${port} dynamically. ` +
+        `Declare it at creation time via \`provider.unencryptedPorts\` ` +
+        `(e.g. \`provider: { unencryptedPorts: [${port}] }\`) or use ` +
+        `\`AGENT_RESERVED_PORTS\` / \`collectAllAgentReservedPorts()\` ` +
+        `from agentbox-sdk to pre-declare the agent harness ports.`,
+    );
   }
 
   async getPreviewLink(port: number): Promise<string> {

@@ -88,7 +88,9 @@ function buildThreadParams(
     approvalPolicy: isInteractiveApproval(options) ? "untrusted" : "never",
     sandbox: buildCodexSandboxMode(options),
     serviceName: "agentbox",
-    ephemeral: true,
+    // Persist the rollout on disk so follow-up runs can call `thread/resume`.
+    // `ephemeral: true` threads have no rollout file and resume fails with
+    // "no rollout found for thread id ...".
     experimentalRawEvents: true,
   };
 }
@@ -483,16 +485,18 @@ async function ensureCodexLogin(
   request: AgentExecutionRequest<"codex">,
   target: RuntimeTarget,
 ): Promise<void> {
-  const openAiApiKey = request.options.env?.OPENAI_API_KEY;
-  if (!openAiApiKey) {
-    return;
-  }
+  const openAiApiKey =
+    request.options.env?.OPENAI_API_KEY ??
+    request.options.provider?.env?.OPENAI_API_KEY;
 
+  // Best-effort login. If OPENAI_API_KEY is exposed via the agent options, the
+  // sandbox's base env, or the host process env, the shell guard below detects
+  // it and runs `codex login --with-api-key`. Otherwise it silently no-ops so
+  // callers relying on a pre-existing `auth.json` (or other auth mechanisms)
+  // are not broken.
   await target.runCommand(
-    'if [ -z "$OPENAI_API_KEY" ]; then exit 1; fi; printenv OPENAI_API_KEY | env -u CODEX_HOME -u XDG_CONFIG_HOME codex login --with-api-key >/dev/null 2>&1',
-    {
-      OPENAI_API_KEY: openAiApiKey,
-    },
+    'if [ -z "${OPENAI_API_KEY:-}" ]; then exit 0; fi; printenv OPENAI_API_KEY | env -u CODEX_HOME -u XDG_CONFIG_HOME codex login --with-api-key >/dev/null 2>&1',
+    openAiApiKey ? { OPENAI_API_KEY: openAiApiKey } : undefined,
   );
 }
 
