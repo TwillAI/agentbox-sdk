@@ -481,6 +481,15 @@ async function materializeCodexImage(
   return imagePath;
 }
 
+function resolveCodexOpenAiBaseUrl(
+  request: AgentExecutionRequest<"codex">,
+): string | undefined {
+  return (
+    request.options.env?.OPENAI_BASE_URL ??
+    request.options.provider?.env?.OPENAI_BASE_URL
+  );
+}
+
 async function ensureCodexLogin(
   request: AgentExecutionRequest<"codex">,
   target: RuntimeTarget,
@@ -488,15 +497,23 @@ async function ensureCodexLogin(
   const openAiApiKey =
     request.options.env?.OPENAI_API_KEY ??
     request.options.provider?.env?.OPENAI_API_KEY;
+  const openAiBaseUrl = resolveCodexOpenAiBaseUrl(request);
 
   // Best-effort login. If OPENAI_API_KEY is exposed via the agent options, the
   // sandbox's base env, or the host process env, the shell guard below detects
   // it and runs `codex login --with-api-key`. Otherwise it silently no-ops so
   // callers relying on a pre-existing `auth.json` (or other auth mechanisms)
   // are not broken.
+  const extraEnv: Record<string, string> = {};
+  if (openAiApiKey) {
+    extraEnv.OPENAI_API_KEY = openAiApiKey;
+  }
+  if (openAiBaseUrl) {
+    extraEnv.OPENAI_BASE_URL = openAiBaseUrl;
+  }
   await target.runCommand(
     'if [ -z "${OPENAI_API_KEY:-}" ]; then exit 0; fi; printenv OPENAI_API_KEY | env -u CODEX_HOME -u XDG_CONFIG_HOME codex login --with-api-key >/dev/null 2>&1',
-    openAiApiKey ? { OPENAI_API_KEY: openAiApiKey } : undefined,
+    Object.keys(extraEnv).length > 0 ? extraEnv : undefined,
   );
 }
 
@@ -610,6 +627,10 @@ async function createRuntime(
 
     const configArgs: string[] = [];
     configArgs.push("-c", `features.multi_agent=${enableMultiAgent}`);
+    const openAiBaseUrl = resolveCodexOpenAiBaseUrl(request);
+    if (openAiBaseUrl) {
+      configArgs.push("-c", `openai_base_url=${JSON.stringify(openAiBaseUrl)}`);
+    }
     const binary = options.provider?.binary ?? "codex";
     const pidFilePath = path.posix.join(
       sharedTarget.layout.rootDir,
@@ -807,6 +828,10 @@ async function createRuntime(
     );
   }
   configArgs.push("-c", `features.multi_agent=${enableMultiAgent}`);
+  const openAiBaseUrl = resolveCodexOpenAiBaseUrl(request);
+  if (openAiBaseUrl) {
+    configArgs.push("-c", `openai_base_url=${JSON.stringify(openAiBaseUrl)}`);
+  }
 
   const textPrompt = joinTextParts(
     inputParts.filter(
@@ -957,8 +982,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
             }),
             new Promise((_, reject) =>
               setTimeout(
-                () =>
-                  reject(new Error("codex turn/interrupt timed out")),
+                () => reject(new Error("codex turn/interrupt timed out")),
                 3_000,
               ),
             ),
