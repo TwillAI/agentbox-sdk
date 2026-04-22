@@ -15,7 +15,10 @@ import type {
   OpenCodePluginConfig,
 } from "./config/types";
 
-export type AgentProviderName = "codex" | "opencode" | "claude-code";
+export { AgentProvider } from "../enums";
+import type { AgentProvider } from "../enums";
+
+export type AgentProviderName = AgentProvider;
 
 export type DataContent = string | URL | Uint8Array | ArrayBuffer | Buffer;
 

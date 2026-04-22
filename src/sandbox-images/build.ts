@@ -7,7 +7,10 @@ import Docker from "dockerode";
 import { ModalClient } from "modal";
 import tar from "tar-stream";
 
-import type { SandboxProviderName } from "../sandboxes/types";
+import {
+  SandboxProvider,
+  type SandboxProviderName,
+} from "../sandboxes/types";
 import { toShellCommand } from "../shared/shell";
 import type { BuiltInSandboxImageName, SandboxImageDefinition } from "./types";
 import {
@@ -56,13 +59,13 @@ export async function buildSandboxImage(
   );
 
   switch (options.provider) {
-    case "local-docker":
+    case SandboxProvider.LocalDocker:
       return buildLocalDockerImage(definition, options);
-    case "modal":
+    case SandboxProvider.Modal:
       return buildModalImage(definition, options);
-    case "daytona":
+    case SandboxProvider.Daytona:
       return buildDaytonaSnapshot(definition, options);
-    case "e2b":
+    case SandboxProvider.E2B:
       return buildE2bTemplate(definition, options);
     default:
       throw new Error(

@@ -1,5 +1,6 @@
 import path from "node:path";
 
+import { AgentProvider } from "../types";
 import type { AgentCommandConfig, RuntimeLayout, TextArtifact } from "./types";
 
 function buildFrontmatter(
@@ -54,7 +55,7 @@ export function assertCommandsSupported(
     return;
   }
 
-  if (provider === "codex") {
+  if (provider === AgentProvider.Codex) {
     throw new Error(
       "Custom commands are not supported for Codex in this package yet.",
     );

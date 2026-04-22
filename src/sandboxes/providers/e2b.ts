@@ -1,15 +1,16 @@
 import type { Sandbox as E2bSandbox } from "e2b";
 
 import { SandboxAdapter } from "../base";
-import type {
-  AsyncCommandHandle,
-  CommandEvent,
-  CommandOptions,
-  CommandResult,
-  E2bProviderOptions,
-  E2bSandboxOptions,
-  SandboxDescriptor,
-  SandboxListOptions,
+import {
+  SandboxProvider,
+  type AsyncCommandHandle,
+  type CommandEvent,
+  type CommandOptions,
+  type CommandResult,
+  type E2bProviderOptions,
+  type E2bSandboxOptions,
+  type SandboxDescriptor,
+  type SandboxListOptions,
 } from "../types";
 import { AsyncQueue } from "../../shared/async-queue";
 import { toShellCommand } from "../../shared/shell";
@@ -45,7 +46,7 @@ export class E2bSandboxAdapter extends SandboxAdapter<
   private sandbox?: E2bSandbox;
 
   get provider(): "e2b" {
-    return "e2b";
+    return SandboxProvider.E2B;
   }
 
   get raw(): E2bRaw {

@@ -4,14 +4,15 @@ import { PassThrough } from "node:stream";
 import { finished } from "node:stream/promises";
 
 import { SandboxAdapter } from "../base";
-import type {
-  AsyncCommandHandle,
-  CommandEvent,
-  CommandOptions,
-  CommandResult,
-  LocalDockerSandboxOptions,
-  SandboxDescriptor,
-  SandboxListOptions,
+import {
+  SandboxProvider,
+  type AsyncCommandHandle,
+  type CommandEvent,
+  type CommandOptions,
+  type CommandResult,
+  type LocalDockerSandboxOptions,
+  type SandboxDescriptor,
+  type SandboxListOptions,
 } from "../types";
 import { AsyncQueue } from "../../shared/async-queue";
 import { readNodeStream } from "../../shared/streams";
@@ -32,7 +33,7 @@ export class LocalDockerSandboxAdapter extends SandboxAdapter<
   private container?: Docker.Container;
 
   get provider(): "local-docker" {
-    return "local-docker";
+    return SandboxProvider.LocalDocker;
   }
 
   get raw(): DockerRaw {

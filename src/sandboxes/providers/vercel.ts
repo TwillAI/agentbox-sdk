@@ -1,14 +1,15 @@
 import { Sandbox as VercelSandbox } from "@vercel/sandbox";
 
 import { SandboxAdapter } from "../base";
-import type {
-  AsyncCommandHandle,
-  CommandEvent,
-  CommandOptions,
-  CommandResult,
-  SandboxDescriptor,
-  SandboxListOptions,
-  VercelSandboxOptions,
+import {
+  SandboxProvider,
+  type AsyncCommandHandle,
+  type CommandEvent,
+  type CommandOptions,
+  type CommandResult,
+  type SandboxDescriptor,
+  type SandboxListOptions,
+  type VercelSandboxOptions,
 } from "../types";
 import { AsyncQueue } from "../../shared/async-queue";
 import { toShellCommand } from "../../shared/shell";
@@ -112,7 +113,7 @@ export class VercelSandboxAdapter extends SandboxAdapter<
   private sandbox?: VercelSandbox;
 
   get provider(): "vercel" {
-    return "vercel";
+    return SandboxProvider.Vercel;
   }
 
   get raw(): VercelRaw {

@@ -1,9 +1,7 @@
-export type SandboxProviderName =
-  | "local-docker"
-  | "modal"
-  | "daytona"
-  | "vercel"
-  | "e2b";
+export { SandboxProvider } from "../enums";
+import type { SandboxProvider } from "../enums";
+
+export type SandboxProviderName = SandboxProvider;
 
 export interface CommandOptions {
   cwd?: string;

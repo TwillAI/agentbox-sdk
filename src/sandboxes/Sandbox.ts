@@ -3,16 +3,17 @@ import { E2bSandboxAdapter } from "./providers/e2b";
 import { LocalDockerSandboxAdapter } from "./providers/local-docker";
 import { ModalSandboxAdapter } from "./providers/modal";
 import { VercelSandboxAdapter } from "./providers/vercel";
-import type {
-  AsyncCommandHandle,
-  CommandOptions,
-  CommandResult,
-  GitCloneOptions,
-  SandboxDescriptor,
-  SandboxListOptions,
-  SandboxOptions,
-  SandboxProviderName,
-  SandboxRaw,
+import {
+  SandboxProvider,
+  type AsyncCommandHandle,
+  type CommandOptions,
+  type CommandResult,
+  type GitCloneOptions,
+  type SandboxDescriptor,
+  type SandboxListOptions,
+  type SandboxOptions,
+  type SandboxProviderName,
+  type SandboxRaw,
 } from "./types";
 import type { SandboxAdapter } from "./base";
 import { UnsupportedProviderError } from "../shared/errors";
@@ -22,23 +23,23 @@ function createSandboxAdapter<P extends SandboxProviderName>(
   options: SandboxOptions<P>,
 ): SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>> {
   switch (provider) {
-    case "local-docker":
+    case SandboxProvider.LocalDocker:
       return new LocalDockerSandboxAdapter(
         options as SandboxOptions<"local-docker">,
       ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
-    case "modal":
+    case SandboxProvider.Modal:
       return new ModalSandboxAdapter(
         options as SandboxOptions<"modal">,
       ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
-    case "daytona":
+    case SandboxProvider.Daytona:
       return new DaytonaSandboxAdapter(
         options as SandboxOptions<"daytona">,
       ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
-    case "vercel":
+    case SandboxProvider.Vercel:
       return new VercelSandboxAdapter(
         options as SandboxOptions<"vercel">,
       ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
-    case "e2b":
+    case SandboxProvider.E2B:
       return new E2bSandboxAdapter(
         options as SandboxOptions<"e2b">,
       ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;

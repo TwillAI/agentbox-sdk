@@ -3,9 +3,9 @@
  * Requires: VERCEL_TOKEN, VERCEL_TEAM_ID, VERCEL_PROJECT_ID
  */
 
-import { Sandbox } from "agentbox-sdk";
+import { Sandbox, SandboxProvider } from "agentbox-sdk";
 
-const sandbox = new Sandbox("vercel", {
+const sandbox = new Sandbox(SandboxProvider.Vercel, {
   tags: { example: "basic-vercel" },
   provider: {
     runtime: "node24",

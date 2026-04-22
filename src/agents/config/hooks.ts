@@ -1,6 +1,6 @@
 import path from "node:path";
 
-import type { AgentProviderName } from "../types";
+import { AgentProvider, type AgentProviderName } from "../types";
 import type {
   ClaudeCodeHooksConfig,
   CodexHooksConfig,
@@ -58,15 +58,15 @@ function readProviderPlugins(options: unknown): unknown {
 }
 
 function legacySharedHooksError(provider: AgentProviderName): string {
-  return provider === "opencode"
+  return provider === AgentProvider.OpenCode
     ? "OpenCode hook plugins must be configured on options.provider.plugins. The shared options.hooks field was removed because hook semantics differ by provider."
-    : `${provider === "claude-code" ? "Claude Code" : "Codex"} hooks must be configured on options.provider.hooks. The shared options.hooks field was removed because hook semantics differ by provider.`;
+    : `${provider === AgentProvider.ClaudeCode ? "Claude Code" : "Codex"} hooks must be configured on options.provider.hooks. The shared options.hooks field was removed because hook semantics differ by provider.`;
 }
 
 function invalidGroupedHooksShapeError(
   provider: "claude-code" | "codex",
 ): string {
-  return `${provider === "claude-code" ? "Claude Code" : "Codex"} hooks must use the native grouped hooks object shape under options.provider.hooks, with each event mapped to an array of matcher groups.`;
+  return `${provider === AgentProvider.ClaudeCode ? "Claude Code" : "Codex"} hooks must use the native grouped hooks object shape under options.provider.hooks, with each event mapped to an array of matcher groups.`;
 }
 
 function hasMalformedGroupedHookEntries(
@@ -226,7 +226,7 @@ export function assertHooksSupported(
   const providerHooks = readProviderHooks(options);
   const providerPlugins = readProviderPlugins(options);
 
-  if (provider === "opencode") {
+  if (provider === AgentProvider.OpenCode) {
     if (providerHooks !== undefined) {
       throw new Error(opencodeHooksFieldError());
     }

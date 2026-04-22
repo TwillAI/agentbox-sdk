@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   Agent,
+  AgentProvider,
   buildGitCloneCommand,
   Sandbox,
+  SandboxProvider,
   type AgentRunConfig,
 } from "../src";
 
@@ -27,7 +29,7 @@ describe("git helpers", () => {
 
 describe("public facades", () => {
   it("creates a sandbox with a string image reference", () => {
-    const sandbox = new Sandbox("modal", {
+    const sandbox = new Sandbox(SandboxProvider.Modal, {
       tags: { project: "demo" },
       image: "im-demo-image",
       resources: {
@@ -37,14 +39,14 @@ describe("public facades", () => {
       provider: { appName: "agentbox-demo" },
     });
 
-    expect(sandbox.provider).toBe("modal");
+    expect(sandbox.provider).toBe(SandboxProvider.Modal);
     expect(sandbox.optionsSnapshot.image).toBe("im-demo-image");
     expect(sandbox.optionsSnapshot.resources?.memoryMiB).toBe(2048);
     expect(sandbox.optionsSnapshot.provider?.appName).toBe("agentbox-demo");
   });
 
   it("creates an e2b sandbox with a template reference", async () => {
-    const sandbox = new Sandbox("e2b", {
+    const sandbox = new Sandbox(SandboxProvider.E2B, {
       tags: { project: "demo" },
       image: "agentbox-browser-agent:demo123",
       provider: {
@@ -54,7 +56,7 @@ describe("public facades", () => {
     });
 
     await expect(sandbox.openPort(4242)).resolves.toBe(sandbox);
-    expect(sandbox.provider).toBe("e2b");
+    expect(sandbox.provider).toBe(SandboxProvider.E2B);
     expect(sandbox.optionsSnapshot.image).toBe(
       "agentbox-browser-agent:demo123",
     );
@@ -62,7 +64,7 @@ describe("public facades", () => {
   });
 
   it("creates an agent without touching the runtime immediately", () => {
-    const agent = new Agent("opencode", {
+    const agent = new Agent(AgentProvider.OpenCode, {
       cwd: "/workspace",
     });
 
@@ -70,7 +72,7 @@ describe("public facades", () => {
   });
 
   it("opens a local-docker port", async () => {
-    const sandbox = new Sandbox("local-docker", {
+    const sandbox = new Sandbox(SandboxProvider.LocalDocker, {
       image: "agentbox-e2e",
     });
 
@@ -80,7 +82,7 @@ describe("public facades", () => {
   });
 
   it("opens a modal port", async () => {
-    const sandbox = new Sandbox("modal", {
+    const sandbox = new Sandbox(SandboxProvider.Modal, {
       image: "im-demo-image",
     });
 
@@ -98,7 +100,7 @@ describe("public facades", () => {
       }),
     } as unknown as Sandbox<"local-docker">;
 
-    const agent = new Agent("opencode", {
+    const agent = new Agent(AgentProvider.OpenCode, {
       sandbox: fakeSandbox,
       cwd: "/workspace",
     });

@@ -3,14 +3,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { AgentBoxError } from "../shared/errors";
-import type {
-  AgentProviderName,
-  DataContent,
-  FilePart,
-  ImagePart,
-  TextPart,
-  UserContent,
-  UserContentPart,
+import {
+  AgentProvider,
+  type AgentProviderName,
+  type DataContent,
+  type FilePart,
+  type ImagePart,
+  type TextPart,
+  type UserContent,
+  type UserContentPart,
 } from "./types";
 
 type BinarySource =
@@ -122,7 +123,7 @@ export async function validateProviderUserInput(
 ): Promise<ResolvedUserContentPart[]> {
   const parts = await resolveUserInputParts(input);
 
-  if (provider === "codex") {
+  if (provider === AgentProvider.Codex) {
     const unsupportedPart = parts.find((part) => part.type === "file");
     if (unsupportedPart) {
       throw new AgentBoxError(
@@ -140,7 +141,7 @@ export async function validateProviderUserInput(
     return parts;
   }
 
-  if (provider === "claude-code") {
+  if (provider === AgentProvider.ClaudeCode) {
     for (const part of parts) {
       if (part.type === "image") {
         if (!CLAUDE_IMAGE_MEDIA_TYPES.has(part.mediaType)) {

@@ -9,7 +9,7 @@
  * Required env: MODAL_TOKEN_ID, MODAL_TOKEN_SECRET, MODAL_APP_NAME,
  * OPENAGENT_MODAL_IMAGE, ANTHROPIC_API_KEY (or OPENAI_API_KEY).
  */
-import { Agent, Sandbox } from "../src";
+import { Agent, AgentProvider, Sandbox, SandboxProvider } from "../src";
 import { AGENT_RESERVED_PORTS } from "../src/agents/ports";
 
 function fail(message: string): never {
@@ -55,7 +55,7 @@ const model = process.env.ANTHROPIC_API_KEY
   ? "anthropic/claude-sonnet-4-6"
   : "openai/gpt-4.1";
 
-const sandbox = new Sandbox("modal", {
+const sandbox = new Sandbox(SandboxProvider.Modal, {
   workingDir: "/workspace",
   image,
   env: {
@@ -83,7 +83,7 @@ try {
   console.log("Provisioning Modal sandbox…");
   await sandbox.run("opencode --version", { timeoutMs: 60_000 });
 
-  const agent = new Agent("opencode", {
+  const agent = new Agent(AgentProvider.OpenCode, {
     sandbox,
     cwd: "/workspace",
     approvalMode: "auto",

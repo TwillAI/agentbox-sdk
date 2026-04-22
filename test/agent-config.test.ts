@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { Agent } from "../src";
+import { Agent, AgentProvider } from "../src";
 import { buildOpenCodeCommandsConfig } from "../src/agents/config/commands";
 import {
   assertHooksSupported,
@@ -18,7 +18,7 @@ import {
 
 describe("agent options config", () => {
   it("constructs an agent with shared runtime option fields", () => {
-    const agent = new Agent("claude-code", {
+    const agent = new Agent(AgentProvider.ClaudeCode, {
       cwd: "/workspace",
       approvalMode: "interactive",
       mcps: [
@@ -63,7 +63,7 @@ describe("agent options config", () => {
   });
 
   it("accepts a shared approval mode on any provider", () => {
-    const codexAgent = new Agent("codex", {
+    const codexAgent = new Agent(AgentProvider.Codex, {
       cwd: "/workspace",
       approvalMode: "interactive",
       provider: {
@@ -81,7 +81,7 @@ describe("agent options config", () => {
         },
       },
     });
-    const openCodeAgent = new Agent("opencode", {
+    const openCodeAgent = new Agent(AgentProvider.OpenCode, {
       cwd: "/workspace",
       approvalMode: "auto",
       provider: {

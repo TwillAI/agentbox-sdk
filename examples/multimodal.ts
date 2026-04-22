@@ -1,7 +1,7 @@
 import { pathToFileURL } from "node:url";
-import { Agent, Sandbox } from "agentbox-sdk";
+import { Agent, AgentProvider, Sandbox, SandboxProvider } from "agentbox-sdk";
 
-const sandbox = new Sandbox("local-docker", {
+const sandbox = new Sandbox(SandboxProvider.LocalDocker, {
   workingDir: "/workspace",
   image: process.env.IMAGE_ID!,
   env: {
@@ -9,7 +9,7 @@ const sandbox = new Sandbox("local-docker", {
   },
 });
 
-const agent = new Agent("claude-code", {
+const agent = new Agent(AgentProvider.ClaudeCode, {
   sandbox,
   cwd: "/workspace",
   approvalMode: "auto",

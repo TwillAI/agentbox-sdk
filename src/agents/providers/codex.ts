@@ -6,12 +6,14 @@ import {
   type PermissionRequestedEvent,
   type RawAgentEvent,
 } from "../../events";
-import type {
-  AgentExecutionRequest,
-  AgentProviderAdapter,
-  AgentRunSink,
-  UserContent,
+import {
+  AgentProvider,
+  type AgentExecutionRequest,
+  type AgentProviderAdapter,
+  type AgentRunSink,
+  type UserContent,
 } from "../types";
+import { SandboxProvider } from "../../sandboxes/types";
 import { isInteractiveApproval } from "../approval";
 import {
   joinTextParts,
@@ -125,7 +127,7 @@ function buildTurnSandboxPolicy(
     return undefined;
   }
 
-  if (options.sandbox.provider === "local-docker") {
+  if (options.sandbox.provider === SandboxProvider.LocalDocker) {
     return {
       type: "workspaceWrite",
       networkAccess: true,
@@ -159,7 +161,7 @@ function toRawEvent(
   type: string,
 ): RawAgentEvent {
   return {
-    provider: "codex",
+    provider: AgentProvider.Codex,
     runId,
     type,
     timestamp: new Date().toISOString(),
@@ -184,7 +186,7 @@ function toNormalizedCodexEvents(
   notification: CodexNotification,
 ): NormalizedAgentEvent[] {
   const base = {
-    provider: "codex",
+    provider: AgentProvider.Codex,
     runId,
     raw: toRawEvent(runId, notification, notification.method),
   };
@@ -573,7 +575,7 @@ async function createRuntime(
 ): Promise<CodexRuntime> {
   const options = request.options;
   const usesRemoteWebSocket =
-    options.sandbox && options.sandbox.provider !== "local-docker";
+    options.sandbox && options.sandbox.provider !== SandboxProvider.LocalDocker;
   const hooks = assertHooksSupported(request.provider, options);
   assertCommandsSupported(request.provider, options.commands);
 

@@ -1,6 +1,6 @@
-import { Agent, Sandbox } from "agentbox-sdk";
+import { Agent, AgentProvider, Sandbox, SandboxProvider } from "agentbox-sdk";
 
-const sandbox = new Sandbox("local-docker", {
+const sandbox = new Sandbox(SandboxProvider.LocalDocker, {
   workingDir: "/workspace",
   image: process.env.IMAGE_ID!,
   env: {
@@ -14,7 +14,7 @@ await sandbox.gitClone({
   depth: 1,
 });
 
-const agent = new Agent("claude-code", {
+const agent = new Agent(AgentProvider.ClaudeCode, {
   sandbox,
   cwd: "/workspace/express",
   approvalMode: "auto",

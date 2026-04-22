@@ -2,7 +2,10 @@
 
 import { buildSandboxImage } from "./sandbox-images/build";
 import type { BuiltInSandboxImageName } from "./sandbox-images/types";
-import type { SandboxProviderName } from "./sandboxes/types";
+import {
+  SandboxProvider,
+  type SandboxProviderName,
+} from "./sandboxes/types";
 
 type CliOptions = {
   provider?: SandboxProviderName;
@@ -101,13 +104,7 @@ function parseOptions(args: string[]): CliOptions {
 }
 
 function isSandboxProviderName(value: string): value is SandboxProviderName {
-  return (
-    value === "local-docker" ||
-    value === "modal" ||
-    value === "daytona" ||
-    value === "vercel" ||
-    value === "e2b"
-  );
+  return (Object.values(SandboxProvider) as string[]).includes(value);
 }
 
 function isBuiltInImageName(value: string): value is BuiltInSandboxImageName {

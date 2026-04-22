@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { Sandbox } from "../src";
+import { Sandbox, SandboxProvider } from "../src";
 
 const smokeEnabled = process.env.AGENTBOX_RUN_SMOKE_TESTS === "1";
 
@@ -22,7 +22,7 @@ describe.skipIf(!smokeEnabled)("optional provider smoke tests", () => {
       return;
     }
 
-    const sandbox = new Sandbox("modal", {
+    const sandbox = new Sandbox(SandboxProvider.Modal, {
       provider: {
         tokenId: process.env.MODAL_TOKEN_ID,
         tokenSecret: process.env.MODAL_TOKEN_SECRET,
@@ -39,7 +39,7 @@ describe.skipIf(!smokeEnabled)("optional provider smoke tests", () => {
       return;
     }
 
-    const sandbox = new Sandbox("daytona", {
+    const sandbox = new Sandbox(SandboxProvider.Daytona, {
       provider: {
         apiKey: process.env.DAYTONA_API_KEY,
         apiUrl: process.env.DAYTONA_API_URL,
@@ -60,7 +60,7 @@ describe.skipIf(!smokeEnabled)("optional provider smoke tests", () => {
       return;
     }
 
-    const sandbox = new Sandbox("vercel", {
+    const sandbox = new Sandbox(SandboxProvider.Vercel, {
       provider: {
         token: process.env.VERCEL_TOKEN,
         teamId: process.env.VERCEL_TEAM_ID,
@@ -77,7 +77,7 @@ describe.skipIf(!smokeEnabled)("optional provider smoke tests", () => {
       return;
     }
 
-    const sandbox = new Sandbox("e2b", {
+    const sandbox = new Sandbox(SandboxProvider.E2B, {
       provider: {
         apiKey: process.env.E2B_API_KEY,
       },

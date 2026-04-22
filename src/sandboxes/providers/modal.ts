@@ -3,14 +3,15 @@ import type { Image as ModalImage } from "modal";
 import type { Sandbox as ModalSandboxObject } from "modal";
 
 import { SandboxAdapter } from "../base";
-import type {
-  AsyncCommandHandle,
-  CommandEvent,
-  CommandOptions,
-  CommandResult,
-  ModalSandboxOptions,
-  SandboxDescriptor,
-  SandboxListOptions,
+import {
+  SandboxProvider,
+  type AsyncCommandHandle,
+  type CommandEvent,
+  type CommandOptions,
+  type CommandResult,
+  type ModalSandboxOptions,
+  type SandboxDescriptor,
+  type SandboxListOptions,
 } from "../types";
 import { AsyncQueue } from "../../shared/async-queue";
 import { pipeReadableStream, readStreamAsText } from "../../shared/streams";
@@ -44,7 +45,7 @@ export class ModalSandboxAdapter extends SandboxAdapter<
   }
 
   get provider(): "modal" {
-    return "modal";
+    return SandboxProvider.Modal;
   }
 
   get raw(): ModalRaw {

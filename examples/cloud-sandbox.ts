@@ -3,10 +3,10 @@
  * The agent code stays exactly the same.
  */
 
-import { Agent, Sandbox } from "agentbox-sdk";
+import { Agent, AgentProvider, Sandbox, SandboxProvider } from "agentbox-sdk";
 
 // --- E2B ---
-const e2b = new Sandbox("e2b", {
+const e2b = new Sandbox(SandboxProvider.E2B, {
   workingDir: "/workspace",
   image: process.env.E2B_TEMPLATE!,
   provider: {
@@ -17,7 +17,7 @@ const e2b = new Sandbox("e2b", {
 
 // --- Modal ---
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-const modal = new Sandbox("modal", {
+const modal = new Sandbox(SandboxProvider.Modal, {
   workingDir: "/workspace",
   image: process.env.MODAL_IMAGE_ID!,
   resources: { cpu: 2, memoryMiB: 4096 },
@@ -28,7 +28,7 @@ const modal = new Sandbox("modal", {
 
 // --- Daytona ---
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-const daytona = new Sandbox("daytona", {
+const daytona = new Sandbox(SandboxProvider.Daytona, {
   workingDir: "/workspace",
   image: process.env.DAYTONA_IMAGE!,
   provider: {
@@ -39,7 +39,7 @@ const daytona = new Sandbox("daytona", {
 // Pick one:
 const sandbox = e2b; // or modal, daytona
 
-const agent = new Agent("opencode", {
+const agent = new Agent(AgentProvider.OpenCode, {
   sandbox,
   cwd: "/workspace",
   approvalMode: "auto",

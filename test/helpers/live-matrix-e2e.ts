@@ -5,7 +5,9 @@ import path from "node:path";
 
 import {
   Agent,
+  AgentProvider,
   Sandbox,
+  SandboxProvider,
   type AgentProviderName,
   type SandboxProviderName,
 } from "../../src";
@@ -53,17 +55,17 @@ export const LIVE_MATRIX_E2E_TIMEOUT_MS = Number.parseInt(
 export const LIVE_MATRIX_CONCURRENT_SESSION_COUNT = 2;
 
 export const LIVE_MATRIX_SANDBOX_PROVIDERS = [
-  "local-docker",
-  "modal",
-  "daytona",
-  "e2b",
-  "vercel",
+  SandboxProvider.LocalDocker,
+  SandboxProvider.Modal,
+  SandboxProvider.Daytona,
+  SandboxProvider.E2B,
+  SandboxProvider.Vercel,
 ] as const satisfies readonly LiveMatrixSandboxProvider[];
 
 export const LIVE_MATRIX_AGENT_PROVIDERS = [
-  "codex",
-  "opencode",
-  "claude-code",
+  AgentProvider.Codex,
+  AgentProvider.OpenCode,
+  AgentProvider.ClaudeCode,
 ] as const satisfies readonly LiveMatrixAgentProvider[];
 
 const ROOT_ENV = loadDotEnvFile(new URL("../../.env", import.meta.url));
@@ -265,25 +267,25 @@ function buildLiveMatrixPlan(): {
 function getSandboxSkipReason(
   sandboxProvider: LiveMatrixSandboxProvider,
 ): string | null {
-  if (sandboxProvider === "local-docker") {
+  if (sandboxProvider === SandboxProvider.LocalDocker) {
     return null;
   }
 
-  if (sandboxProvider === "modal") {
+  if (sandboxProvider === SandboxProvider.Modal) {
     if (!ROOT_ENV.MODAL_TOKEN_ID || !ROOT_ENV.MODAL_TOKEN_SECRET) {
       return "requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET.";
     }
     return null;
   }
 
-  if (sandboxProvider === "daytona") {
+  if (sandboxProvider === SandboxProvider.Daytona) {
     if (!ROOT_ENV.DAYTONA_API_KEY && !ROOT_ENV.DAYTONA_JWT_TOKEN) {
       return "requires DAYTONA_API_KEY or DAYTONA_JWT_TOKEN.";
     }
     return null;
   }
 
-  if (sandboxProvider === "vercel") {
+  if (sandboxProvider === SandboxProvider.Vercel) {
     if (
       !ROOT_ENV.VERCEL_TOKEN ||
       !ROOT_ENV.VERCEL_TEAM_ID ||
@@ -307,9 +309,9 @@ function getAgentSkipReason(
   agentProvider: LiveMatrixAgentProvider,
   sandboxProvider: LiveMatrixSandboxProvider,
 ): string | null {
-  if (agentProvider === "codex") {
+  if (agentProvider === AgentProvider.Codex) {
     if (
-      sandboxProvider === "local-docker" &&
+      sandboxProvider === SandboxProvider.LocalDocker &&
       (fs.existsSync(HOST_AUTH_PATHS.codex) || ROOT_ENV.OPENAI_API_KEY)
     ) {
       return null;
@@ -319,9 +321,9 @@ function getAgentSkipReason(
       : "requires OPENAI_API_KEY outside local-docker.";
   }
 
-  if (agentProvider === "claude-code") {
+  if (agentProvider === AgentProvider.ClaudeCode) {
     if (
-      sandboxProvider === "local-docker" &&
+      sandboxProvider === SandboxProvider.LocalDocker &&
       (fs.existsSync(HOST_AUTH_PATHS.claude) || ROOT_ENV.ANTHROPIC_API_KEY)
     ) {
       return null;
@@ -345,12 +347,12 @@ async function resolveSandboxImage(
   }
 
   const build = (async () => {
-    if (sandboxProvider === "local-docker") {
+    if (sandboxProvider === SandboxProvider.LocalDocker) {
       if (ROOT_ENV.AGENTBOX_E2E_DOCKER_IMAGE) {
         return ROOT_ENV.AGENTBOX_E2E_DOCKER_IMAGE;
       }
       return buildSandboxImage({
-        provider: "local-docker",
+        provider: SandboxProvider.LocalDocker,
         preset: "browser-agent",
         imageName: "agentbox-browser-agent:matrix-e2e",
         env: ROOT_ENV,
@@ -358,12 +360,12 @@ async function resolveSandboxImage(
       });
     }
 
-    if (sandboxProvider === "modal") {
+    if (sandboxProvider === SandboxProvider.Modal) {
       if (ROOT_ENV.AGENTBOX_MODAL_IMAGE) {
         return ROOT_ENV.AGENTBOX_MODAL_IMAGE;
       }
       return buildSandboxImage({
-        provider: "modal",
+        provider: SandboxProvider.Modal,
         preset: "browser-agent",
         modalAppName:
           ROOT_ENV.MODAL_APP_NAME ??
@@ -374,9 +376,9 @@ async function resolveSandboxImage(
       });
     }
 
-    if (sandboxProvider === "daytona") {
+    if (sandboxProvider === SandboxProvider.Daytona) {
       return buildSandboxImage({
-        provider: "daytona",
+        provider: SandboxProvider.Daytona,
         preset: "browser-agent",
         imageName: `browser-agent-matrix-e2e-${IMAGE_BUILD_SUFFIX}`,
         env: ROOT_ENV,
@@ -384,7 +386,7 @@ async function resolveSandboxImage(
       });
     }
 
-    if (sandboxProvider === "vercel") {
+    if (sandboxProvider === SandboxProvider.Vercel) {
       if (ROOT_ENV.AGENTBOX_VERCEL_SNAPSHOT_ID) {
         return ROOT_ENV.AGENTBOX_VERCEL_SNAPSHOT_ID;
       }
@@ -392,7 +394,7 @@ async function resolveSandboxImage(
     }
 
     return buildSandboxImage({
-      provider: "e2b",
+      provider: SandboxProvider.E2B,
       preset: "browser-agent",
       imageName: `agentbox-browser-agent-matrix-e2e:${IMAGE_BUILD_SUFFIX}`,
       env: ROOT_ENV,
@@ -416,22 +418,22 @@ function createSandboxForCombination(
     run: randomUUID(),
   };
 
-  if (combination.sandboxProvider === "local-docker") {
-    return new Sandbox("local-docker", {
+  if (combination.sandboxProvider === SandboxProvider.LocalDocker) {
+    return new Sandbox(SandboxProvider.LocalDocker, {
       workingDir: "/workspace",
       image,
       env: COMMON_SANDBOX_ENV,
       tags,
       provider: {
-        ...(combination.agentProvider === "opencode"
+        ...(combination.agentProvider === AgentProvider.OpenCode
           ? { publishedPorts: [LOCAL_DOCKER_OPENCODE_PORT] }
           : {}),
       },
     });
   }
 
-  if (combination.sandboxProvider === "modal") {
-    return new Sandbox("modal", {
+  if (combination.sandboxProvider === SandboxProvider.Modal) {
+    return new Sandbox(SandboxProvider.Modal, {
       workingDir: "/workspace",
       image,
       tags,
@@ -454,8 +456,8 @@ function createSandboxForCombination(
     });
   }
 
-  if (combination.sandboxProvider === "daytona") {
-    return new Sandbox("daytona", {
+  if (combination.sandboxProvider === SandboxProvider.Daytona) {
+    return new Sandbox(SandboxProvider.Daytona, {
       workingDir: "/workspace",
       image,
       tags,
@@ -480,14 +482,14 @@ function createSandboxForCombination(
     });
   }
 
-  if (combination.sandboxProvider === "vercel") {
+  if (combination.sandboxProvider === SandboxProvider.Vercel) {
     // Vercel sandboxes are capped at 5 tags total. The shared `tags` block
     // already has 5 entries, and the adapter auto-adds `agentbox.provider`,
     // which would push us to 6 and fail at create time. Drop `runner` since
     // `scope: "e2e"` already conveys it.
     const { runner: _runner, ...vercelTags } = tags;
     void _runner;
-    return new Sandbox("vercel", {
+    return new Sandbox(SandboxProvider.Vercel, {
       workingDir: "/workspace",
       tags: vercelTags,
       resources: {
@@ -511,7 +513,7 @@ function createSandboxForCombination(
     });
   }
 
-  return new Sandbox("e2b", {
+  return new Sandbox(SandboxProvider.E2B, {
     workingDir: "/workspace",
     image,
     tags,
@@ -535,7 +537,7 @@ async function prepareSandboxForCombination(
   combination: LiveMatrixCombination,
   sandbox: Sandbox<LiveMatrixSandboxProvider>,
 ): Promise<string> {
-  if (combination.sandboxProvider === "local-docker") {
+  if (combination.sandboxProvider === SandboxProvider.LocalDocker) {
     assertLocalDockerPrerequisites(combination.agentProvider);
   }
 
@@ -558,7 +560,7 @@ async function prepareSandboxForCombination(
 function assertLocalDockerPrerequisites(
   agentProvider: LiveMatrixAgentProvider,
 ): void {
-  if (agentProvider === "codex") {
+  if (agentProvider === AgentProvider.Codex) {
     if (!fs.existsSync(HOST_AUTH_PATHS.codex) && !ROOT_ENV.OPENAI_API_KEY) {
       throw new Error(
         "Codex local Docker matrix E2E requires either ~/.codex or OPENAI_API_KEY.",
@@ -567,7 +569,7 @@ function assertLocalDockerPrerequisites(
     return;
   }
 
-  if (agentProvider === "claude-code") {
+  if (agentProvider === AgentProvider.ClaudeCode) {
     if (!fs.existsSync(HOST_AUTH_PATHS.claude) && !ROOT_ENV.ANTHROPIC_API_KEY) {
       throw new Error(
         "Claude Code local Docker matrix E2E requires either ~/.claude or ANTHROPIC_API_KEY.",
@@ -587,8 +589,8 @@ function createAgentForCombination(
   combination: LiveMatrixCombination,
   sandbox: Sandbox<LiveMatrixSandboxProvider>,
 ): Agent<LiveMatrixAgentProvider> {
-  if (combination.agentProvider === "codex") {
-    return new Agent("codex", {
+  if (combination.agentProvider === AgentProvider.Codex) {
+    return new Agent(AgentProvider.Codex, {
       sandbox,
       cwd: "/workspace",
       approvalMode: "auto",
@@ -600,8 +602,8 @@ function createAgentForCombination(
     });
   }
 
-  if (combination.agentProvider === "claude-code") {
-    return new Agent("claude-code", {
+  if (combination.agentProvider === AgentProvider.ClaudeCode) {
+    return new Agent(AgentProvider.ClaudeCode, {
       sandbox,
       cwd: "/workspace",
       approvalMode: "auto",
@@ -617,7 +619,7 @@ function createAgentForCombination(
     });
   }
 
-  return new Agent("opencode", {
+  return new Agent(AgentProvider.OpenCode, {
     sandbox,
     cwd: "/workspace",
     approvalMode: "auto",
@@ -628,11 +630,11 @@ function createAgentForCombination(
 function getModelForCombination(
   agentProvider: LiveMatrixAgentProvider,
 ): string {
-  if (agentProvider === "codex") {
+  if (agentProvider === AgentProvider.Codex) {
     return "gpt-5.4";
   }
 
-  if (agentProvider === "claude-code") {
+  if (agentProvider === AgentProvider.ClaudeCode) {
     return "sonnet";
   }
 
@@ -652,11 +654,11 @@ function getModelForCombination(
 function getModalPortsForAgent(
   agentProvider: LiveMatrixAgentProvider,
 ): number[] {
-  if (agentProvider === "codex") {
+  if (agentProvider === AgentProvider.Codex) {
     return [MODAL_CODEX_PORT];
   }
 
-  if (agentProvider === "opencode") {
+  if (agentProvider === AgentProvider.OpenCode) {
     return [MODAL_OPENCODE_PORT];
   }
 
@@ -666,11 +668,11 @@ function getModalPortsForAgent(
 function getVercelPortsForAgent(
   agentProvider: LiveMatrixAgentProvider,
 ): number[] {
-  if (agentProvider === "codex") {
+  if (agentProvider === AgentProvider.Codex) {
     return [VERCEL_CODEX_PORT];
   }
 
-  if (agentProvider === "opencode") {
+  if (agentProvider === AgentProvider.OpenCode) {
     return [VERCEL_OPENCODE_PORT];
   }
 
@@ -689,9 +691,10 @@ async function buildVercelMatrixSnapshot(): Promise<string> {
     );
   }
 
-  const log = (chunk: string) => logImageBuildProgress("vercel", chunk);
+  const log = (chunk: string) =>
+    logImageBuildProgress(SandboxProvider.Vercel, chunk);
 
-  const prep = new Sandbox("vercel", {
+  const prep = new Sandbox(SandboxProvider.Vercel, {
     workingDir: "/workspace",
     tags: {
       scope: "e2e",

@@ -1,6 +1,6 @@
 import path from "node:path";
 
-import type { AgentProviderName } from "../types";
+import { AgentProvider, type AgentProviderName } from "../types";
 import { shellQuote } from "../../shared/shell";
 import type {
   AgentSkillConfig,
@@ -16,11 +16,11 @@ function getSkillTargetDir(
   skillName: string,
 ): string {
   switch (provider) {
-    case "claude-code":
+    case AgentProvider.ClaudeCode:
       return path.join(layout.claudeDir, "skills", skillName);
-    case "opencode":
+    case AgentProvider.OpenCode:
       return path.join(layout.opencodeDir, "skills", skillName);
-    case "codex":
+    case AgentProvider.Codex:
       return path.join(layout.agentsDir, "skills", skillName);
   }
 }
@@ -30,8 +30,7 @@ function buildSkillsInstallerCommand(
   skill: Exclude<AgentSkillConfig, { source: "embedded" }>,
 ): string {
   const repo = skill.repo ?? "https://github.com/anthropics/skills";
-  const agent = provider === "claude-code" ? "claude-code" : provider;
-  return `npx skills add ${shellQuote(repo)} -g --skill ${shellQuote(skill.name)} --agent ${shellQuote(agent)} -y`;
+  return `npx skills add ${shellQuote(repo)} -g --skill ${shellQuote(skill.name)} --agent ${shellQuote(provider)} -y`;
 }
 
 export async function prepareSkillArtifacts(

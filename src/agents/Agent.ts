@@ -13,17 +13,18 @@ import { ClaudeCodeAgentAdapter } from "./providers/claude-code";
 import { CodexAgentAdapter } from "./providers/codex";
 import { OpenCodeAgentAdapter } from "./providers/opencode";
 import { AGENT_RESERVED_PORTS } from "./ports";
-import type {
-  AgentExecutionRequest,
-  AgentProviderAdapter,
-  AgentProviderName,
-  AgentResult,
-  AgentRun,
-  AgentRunConfig,
-  AgentOptions,
-  AgentRunSink,
-  AgentPermissionResponse,
-  UserContent,
+import {
+  AgentProvider,
+  type AgentExecutionRequest,
+  type AgentProviderAdapter,
+  type AgentProviderName,
+  type AgentResult,
+  type AgentRun,
+  type AgentRunConfig,
+  type AgentOptions,
+  type AgentRunSink,
+  type AgentPermissionResponse,
+  type UserContent,
 } from "./types";
 import { normalizeUserInput } from "./input";
 
@@ -95,11 +96,11 @@ function createAdapter<P extends AgentProviderName>(
   provider: P,
 ): AgentProviderAdapter<P> {
   switch (provider) {
-    case "codex":
+    case AgentProvider.Codex:
       return new CodexAgentAdapter() as AgentProviderAdapter<P>;
-    case "opencode":
+    case AgentProvider.OpenCode:
       return new OpenCodeAgentAdapter() as AgentProviderAdapter<P>;
-    case "claude-code":
+    case AgentProvider.ClaudeCode:
       return new ClaudeCodeAgentAdapter() as AgentProviderAdapter<P>;
     default:
       throw new UnsupportedProviderError("agent", provider);

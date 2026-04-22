@@ -1,14 +1,15 @@
 import { Daytona, type Sandbox as DaytonaSandboxObject } from "@daytonaio/sdk";
 
 import { SandboxAdapter } from "../base";
-import type {
-  AsyncCommandHandle,
-  CommandEvent,
-  CommandOptions,
-  CommandResult,
-  DaytonaSandboxOptions,
-  SandboxDescriptor,
-  SandboxListOptions,
+import {
+  SandboxProvider,
+  type AsyncCommandHandle,
+  type CommandEvent,
+  type CommandOptions,
+  type CommandResult,
+  type DaytonaSandboxOptions,
+  type SandboxDescriptor,
+  type SandboxListOptions,
 } from "../types";
 import { AsyncQueue } from "../../shared/async-queue";
 import { sleep } from "../../shared/network";
@@ -41,7 +42,7 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
   }
 
   get provider(): "daytona" {
-    return "daytona";
+    return SandboxProvider.Daytona;
   }
 
   get raw(): DaytonaRaw {

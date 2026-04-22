@@ -1,4 +1,4 @@
-import type { AgentProviderName } from "./types";
+import { AgentProvider, type AgentProviderName } from "./types";
 
 /**
  * Ports each agent harness needs exposed on its sandbox in order to reach
@@ -17,9 +17,9 @@ import type { AgentProviderName } from "./types";
  */
 export const AGENT_RESERVED_PORTS: Record<AgentProviderName, readonly number[]> =
   {
-    "claude-code": [43180],
-    codex: [43181],
-    opencode: [4096],
+    [AgentProvider.ClaudeCode]: [43180],
+    [AgentProvider.Codex]: [43181],
+    [AgentProvider.OpenCode]: [4096],
   };
 
 export function collectAllAgentReservedPorts(): number[] {

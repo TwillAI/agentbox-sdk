@@ -5,12 +5,14 @@ import { createNormalizedEvent, type RawAgentEvent } from "../../events";
 import type { PermissionRequestedEvent } from "../../events";
 import { sleep } from "../../shared/network";
 import { shellQuote } from "../../shared/shell";
-import type {
-  AgentExecutionRequest,
-  AgentProviderAdapter,
-  AgentRunSink,
-  UserContent,
+import {
+  AgentProvider,
+  type AgentExecutionRequest,
+  type AgentProviderAdapter,
+  type AgentRunSink,
+  type UserContent,
 } from "../types";
+import { SandboxProvider } from "../../sandboxes/types";
 import { shouldAutoApproveClaudeTools } from "../approval";
 import { mapToClaudeUserContent, validateProviderUserInput } from "../input";
 import {
@@ -64,7 +66,7 @@ function toRawEvent(
   type: string,
 ): RawAgentEvent {
   return {
-    provider: "claude-code",
+    provider: AgentProvider.ClaudeCode,
     runId,
     type,
     timestamp: new Date().toISOString(),
@@ -600,7 +602,7 @@ function buildLocalSdkUrl(
   server: SdkWsServer,
   sandboxProvider?: string,
 ): string {
-  if (sandboxProvider === "local-docker") {
+  if (sandboxProvider === SandboxProvider.LocalDocker) {
     return server.url
       .replace("127.0.0.1", "host.docker.internal")
       .replace("0.0.0.0", "host.docker.internal");
@@ -772,7 +774,8 @@ async function createLocalRuntime(
 ): Promise<ClaudeRuntime> {
   const sandboxProvider = request.options.sandbox?.provider;
   const transport = new SdkWsServer({
-    host: sandboxProvider === "local-docker" ? "0.0.0.0" : "127.0.0.1",
+    host:
+      sandboxProvider === SandboxProvider.LocalDocker ? "0.0.0.0" : "127.0.0.1",
   });
   await transport.start();
 
@@ -866,7 +869,7 @@ async function createRuntime(
 ): Promise<ClaudeRuntime> {
   if (
     request.options.sandbox &&
-    request.options.sandbox.provider !== "local-docker"
+    request.options.sandbox.provider !== SandboxProvider.LocalDocker
   ) {
     await request.options.sandbox.openPort(REMOTE_SDK_RELAY_PORT);
     const prepared = await prepareClaudeRuntime(request);

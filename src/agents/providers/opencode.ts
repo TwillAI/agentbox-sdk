@@ -6,11 +6,12 @@ import {
   type PermissionRequestedEvent,
   type RawAgentEvent,
 } from "../../events";
-import type {
-  AgentExecutionRequest,
-  AgentProviderAdapter,
-  AgentRunSink,
-  UserContent,
+import {
+  AgentProvider,
+  type AgentExecutionRequest,
+  type AgentProviderAdapter,
+  type AgentRunSink,
+  type UserContent,
 } from "../types";
 import { isInteractiveApproval } from "../approval";
 import {
@@ -57,7 +58,7 @@ function toRawEvent(
   type: string,
 ): RawAgentEvent {
   return {
-    provider: "opencode",
+    provider: AgentProvider.OpenCode,
     runId,
     type,
     timestamp: new Date().toISOString(),
