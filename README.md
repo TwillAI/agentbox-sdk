@@ -1,5 +1,7 @@
 # AgentBox
 
+[Live demo](https://agentbox-demo-175164121374.us-west1.run.app/)
+
 Run coding agents inside sandboxes. One API, any provider.
 
 Unlike wrappers that shell out to CLIs in non-interactive mode (e.g. `claude --print`), AgentBox launches each agent as a **server process** inside the sandbox and communicates over WebSocket or HTTP. This preserves the full interactive capabilities of each agent — approval flows, tool-use control, streaming events.
