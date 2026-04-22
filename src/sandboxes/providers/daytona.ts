@@ -12,6 +12,7 @@ import {
   type SandboxListOptions,
 } from "../types";
 import { AsyncQueue } from "../../shared/async-queue";
+import { suppressUnhandledRejection } from "../../shared/errors";
 import { sleep } from "../../shared/network";
 import { shellQuote, toShellCommand } from "../../shared/shell";
 import { resolveSandboxImage, resolveSandboxResources } from "../image-utils";
@@ -232,6 +233,8 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
       queue.fail(error);
       throw error;
     });
+
+    suppressUnhandledRejection(completion);
 
     return {
       id: commandId,

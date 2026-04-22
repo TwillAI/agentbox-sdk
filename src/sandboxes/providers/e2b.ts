@@ -13,6 +13,7 @@ import {
   type SandboxListOptions,
 } from "../types";
 import { AsyncQueue } from "../../shared/async-queue";
+import { suppressUnhandledRejection } from "../../shared/errors";
 import { toShellCommand } from "../../shared/shell";
 import { resolveSandboxImage, resolveSandboxResources } from "../image-utils";
 
@@ -205,6 +206,12 @@ export class E2bSandboxAdapter extends SandboxAdapter<
         throw error;
       });
 
+    // Callers may not await `completion` (e.g. fire-and-forget background
+    // processes) — attach a no-op rejection handler so Node does not report
+    // the error as an unhandled rejection. Consumers that do await via
+    // `wait()` still observe the original error.
+    suppressUnhandledRejection(completion);
+
     return {
       id: String(handle.pid),
       raw: handle,
@@ -281,6 +288,8 @@ export class E2bSandboxAdapter extends SandboxAdapter<
         queue.fail(error);
         throw error;
       });
+
+    suppressUnhandledRejection(completion);
 
     return {
       id: String(handle.pid),

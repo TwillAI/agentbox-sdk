@@ -12,6 +12,7 @@ import {
   type VercelSandboxOptions,
 } from "../types";
 import { AsyncQueue } from "../../shared/async-queue";
+import { suppressUnhandledRejection } from "../../shared/errors";
 import { toShellCommand } from "../../shared/shell";
 import { resolveSandboxResources } from "../image-utils";
 
@@ -291,6 +292,12 @@ export class VercelSandboxAdapter extends SandboxAdapter<
       queue.fail(error);
       throw error;
     });
+
+    // Callers are not required to await `completion` (e.g. fire-and-forget
+    // background processes) — attach a no-op rejection handler so Node does
+    // not surface the error as an unhandled rejection. Consumers that do
+    // await via `wait()` still observe the original error.
+    suppressUnhandledRejection(completion);
 
     return {
       id: cmd.cmdId,

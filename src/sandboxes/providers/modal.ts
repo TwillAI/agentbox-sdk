@@ -14,6 +14,7 @@ import {
   type SandboxListOptions,
 } from "../types";
 import { AsyncQueue } from "../../shared/async-queue";
+import { suppressUnhandledRejection } from "../../shared/errors";
 import { pipeReadableStream, readStreamAsText } from "../../shared/streams";
 import { toShellCommand } from "../../shared/shell";
 import { resolveSandboxImage, resolveSandboxResources } from "../image-utils";
@@ -212,6 +213,8 @@ export class ModalSandboxAdapter extends SandboxAdapter<
         queue.fail(error);
         throw error;
       });
+
+    suppressUnhandledRejection(completion);
 
     return {
       id: `${sandbox.sandboxId}:${Date.now()}`,
