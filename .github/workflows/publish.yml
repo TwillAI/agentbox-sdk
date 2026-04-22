@@ -2,6 +2,11 @@ name: Publish
 
 on:
   workflow_dispatch:
+    inputs:
+      skip_matrix_e2e:
+        description: "Skip the live matrix E2E job (useful when providers are flaky)."
+        type: boolean
+        default: false
 
 concurrency:
   group: publish
@@ -14,12 +19,20 @@ jobs:
 
   e2e:
     name: E2E
+    if: ${{ !inputs.skip_matrix_e2e }}
     uses: ./.github/workflows/e2e.yml
     secrets: inherit
 
   publish:
     name: Publish to npm
     needs: [ci, e2e]
+    # `needs` only gates on completion, not success — a skipped `e2e` job would
+    # otherwise block publish. Require CI to succeed and E2E to be either
+    # successful or explicitly skipped via the workflow input.
+    if: |
+      always() &&
+      needs.ci.result == 'success' &&
+      (needs.e2e.result == 'success' || needs.e2e.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: read
