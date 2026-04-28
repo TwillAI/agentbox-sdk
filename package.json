@@ -51,7 +51,7 @@
     "test:watch": "vitest",
     "check": "npm run typecheck && npm run lint && npm run test",
     "hooks:install": "lefthook install",
-    "prepare": "if [ -d .git ]; then lefthook install; else echo 'Skipping lefthook install (no .git directory)'; fi"
+    "prepare": "if [ -n \"$CI\" ] || [ ! -d .git ]; then echo 'Skipping lefthook install (CI or no .git directory)'; else lefthook install || echo 'Skipping lefthook install (binary unavailable)'; fi"
   },
   "engines": {
     "node": ">=20.0.0",
