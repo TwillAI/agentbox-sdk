@@ -15,6 +15,8 @@ const sandbox = new Sandbox("local-docker", {
   env: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY! },
 });
 
+await sandbox.findOrProvision();
+
 const run = new Agent("claude-code", {
   sandbox,
   cwd: "/workspace",
@@ -73,6 +75,11 @@ const sandbox = new Sandbox("local-docker", {
   env: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY! },
 });
 
+// Explicitly attach to / create the sandbox before running anything.
+// Subsequent `sandbox.run`, `sandbox.gitClone`, agent runs, etc. all
+// require this to have happened first.
+await sandbox.findOrProvision();
+
 const agent = new Agent("claude-code", {
   sandbox,
   cwd: "/workspace",
@@ -120,9 +127,23 @@ Three agent providers are supported. Each wraps a CLI that runs inside the sandb
 
 ```ts
 new Agent("claude-code", { sandbox, cwd: "/workspace", approvalMode: "auto" });
-new Agent("opencode", { sandbox, cwd: "/workspace", approvalMode: "auto" });
+new Agent("open-code", { sandbox, cwd: "/workspace", approvalMode: "auto" });
 new Agent("codex", { sandbox, cwd: "/workspace", approvalMode: "auto" });
 ```
+
+### Reasoning effort
+
+Pass an optional `reasoning` level alongside `model` on any run. It maps to each provider's native reasoning control: Codex's `effort` on `turn/start`, Claude Code's `--effort` flag, and OpenCode's `reasoningEffort` agent variant.
+
+```ts
+await agent.run({
+  model: "sonnet",
+  reasoning: "high", // "low" | "medium" | "high" | "xhigh"
+  input: "Refactor this module and explain your reasoning.",
+});
+```
+
+`xhigh` requires a model that supports it (e.g. Claude Opus 4.7+, Codex `gpt-5.4`).
 
 ## Sandboxes
 
@@ -136,7 +157,23 @@ Five sandbox providers are supported. Each gives you an isolated environment wit
 | `daytona`      | Cloud dev environment  | `DAYTONA_API_KEY`                                       |
 | `vercel`       | Ephemeral cloud VM     | `VERCEL_TOKEN` + `VERCEL_TEAM_ID` + `VERCEL_PROJECT_ID` |
 
-Every sandbox supports: `run()`, `runAsync()`, `gitClone()`, `openPort()`, `getPreviewLink()`, `snapshot()`, `stop()`, `delete()`.
+Every sandbox supports: `findOrProvision()`, `run()`, `runAsync()`, `gitClone()`, `uploadAndRun()`, `openPort()`, `getPreviewLink()`, `snapshot()`, `stop()`, `delete()`.
+
+### Provisioning lifecycle
+
+`new Sandbox(...)` only stores configuration — it does **not** create or attach to a real sandbox. Call `findOrProvision()` once when you're ready to start using it, and every subsequent operation (`run`, `gitClone`, `uploadAndRun`, agent runs, …) reuses that sandbox:
+
+```ts
+const sandbox = new Sandbox("modal", {
+  /* … */
+});
+
+await sandbox.findOrProvision(); // attach to existing tagged sandbox or create a fresh one
+await sandbox.gitClone({ repoUrl: "…" });
+const result = await sandbox.run("pnpm install");
+```
+
+Calling a method that needs a live sandbox before `findOrProvision()` throws a clear error. This makes the (potentially slow) attach / create step explicit and lets you control exactly when it happens.
 
 Vercel sandboxes use runtime snapshots instead of pre-built images — call `sandbox.snapshot()` to capture state and pass the returned id via `provider.snapshotId` on the next run.
 
@@ -234,7 +271,7 @@ const agent = new Agent("claude-code", {
 Register slash commands the agent can use:
 
 ```ts
-const agent = new Agent("opencode", {
+const agent = new Agent("open-code", {
   sandbox,
   cwd: "/workspace",
   approvalMode: "auto",
@@ -335,7 +372,7 @@ new Agent("codex", {
 **OpenCode** — plugin-based hooks:
 
 ```ts
-new Agent("opencode", {
+new Agent("open-code", {
   sandbox,
   cwd: "/workspace",
   provider: {

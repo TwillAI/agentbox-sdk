@@ -19,6 +19,7 @@ import { pipeReadableStream, readStreamAsText } from "../../shared/streams";
 import { toShellCommand } from "../../shared/shell";
 import { resolveSandboxImage, resolveSandboxResources } from "../image-utils";
 import { collectAllAgentReservedPorts } from "../../agents/ports";
+import { buildTarball, type TarballEntry } from "../tarball";
 
 export type ModalRaw = {
   client: ModalClient;
@@ -33,6 +34,10 @@ export class ModalSandboxAdapter extends SandboxAdapter<
   private readonly client: ModalClient;
   private sandbox?: ModalSandboxObject;
   private clientClosed = false;
+  // Cached tunnel map. Populated on the first `getPreviewLink` call after
+  // provision; reused on every subsequent call so the agent runtime path
+  // doesn't re-issue the Modal RPC for each per-run tunnel lookup.
+  private tunnelsPromise?: Promise<Record<number, { url: string }>>;
 
   constructor(options: ModalSandboxOptions) {
     super(options);
@@ -64,6 +69,7 @@ export class ModalSandboxAdapter extends SandboxAdapter<
     const existing = await this.findMatchingSandbox();
     if (existing) {
       this.sandbox = existing;
+      this.wasFoundFlag = true;
       return;
     }
 
@@ -78,6 +84,7 @@ export class ModalSandboxAdapter extends SandboxAdapter<
     const unencryptedPorts = this.resolveDefaultUnencryptedPorts();
 
     const sandbox = await this.client.sandboxes.create(app, image, {
+      ...this.options.provider?.createParams,
       cpu: resources?.cpu,
       memoryMiB: resources?.memoryMiB,
       timeoutMs: this.options.autoStopMs,
@@ -125,10 +132,10 @@ export class ModalSandboxAdapter extends SandboxAdapter<
     command: string | string[],
     options?: CommandOptions,
   ): Promise<CommandResult> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
     const process = await sandbox.exec(
-      ["/bin/sh", "-lc", toShellCommand(command)],
+      ["/bin/sh", "-c", toShellCommand(command)],
       {
         workdir: options?.cwd ?? this.workingDir,
         timeoutMs: options?.timeoutMs,
@@ -157,10 +164,10 @@ export class ModalSandboxAdapter extends SandboxAdapter<
     command: string | string[],
     options?: CommandOptions,
   ): Promise<AsyncCommandHandle> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
     const process = await sandbox.exec(
-      ["/bin/sh", "-lc", toShellCommand(command)],
+      ["/bin/sh", "-c", toShellCommand(command)],
       {
         workdir: options?.cwd ?? this.workingDir,
         timeoutMs: options?.timeoutMs,
@@ -234,6 +241,69 @@ export class ModalSandboxAdapter extends SandboxAdapter<
     };
   }
 
+  /**
+   * Upload `files` as a tarball piped through stdin to a single in-sandbox
+   * `tar -x` invocation, then exec `command` — all in one Modal `exec`
+   * round-trip. This collapses the typical "N writeArtifact RPCs +
+   * runCommand" setup pattern (~25 RPCs on cold paths, ~6s wall) into a
+   * single ~1s call dominated by the actual install work.
+   */
+  override async uploadAndRun(
+    files: TarballEntry[],
+    command: string,
+    options?: CommandOptions,
+  ): Promise<CommandResult> {
+    this.requireProvisioned();
+    const sandbox = this.requireSandbox();
+    const tar = await buildTarball(files);
+
+    // Extract from stdin (`tar -x -`) to absolute root (`-C /`); the entry
+    // paths in the archive are absolute (with leading `/` stripped during
+    // packing), so each file lands in its declared destination. Then run
+    // the user-provided command. Both halves are wrapped in a single
+    // `bash -c` invocation so the sandbox sees a single exec round-trip.
+    //
+    // We use binary mode so we can stream raw tar bytes through stdin.
+    const wrapped = `set -e\ntar -xf - -C /\n${command}`;
+    const process = await sandbox.exec(["/bin/sh", "-c", wrapped], {
+      workdir: options?.cwd ?? this.workingDir,
+      timeoutMs: options?.timeoutMs,
+      env: this.getMergedEnv(options?.env),
+      mode: "binary",
+    });
+
+    // Modal's `ModalWriteStream` extends `WritableStream`, which doesn't
+    // expose `close()` directly. Acquire a default writer, push the tar
+    // bytes, then close — that signals EOF to the sandbox-side `tar -x -`.
+    const writer = (
+      process.stdin as unknown as WritableStream<Uint8Array>
+    ).getWriter();
+    try {
+      await writer.write(tar);
+      await writer.close();
+    } finally {
+      try {
+        writer.releaseLock();
+      } catch {
+        // Lock may already be released on close in some runtimes.
+      }
+    }
+
+    const [stdout, stderr, exitCode] = await Promise.all([
+      readStreamAsText(process.stdout),
+      readStreamAsText(process.stderr),
+      process.wait(),
+    ]);
+
+    return {
+      exitCode,
+      stdout,
+      stderr,
+      combinedOutput: `${stdout}${stderr}`,
+      raw: process,
+    };
+  }
+
   async list(options?: SandboxListOptions): Promise<SandboxDescriptor[]> {
     const sandboxes: SandboxDescriptor[] = [];
 
@@ -253,7 +323,7 @@ export class ModalSandboxAdapter extends SandboxAdapter<
   }
 
   async snapshot(): Promise<string | null> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
     const image = await sandbox.snapshotFilesystem();
     return image.imageId;
@@ -267,6 +337,7 @@ export class ModalSandboxAdapter extends SandboxAdapter<
 
     await sandbox.terminate();
     this.sandbox = undefined;
+    this.tunnelsPromise = undefined;
   }
 
   async delete(): Promise<void> {
@@ -286,15 +357,23 @@ export class ModalSandboxAdapter extends SandboxAdapter<
     }
 
     // If the sandbox is already running we can't retroactively punch a new
-    // tunnel. Verify the port was declared at provisioning time; otherwise
-    // surface a clear, actionable error instead of silently proceeding to a
-    // downstream failure like "Modal sandbox does not expose port ...".
+    // tunnel. Skip the round-trip when the port was declared up-front
+    // (typical when callers pre-declare via `unencryptedPorts` or via
+    // `AGENT_RESERVED_PORTS`).
     if (!this.sandbox) {
       return;
     }
+    if (alreadyDeclared) {
+      return;
+    }
 
+    // Port wasn't declared at creation time — verify the tunnel exists
+    // (Modal might have surfaced one for us anyway) before failing loudly.
     try {
-      const tunnels = await this.sandbox.tunnels();
+      if (!this.tunnelsPromise) {
+        this.tunnelsPromise = this.sandbox.tunnels();
+      }
+      const tunnels = await this.tunnelsPromise;
       if (tunnels[port]) {
         return;
       }
@@ -312,9 +391,20 @@ export class ModalSandboxAdapter extends SandboxAdapter<
   }
 
   async getPreviewLink(port: number): Promise<string> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
-    const tunnels = await sandbox.tunnels();
+    if (!this.tunnelsPromise) {
+      this.tunnelsPromise = sandbox.tunnels();
+    }
+    let tunnels: Record<number, { url: string }>;
+    try {
+      tunnels = await this.tunnelsPromise;
+    } catch (error) {
+      // Don't poison the cache on transient errors; force a fresh lookup
+      // next time so callers can recover.
+      this.tunnelsPromise = undefined;
+      throw error;
+    }
     const tunnel = tunnels[port];
     if (!tunnel) {
       throw new Error(`Modal sandbox does not expose port ${port}.`);

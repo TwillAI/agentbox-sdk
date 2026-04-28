@@ -199,7 +199,7 @@ export class VercelSandboxAdapter extends SandboxAdapter<
     command: string | string[],
     options?: CommandOptions,
   ): Promise<CommandResult> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
 
     const signal = buildTimeoutSignal(options?.timeoutMs);
@@ -232,7 +232,7 @@ export class VercelSandboxAdapter extends SandboxAdapter<
     command: string | string[],
     options?: CommandOptions,
   ): Promise<AsyncCommandHandle> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
 
     const signal = buildTimeoutSignal(options?.timeoutMs);
@@ -332,7 +332,7 @@ export class VercelSandboxAdapter extends SandboxAdapter<
   }
 
   async snapshot(): Promise<string | null> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
     const snap = await wrapVercelApiError("snapshot sandbox", () =>
       sandbox.snapshot(),
@@ -361,7 +361,7 @@ export class VercelSandboxAdapter extends SandboxAdapter<
   }
 
   async getPreviewLink(port: number): Promise<string> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
     return sandbox.domain(port);
   }
@@ -370,7 +370,7 @@ export class VercelSandboxAdapter extends SandboxAdapter<
     content: Buffer | string,
     targetPath: string,
   ): Promise<void> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
     const data =
       typeof content === "string" ? content : new Uint8Array(content);
@@ -378,7 +378,7 @@ export class VercelSandboxAdapter extends SandboxAdapter<
   }
 
   async downloadFile(sourcePath: string): Promise<Buffer> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
     const result = await sandbox.readFileToBuffer({ path: sourcePath });
     if (!result) {
@@ -394,9 +394,7 @@ export class VercelSandboxAdapter extends SandboxAdapter<
     };
   }
 
-  private async listSandboxesByTags(
-    tags: Record<string, string>,
-  ): Promise<
+  private async listSandboxesByTags(tags: Record<string, string>): Promise<
     Array<{
       name: string;
       status: string;
@@ -411,8 +409,8 @@ export class VercelSandboxAdapter extends SandboxAdapter<
         tags: pickFirstTag(tags),
       }),
     );
-    return result.sandboxes.filter(
-      (s: { tags?: Record<string, string> }) => matchesAllTags(s.tags, tags),
+    return result.sandboxes.filter((s: { tags?: Record<string, string> }) =>
+      matchesAllTags(s.tags, tags),
     );
   }
 

@@ -9,12 +9,13 @@ import {
 } from "../events";
 import { AsyncQueue } from "../shared/async-queue";
 import { asError, UnsupportedProviderError } from "../shared/errors";
+import { debugAgent } from "../shared/debug";
 import { ClaudeCodeAgentAdapter } from "./providers/claude-code";
 import { CodexAgentAdapter } from "./providers/codex";
 import { OpenCodeAgentAdapter } from "./providers/opencode";
-import { AGENT_RESERVED_PORTS } from "./ports";
 import {
   AgentProvider,
+  type AgentAttachRequest,
   type AgentExecutionRequest,
   type AgentProviderAdapter,
   type AgentProviderName,
@@ -24,9 +25,13 @@ import {
   type AgentOptions,
   type AgentRunSink,
   type AgentPermissionResponse,
+  type AgentSetupConfig,
+  type AttachedRun,
   type UserContent,
+  type AgentCostData,
 } from "./types";
 import { normalizeUserInput } from "./input";
+import type { Sandbox } from "../sandboxes";
 
 function buildAgentOptionsSystemAppendix(
   options: AgentOptions,
@@ -108,19 +113,16 @@ function createAdapter<P extends AgentProviderName>(
 }
 
 function prepareAgentOptions<P extends AgentProviderName>(
-  provider: P,
+  _provider: P,
   options: AgentOptions<P>,
 ): AgentOptions<P> {
-  const ports = AGENT_RESERVED_PORTS[provider] ?? [];
-  for (const port of ports) {
-    // Best-effort: fire-and-forget. Most providers mutate options synchronously
-    // and return a resolved promise; we rely on that to ensure the ports are
-    // staged before the sandbox is first provisioned. Failures (e.g. a Modal
-    // sandbox that's already running without the port) are surfaced later via
-    // `openPort` itself with an actionable error message.
-    void options.sandbox?.openPort(port);
-  }
-
+  // Agent harness ports (claude-code relay, codex app-server, opencode
+  // server) used to be opened here on a best-effort basis. Callers are now
+  // expected to pre-declare them at sandbox creation time
+  // (`provider.unencryptedPorts`) — `AGENT_RESERVED_PORTS` and
+  // `collectAllAgentReservedPorts()` from `agentbox-sdk` are exported for
+  // exactly this purpose. Eliminating this loop removes one Modal RPC per
+  // run.
   return options;
 }
 
@@ -144,8 +146,11 @@ class AgentRunController implements AgentRun, AgentRunSink {
       reject: (reason?: unknown) => void;
     }
   >();
-  private messageHandler?: (content: UserContent) => Promise<void>;
+  private messageHandler?: (
+    content: UserContent,
+  ) => Promise<{ messageId?: string } | void>;
   private text = "";
+  private costData: AgentCostData | null = null;
   private settled = false;
   readonly finished: Promise<AgentResult>;
   private readonly resolveSessionIdReady: (value: string) => void;
@@ -243,7 +248,9 @@ class AgentRunController implements AgentRun, AgentRunSink {
     return response;
   }
 
-  onMessage(handler: (content: UserContent) => Promise<void>): void {
+  onMessage(
+    handler: (content: UserContent) => Promise<{ messageId?: string } | void>,
+  ): void {
     this.messageHandler = handler;
   }
 
@@ -262,15 +269,19 @@ class AgentRunController implements AgentRun, AgentRunSink {
       .map((p) => p.text)
       .join("");
 
+    const handlerResult = await this.messageHandler(content);
+    const messageId = handlerResult?.messageId;
+
     this.pushEvent(
       createNormalizedEvent(
         "message.injected",
         { provider: this.provider, runId: this.id },
-        { content: textContent || "(non-text content)" },
+        {
+          content: textContent || "(non-text content)",
+          ...(messageId ? { messageId } : {}),
+        },
       ),
     );
-
-    await this.messageHandler(content);
   }
 
   async respondToPermission(response: AgentPermissionResponse): Promise<void> {
@@ -313,7 +324,7 @@ class AgentRunController implements AgentRun, AgentRunSink {
     this.pendingPermissions.clear();
   }
 
-  complete(result?: { text?: string }): void {
+  complete(result?: { text?: string; costData?: AgentCostData | null }): void {
     if (this.settled) {
       return;
     }
@@ -326,6 +337,9 @@ class AgentRunController implements AgentRun, AgentRunSink {
     );
     if (result?.text) {
       this.text = result.text;
+    }
+    if (result && "costData" in result) {
+      this.costData = result.costData ?? null;
     }
 
     this.eventQueue.finish();
@@ -345,6 +359,7 @@ class AgentRunController implements AgentRun, AgentRunSink {
       text: this.text,
       rawEvents: [...this.rawEventsList],
       events: [...this.events],
+      costData: this.costData,
     });
   }
 
@@ -396,8 +411,9 @@ class AgentRunController implements AgentRun, AgentRunSink {
 
 export class Agent<P extends AgentProviderName = AgentProviderName> {
   private readonly adapter: AgentProviderAdapter<P>;
-  private readonly provider: P;
+  readonly provider: P;
   private readonly options: AgentOptions<P>;
+  private setupPromise?: Promise<void>;
 
   constructor(provider: P, options: AgentOptions<P>) {
     this.provider = provider;
@@ -405,19 +421,99 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
     this.adapter = createAdapter(provider);
   }
 
+  /**
+   * The sandbox the agent will run inside, if any was passed via
+   * `options.sandbox`. Returns `undefined` for host-mode runs (no sandbox).
+   */
+  get sandbox(): Sandbox | undefined {
+    return this.options.sandbox;
+  }
+
+  /**
+   * Prepare provider-specific runtime state on the configured sandbox
+   * (skill artifacts, MCP/hook/sub-agent config, app-server / relay boot, …).
+   *
+   * `setup()` is REQUIRED before {@link Agent.stream} or {@link Agent.run}
+   * for any sandbox-backed run. `stream` and the underlying
+   * `adapter.execute` deliberately do not trigger setup themselves so
+   * callers can run sandbox-side preparation in parallel with other
+   * long-running work (e.g. `git clone`).
+   *
+   * `execute` does not consume any setup output and does not re-do
+   * setup work. It assumes the relay/server boot performed here is
+   * already up. Skipping `setup()` against a remote sandbox is a
+   * programmer error and surfaces as a connect-retry timeout inside
+   * `execute`, not a silent fallback.
+   *
+   * Idempotent across repeated invocations: subsequent calls return the
+   * promise from the first call. The differential setup cache and the
+   * relay/server probes also make this cheap on warm sandboxes — the
+   * second `setup()` against the same sandbox does ~one round-trip of
+   * work.
+   */
+  async setup(config: AgentSetupConfig = {}): Promise<void> {
+    if (this.setupPromise) {
+      await this.setupPromise;
+      return;
+    }
+
+    debugAgent("setup() provider=%s", this.provider);
+    const startedAt = Date.now();
+    this.setupPromise = (async () => {
+      await this.adapter.setup({
+        provider: this.provider,
+        options: this.options,
+        config,
+      });
+      debugAgent(
+        "setup() returned provider=%s after %dms",
+        this.provider,
+        Date.now() - startedAt,
+      );
+    })();
+
+    try {
+      await this.setupPromise;
+    } catch (error) {
+      // Allow callers to retry after a setup failure.
+      this.setupPromise = undefined;
+      throw error;
+    }
+  }
+
   stream(runConfig: AgentRunConfig): AgentRun {
-    const runId = randomUUID();
+    const runId = runConfig.runId ?? randomUUID();
+    const streamCalledAt = Date.now();
+    debugAgent("stream() provider=%s runId=%s", this.provider, runId);
     const run = new AgentRunController(this.provider, runId);
-    const request: AgentExecutionRequest<P> = {
-      runId,
-      provider: this.provider,
-      options: this.options,
-      run: buildRunConfig(this.options, runConfig),
-    };
+    // `agent.setup()` is purely a side-effect (uploads artifacts +
+    // boots provider servers / relay). Adapters do NOT receive its
+    // return value — execute recomputes every path it needs from
+    // `(provider, options, run)` and dials the relay/server using
+    // deterministic constants. We wait for any in-flight setup so
+    // sandbox-side prep finishes before execute starts dialing.
+    const setupPromise = this.setupPromise;
+    const provider = this.provider;
+    const options = this.options;
+    const adapter = this.adapter;
 
     void (async () => {
       try {
-        const cleanup = await this.adapter.execute(request, run);
+        if (setupPromise) {
+          await setupPromise;
+        }
+        const request: AgentExecutionRequest<P> = {
+          runId,
+          provider,
+          options,
+          run: buildRunConfig(options, runConfig),
+        };
+        const cleanup = await adapter.execute(request, run);
+        debugAgent(
+          "adapter.execute() returned for runId=%s after %dms",
+          runId,
+          Date.now() - streamCalledAt,
+        );
         run.setAbort(async () => {
           await cleanup();
         });
@@ -435,5 +531,35 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
 
   rawEvents(runConfig: AgentRunConfig): AsyncIterable<RawAgentEvent> {
     return this.stream(runConfig).rawEvents();
+  }
+
+  /**
+   * Stateless control plane for an in-flight run.
+   *
+   * Returns an {@link AttachedRun} whose `abort()` / `sendMessage()` methods
+   * dial the in-sandbox provider server directly (codex app-server, opencode
+   * HTTP server, claude-code relay control endpoint) — there is no shared
+   * in-memory registry or Redis broker. Any process with the right `sandbox`
+   * + `runId` (+ optional provider-native `sessionId`) can issue commands
+   * against a run started on a different process.
+   *
+   * The originating process keeps owning the event stream that
+   * `agent.stream()` returned; commands attached here cause the in-sandbox
+   * server to emit the natural follow-up events (`turn/aborted`, message
+   * events, etc.), which the originating process ingests through its
+   * existing transport.
+   *
+   * The handle is short-lived: each method call opens a fresh connection,
+   * performs the operation with a timeout, and tears the connection down.
+   */
+  static async attach<P extends AgentProviderName>(
+    request: AgentAttachRequest<P>,
+  ): Promise<AttachedRun> {
+    const adapter = createAdapter(request.provider);
+    return {
+      abort: () => adapter.attachAbort(request),
+      sendMessage: (content: UserContent) =>
+        adapter.attachSendMessage(request, content),
+    };
   }
 }

@@ -43,7 +43,7 @@ describe("multimodal input helpers", () => {
   });
 
   it("maps OpenCode image and file parts to multipart payloads", async () => {
-    const parts = await validateProviderUserInput("opencode", [
+    const parts = await validateProviderUserInput("open-code", [
       { type: "text", text: "Inspect these assets." },
       {
         type: "image",
@@ -116,7 +116,7 @@ describe("multimodal input helpers", () => {
     const imagePath = path.join(tempDir, "diagram.png");
     await fs.writeFile(imagePath, Buffer.from([1, 2, 3]));
 
-    const parts = await validateProviderUserInput("opencode", [
+    const parts = await validateProviderUserInput("open-code", [
       { type: "image", image: pathToFileURL(imagePath) },
     ]);
 

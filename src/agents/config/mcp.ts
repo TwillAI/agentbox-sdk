@@ -1,6 +1,4 @@
-import path from "node:path";
-
-import type { AgentMcpConfig, TextArtifact } from "./types";
+import type { AgentMcpConfig } from "./types";
 
 const SAFE_TOML_KEY = /^[a-zA-Z0-9_-]+$/;
 
@@ -109,12 +107,49 @@ export function buildOpenCodeMcpConfig(
   );
 }
 
+export interface CodexConfigTomlOptions {
+  mcps?: AgentMcpConfig[];
+  agentSections?: string[];
+  enableHooks?: boolean;
+  /**
+   * Sets `[features]\nskills = true` so codex discovers skills from
+   * `<CODEX_HOME>/skills/...` at startup. Without this flag codex
+   * silently ignores any skill files we wrote.
+   */
+  enableSkills?: boolean;
+  /**
+   * Sets `[features]\nmulti_agent = true` so codex loads custom agent
+   * TOML files written by `setup()`. Replaces the previous
+   * per-`execute()` `-c features.multi_agent=...` flag, keeping
+   * agent-config out of the spawn path.
+   */
+  enableMultiAgent?: boolean;
+  /**
+   * Static OpenAI base URL override (e.g. when routing through a
+   * proxy). Goes in config.toml so `execute()` doesn't need to know
+   * about provider-level overrides at spawn time.
+   */
+  openAiBaseUrl?: string;
+}
+
 export function buildCodexConfigToml(
-  mcps: AgentMcpConfig[] | undefined,
-  agentSections: string[] = [],
-  enableHooks = false,
+  opts: CodexConfigTomlOptions = {},
 ): string | undefined {
+  const {
+    mcps,
+    agentSections = [],
+    enableHooks = false,
+    enableSkills = false,
+    enableMultiAgent = false,
+    openAiBaseUrl,
+  } = opts;
+
   const blocks: string[] = [];
+
+  if (openAiBaseUrl) {
+    blocks.push(`openai_base_url = ${tomlString(openAiBaseUrl)}`);
+    blocks.push("");
+  }
 
   for (const mcp of mcps ?? []) {
     if (mcp.enabled === false) {
@@ -152,9 +187,15 @@ export function buildCodexConfigToml(
     blocks.push("");
   }
 
-  if (enableHooks) {
+  // Coalesce `[features]` so we don't emit the section header twice
+  // when more than one feature flag is active.
+  const featureLines: string[] = [];
+  if (enableHooks) featureLines.push("codex_hooks = true");
+  if (enableSkills) featureLines.push("skills = true");
+  if (enableMultiAgent) featureLines.push("multi_agent = true");
+  if (featureLines.length > 0) {
     blocks.push("[features]");
-    blocks.push("codex_hooks = true");
+    blocks.push(...featureLines);
     blocks.push("");
   }
 
@@ -165,19 +206,4 @@ export function buildCodexConfigToml(
   }
 
   return `${blocks.join("\n").trim()}\n`;
-}
-
-export function buildClaudeMcpArtifact(
-  mcps: AgentMcpConfig[] | undefined,
-  claudeDir: string,
-): TextArtifact | undefined {
-  const content = buildClaudeMcpConfig(mcps);
-  if (!content) {
-    return undefined;
-  }
-
-  return {
-    path: path.join(claudeDir, "agentbox-mcp.json"),
-    content,
-  };
 }

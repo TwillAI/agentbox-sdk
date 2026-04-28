@@ -207,7 +207,7 @@ export function assertHooksSupported(
   options: unknown,
 ): CodexHooksConfig | undefined;
 export function assertHooksSupported(
-  provider: "opencode",
+  provider: "open-code",
   options: unknown,
 ): OpenCodePluginConfig[] | undefined;
 export function assertHooksSupported(

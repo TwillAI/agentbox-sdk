@@ -39,7 +39,7 @@ describe("event normalization", () => {
 
   it("maps normalized events to AI SDK style events", () => {
     const events = normalizeRawAgentEvent({
-      provider: "opencode",
+      provider: "open-code",
       runId: "run-2",
       type: "result",
       timestamp: new Date().toISOString(),
@@ -52,7 +52,7 @@ describe("event normalization", () => {
     expect(toAISDKEvent(events[0]!)).toMatchObject({
       type: "response-finish",
       id: "run-2",
-      provider: "opencode",
+      provider: "open-code",
       text: "Ship it",
     });
   });

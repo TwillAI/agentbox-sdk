@@ -34,11 +34,25 @@ export interface RunStartedEvent extends NormalizedAgentEventBase {
 
 export interface MessageStartedEvent extends NormalizedAgentEventBase {
   type: "message.started";
+  /**
+   * Provider-assigned identifier for the user message that started this turn.
+   * Opaque to callers.
+   *
+   * - claude-code: the user message UUID written to the session JSONL
+   * - codex: the turn id from `turn/started`
+   * - open-code: the message id from `message.updated` (role=user)
+   */
+  messageId?: string;
 }
 
 export interface MessageInjectedEvent extends NormalizedAgentEventBase {
   type: "message.injected";
   content: string;
+  /**
+   * Provider-assigned identifier for the injected user message. See
+   * `MessageStartedEvent.messageId` for provider-specific semantics.
+   */
+  messageId?: string;
 }
 
 export interface TextDeltaEvent extends NormalizedAgentEventBase {
@@ -92,6 +106,12 @@ export interface PermissionResolvedEvent extends NormalizedAgentEventBase {
 export interface MessageCompletedEvent extends NormalizedAgentEventBase {
   type: "message.completed";
   text?: string;
+  /**
+   * Provider-assigned identifier for the assistant message that just
+   * completed. Format mirrors `MessageStartedEvent.messageId` but identifies
+   * the assistant turn rather than the user one.
+   */
+  messageId?: string;
 }
 
 export interface RunCompletedEvent extends NormalizedAgentEventBase {

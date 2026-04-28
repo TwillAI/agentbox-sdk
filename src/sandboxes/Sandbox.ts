@@ -16,7 +16,15 @@ import {
   type SandboxRaw,
 } from "./types";
 import type { SandboxAdapter } from "./base";
+import type { TarballEntry } from "./tarball";
 import { UnsupportedProviderError } from "../shared/errors";
+import { debugSandbox, time } from "../shared/debug";
+
+function shortLabel(command: string | string[]): string {
+  const oneLine = Array.isArray(command) ? command.join(" ") : command;
+  const cleaned = oneLine.replace(/\s+/g, " ").trim();
+  return cleaned.length > 80 ? `${cleaned.slice(0, 80)}…` : cleaned;
+}
 
 function createSandboxAdapter<P extends SandboxProviderName>(
   provider: P,
@@ -74,8 +82,33 @@ export class Sandbox<P extends SandboxProviderName = SandboxProviderName> {
     return this.adapter.raw;
   }
 
+  /**
+   * Whether `findOrProvision()` warm-attached to a pre-existing tagged
+   * sandbox (`true`) or created a fresh one (`false`). Useful to skip
+   * idempotent setup that the previous run already performed (e.g.
+   * `agent.setup()`). Always `false` before `findOrProvision()` resolves.
+   */
+  get wasFound(): boolean {
+    return this.adapter.wasFound;
+  }
+
+  /**
+   * Attach to an existing tagged sandbox or create a new one. Must be
+   * called before `run`, `runAsync`, `gitClone`, `uploadAndRun`,
+   * `getPreviewLink`, etc. Repeated calls are cheap (the result is
+   * cached internally).
+   */
+  async findOrProvision(): Promise<this> {
+    await time(debugSandbox, `findOrProvision [${this.provider}]`, () =>
+      this.adapter.findOrProvision(),
+    );
+    return this;
+  }
+
   async openPort(port: number): Promise<this> {
-    await this.adapter.openPort(port);
+    await time(debugSandbox, `openPort [${this.provider}] :${port}`, () =>
+      this.adapter.openPort(port),
+    );
     return this;
   }
 
@@ -97,14 +130,23 @@ export class Sandbox<P extends SandboxProviderName = SandboxProviderName> {
     command: string | string[],
     options?: CommandOptions,
   ): Promise<CommandResult> {
-    return this.adapter.run(command, options);
+    return time(
+      debugSandbox,
+      `run [${this.provider}] ${shortLabel(command)}`,
+      () => this.adapter.run(command, options),
+      (result) => ({ exit: result.exitCode }),
+    );
   }
 
   async runAsync(
     command: string | string[],
     options?: CommandOptions,
   ): Promise<AsyncCommandHandle> {
-    return this.adapter.runAsync(command, options);
+    return time(
+      debugSandbox,
+      `runAsync [${this.provider}] ${shortLabel(command)}`,
+      () => this.adapter.runAsync(command, options),
+    );
   }
 
   async list(options?: SandboxListOptions): Promise<SandboxDescriptor[]> {
@@ -124,7 +166,11 @@ export class Sandbox<P extends SandboxProviderName = SandboxProviderName> {
   }
 
   async getPreviewLink(port: number): Promise<string> {
-    return this.adapter.getPreviewLink(port);
+    return time(
+      debugSandbox,
+      `getPreviewLink [${this.provider}] :${port}`,
+      () => this.adapter.getPreviewLink(port),
+    );
   }
 
   get previewHeaders(): Record<string, string> {
@@ -140,5 +186,18 @@ export class Sandbox<P extends SandboxProviderName = SandboxProviderName> {
 
   async downloadFile(sourcePath: string): Promise<Buffer> {
     return this.adapter.downloadFile(sourcePath);
+  }
+
+  async uploadAndRun(
+    files: TarballEntry[],
+    command: string,
+    options?: CommandOptions,
+  ): Promise<CommandResult> {
+    return time(
+      debugSandbox,
+      `uploadAndRun [${this.provider}] ${shortLabel(command)}`,
+      () => this.adapter.uploadAndRun(files, command, options),
+      (result) => ({ exit: result.exitCode, files: files.length }),
+    );
   }
 }

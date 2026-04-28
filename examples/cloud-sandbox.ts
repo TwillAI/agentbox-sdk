@@ -39,6 +39,8 @@ const daytona = new Sandbox(SandboxProvider.Daytona, {
 // Pick one:
 const sandbox = e2b; // or modal, daytona
 
+await sandbox.findOrProvision();
+
 const agent = new Agent(AgentProvider.OpenCode, {
   sandbox,
   cwd: "/workspace",
@@ -47,6 +49,8 @@ const agent = new Agent(AgentProvider.OpenCode, {
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY!,
   },
 });
+
+await agent.setup();
 
 const result = await agent.run({
   model: "anthropic/claude-sonnet-4-6",

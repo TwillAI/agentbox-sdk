@@ -1,7 +1,7 @@
 import path from "node:path";
 
 import { AgentProvider } from "../types";
-import type { AgentCommandConfig, RuntimeLayout, TextArtifact } from "./types";
+import type { AgentCommandConfig, SetupLayout, TextArtifact } from "./types";
 
 function buildFrontmatter(
   values: Record<string, string | boolean | undefined>,
@@ -15,7 +15,7 @@ function buildFrontmatter(
 
 export function buildClaudeCommandArtifacts(
   commands: AgentCommandConfig[] | undefined,
-  layout: RuntimeLayout,
+  layout: SetupLayout,
 ): TextArtifact[] {
   return (commands ?? []).map((command) => ({
     path: path.join(layout.claudeDir, "commands", `${command.name}.md`),
@@ -48,7 +48,7 @@ export function buildOpenCodeCommandsConfig(
 }
 
 export function assertCommandsSupported(
-  provider: "claude-code" | "opencode" | "codex",
+  provider: "claude-code" | "open-code" | "codex",
   commands: AgentCommandConfig[] | undefined,
 ): void {
   if (!commands || commands.length === 0) {

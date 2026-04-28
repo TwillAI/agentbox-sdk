@@ -10,7 +10,7 @@
 
 export const AgentProvider = {
   ClaudeCode: "claude-code",
-  OpenCode: "opencode",
+  OpenCode: "open-code",
   Codex: "codex",
 } as const;
 export type AgentProvider = (typeof AgentProvider)[keyof typeof AgentProvider];

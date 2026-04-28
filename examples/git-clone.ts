@@ -8,6 +8,8 @@ const sandbox = new Sandbox(SandboxProvider.LocalDocker, {
   },
 });
 
+await sandbox.findOrProvision();
+
 await sandbox.gitClone({
   repoUrl: "https://github.com/expressjs/express",
   targetDir: "/workspace/express",
@@ -19,6 +21,8 @@ const agent = new Agent(AgentProvider.ClaudeCode, {
   cwd: "/workspace/express",
   approvalMode: "auto",
 });
+
+await agent.setup();
 
 const result = await agent.run({
   model: "sonnet",
