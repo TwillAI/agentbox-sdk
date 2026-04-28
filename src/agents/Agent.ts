@@ -15,9 +15,8 @@ import { CodexAgentAdapter } from "./providers/codex";
 import { OpenCodeAgentAdapter } from "./providers/opencode";
 import {
   AgentProvider,
+  type AgentAttachRequest,
   type AgentExecutionRequest,
-  type AgentForkRequest,
-  type AgentForkResult,
   type AgentProviderAdapter,
   type AgentProviderName,
   type AgentResult,
@@ -27,6 +26,7 @@ import {
   type AgentRunSink,
   type AgentPermissionResponse,
   type AgentSetupConfig,
+  type AttachedRun,
   type UserContent,
   type AgentCostData,
 } from "./types";
@@ -534,39 +534,32 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
   }
 
   /**
-   * Truncate a session at a specific user message and produce a forked
-   * sessionId that can be passed to `Agent.stream({ resumeSessionId })`.
+   * Stateless control plane for an in-flight run.
    *
-   * The fork drops the message at `messageId` and everything after it. The
-   * caller should start a new run with the returned sessionId and an edited
-   * input which effectively replaces the dropped message.
+   * Returns an {@link AttachedRun} whose `abort()` / `sendMessage()` methods
+   * dial the in-sandbox provider server directly (codex app-server, opencode
+   * HTTP server, claude-code relay control endpoint) — there is no shared
+   * in-memory registry or Redis broker. Any process with the right `sandbox`
+   * + `runId` (+ optional provider-native `sessionId`) can issue commands
+   * against a run started on a different process.
    *
-   * Like {@link Agent.stream}, `forkAt` does NOT auto-run `setup`.
-   * Callers are expected to have invoked `await agent.setup()` before
-   * forking on a sandbox-backed run; otherwise the underlying RPC /
-   * file lookup fails naturally because the server isn't running and
-   * the layout doesn't exist on disk yet.
+   * The originating process keeps owning the event stream that
+   * `agent.stream()` returned; commands attached here cause the in-sandbox
+   * server to emit the natural follow-up events (`turn/aborted`, message
+   * events, etc.), which the originating process ingests through its
+   * existing transport.
    *
-   * Provider-specific notes:
-   * - **open-code**: in-place revert via `POST /session/:id/revert`.
-   *   Returns the same sessionId. Reverts file changes via the OpenCode
-   *   server's internal git snapshot system.
-   * - **codex**: copies the thread (`thread/fork`) then drops trailing
-   *   turns (`thread/rollback`). Returns a new threadId. Filesystem
-   *   unchanged.
-   * - **claude-code**: rewrites the JSONL session transcript under
-   *   `<claudeDir>/projects/<encoded-cwd>/<sessionId>.jsonl` (the same
-   *   `claudeDir` `setup()` populated and `execute()` points the CLI
-   *   at via `CLAUDE_CONFIG_DIR`), keeping only ancestors of the target
-   *   uuid and writing to a new sessionId file.
+   * The handle is short-lived: each method call opens a fresh connection,
+   * performs the operation with a timeout, and tears the connection down.
    */
-  async forkAt(
-    request: Omit<AgentForkRequest<P>, "options">,
-  ): Promise<AgentForkResult> {
-    return this.adapter.forkAt({
-      sessionId: request.sessionId,
-      messageId: request.messageId,
-      options: this.options,
-    });
+  static async attach<P extends AgentProviderName>(
+    request: AgentAttachRequest<P>,
+  ): Promise<AttachedRun> {
+    const adapter = createAdapter(request.provider);
+    return {
+      abort: () => adapter.attachAbort(request),
+      sendMessage: (content: UserContent) =>
+        adapter.attachSendMessage(request, content),
+    };
   }
 }

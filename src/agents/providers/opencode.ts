@@ -8,9 +8,8 @@ import {
 } from "../../events";
 import {
   AgentProvider,
+  type AgentAttachRequest,
   type AgentExecutionRequest,
-  type AgentForkRequest,
-  type AgentForkResult,
   type AgentOptions,
   type AgentProviderAdapter,
   type AgentRunSink,
@@ -44,9 +43,9 @@ import { extractOpenCodeCostData } from "../cost";
 import { debugOpencode, time } from "../../shared/debug";
 
 /**
- * Per-call runtime handle for opencode. Built independently in
- * `execute` and `forkAt` from the deterministic constants below — there
- * is no setup → execute data channel.
+ * Per-call runtime handle for opencode. Built independently in `execute`
+ * from the deterministic constants below — there is no setup → execute
+ * data channel.
  */
 type OpenCodeRuntime = {
   baseUrl: string;
@@ -781,8 +780,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                 : event.event;
 
             // Surface each user message id as a `message.started` event so
-            // callers can correlate user bubbles with provider message ids
-            // (needed for `Agent.forkAt`).
+            // callers can correlate user bubbles with provider message ids.
             if (eventType === "message.updated") {
               const properties = (payload as Record<string, unknown>)
                 .properties as Record<string, unknown> | undefined;
@@ -857,6 +855,37 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
               payload && typeof payload === "object" && !Array.isArray(payload)
                 ? (payload as Record<string, unknown>)
                 : null;
+
+            // OpenCode signals end-of-turn via `session.idle` on the SSE
+            // bus. We abort the in-flight `POST /session/:id/message`
+            // here so the originating instance unwinds promptly when an
+            // external `Agent.attach({...}).abort()` -> server `/abort`
+            // happens — the server is sometimes slow to close the POST
+            // connection on its own (see opencode issue #20095). For
+            // natural completion this is a no-op: the POST has already
+            // resolved by the time `session.idle` arrives.
+            if (
+              (payloadRecord?.type === "session.idle" ||
+                payloadRecord?.type === "session.error") &&
+              !dispatchAbort.signal.aborted
+            ) {
+              const properties = payloadRecord.properties as
+                | Record<string, unknown>
+                | undefined;
+              const eventSessionId =
+                typeof properties?.sessionID === "string"
+                  ? properties.sessionID
+                  : undefined;
+              if (!eventSessionId || eventSessionId === sessionId) {
+                debugOpencode(
+                  "★ %s for session=%s — aborting in-flight dispatch",
+                  payloadRecord.type,
+                  sessionId,
+                );
+                dispatchAbort.abort();
+              }
+            }
+
             if (payloadRecord?.type === "message.part.delta") {
               const properties = payloadRecord.properties as
                 | Record<string, unknown>
@@ -1023,7 +1052,14 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
 
       await allDone;
 
-      if (dispatchError) {
+      // Treat dispatchAbort-induced errors as a clean termination: an
+      // abort is the explicit "stop this turn" signal (either in-process
+      // `run.abort()` or remote `Agent.attach({...}).abort()` whose
+      // server-side `/abort` we then mirror locally via the SSE
+      // `session.idle` listener above). Bubbling the AbortError as a
+      // run failure was wrong — it surfaced a fake "OpenCode failed"
+      // every time a user pressed Stop.
+      if (dispatchError && !dispatchAbort.signal.aborted) {
         throw dispatchError;
       }
 
@@ -1062,24 +1098,80 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
     return async () => undefined;
   }
 
-  async forkAt(
-    request: AgentForkRequest<"open-code">,
-  ): Promise<AgentForkResult> {
-    // Fork assumes the server is already running. If callers reach
-    // this without having called `agent.setup()`, the underlying fetch
-    // will fail with a connect error — same contract as `execute`.
-    const runtime = await buildOpenCodeRuntime(request.options);
+  /**
+   * Stateless abort. Resolve the in-sandbox base URL via
+   * `sandbox.getPreviewLink` and POST to `/session/:id/abort`. Best-effort:
+   * a 3s timeout protects against an unresponsive server, and any error
+   * is swallowed since the originating run will tear itself down once
+   * the server-side abort takes effect.
+   */
+  async attachAbort(request: AgentAttachRequest<"open-code">): Promise<void> {
+    if (!request.sessionId) {
+      throw new Error(
+        `Cannot attachAbort to opencode run ${request.runId}: sessionId is required.`,
+      );
+    }
+    const baseUrl = (
+      await request.sandbox.getPreviewLink(SANDBOX_OPENCODE_PORT)
+    ).replace(/\/$/, "");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3_000);
+    try {
+      await fetch(`${baseUrl}/session/${request.sessionId}/abort`, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "content-type": "application/json",
+          ...request.sandbox.previewHeaders,
+        },
+      }).catch((error) => {
+        debugOpencode(
+          "attachAbort runId=%s POST /abort failed: %o",
+          request.runId,
+          error,
+        );
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * Stateless message injection. POST a fresh user message to
+   * `/session/:id/message` with `agent` defaulting to the build agent
+   * — opencode appends it to the running session and the originating
+   * instance picks up the new turn through its existing SSE stream.
+   */
+  async attachSendMessage(
+    request: AgentAttachRequest<"open-code">,
+    content: UserContent,
+  ): Promise<void> {
+    if (!request.sessionId) {
+      throw new Error(
+        `Cannot attachSendMessage to opencode run ${request.runId}: sessionId is required.`,
+      );
+    }
+    const baseUrl = (
+      await request.sandbox.getPreviewLink(SANDBOX_OPENCODE_PORT)
+    ).replace(/\/$/, "");
+    const inputParts = await validateProviderUserInput(
+      AgentProvider.OpenCode,
+      content,
+    );
+    const parts = mapToOpenCodeParts(inputParts);
     await fetchJson<unknown>(
-      `${runtime.baseUrl}/session/${encodeURIComponent(request.sessionId)}/revert`,
+      `${baseUrl}/session/${request.sessionId}/message`,
       {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          ...runtime.previewHeaders,
+          ...request.sandbox.previewHeaders,
         },
-        body: JSON.stringify({ messageID: request.messageId }),
+        body: JSON.stringify({
+          agent: openCodeAgentSlug(undefined),
+          parts,
+        }),
       },
     );
-    return { sessionId: request.sessionId };
   }
 }

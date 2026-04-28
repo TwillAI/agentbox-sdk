@@ -36,7 +36,7 @@ export interface MessageStartedEvent extends NormalizedAgentEventBase {
   type: "message.started";
   /**
    * Provider-assigned identifier for the user message that started this turn.
-   * Opaque to callers, but stable enough to pass back into `Agent.forkAt`.
+   * Opaque to callers.
    *
    * - claude-code: the user message UUID written to the session JSONL
    * - codex: the turn id from `turn/started`

@@ -19,8 +19,8 @@ function shortLabel(command: string): string {
 /**
  * The on-disk root for every artifact agentbox writes for a given
  * provider. Deterministic — same inputs, same path — so `setup()` and
- * `execute()` / `forkAt()` agree on file locations without any data
- * channel between them.
+ * `execute()` agree on file locations without any data channel between
+ * them.
  *
  *  - **Sandbox**: `/tmp/agentbox/<provider>` inside the sandbox.
  *  - **Local host**: `<os.tmpdir()>/agentbox-<provider>` on the host.
@@ -249,10 +249,10 @@ class SandboxSetupTarget implements SetupTarget {
 /**
  * Build an upload+run-capable target for a setup phase.
  *
- * Setup-only API. Execute / forkAt should NOT call this; they need
- * paths/env (use {@link getSetupLayout} + {@link buildLayoutEnv}) or
- * direct sandbox access, not a heavyweight target wrapper that mkdirs
- * the host layout as a side effect.
+ * Setup-only API. Execute should NOT call this; it needs paths/env
+ * (use {@link getSetupLayout} + {@link buildLayoutEnv}) or direct
+ * sandbox access, not a heavyweight target wrapper that mkdirs the
+ * host layout as a side effect.
  *
  * Idempotent for both transports: sandbox mode just constructs a thin
  * wrapper, and host mode `mkdir -p`s the layout dirs which is safe to

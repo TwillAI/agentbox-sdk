@@ -69,14 +69,6 @@
     "tar-stream": "^3.1.8",
     "ws": "^8.20.0"
   },
-  "peerDependencies": {
-    "ioredis": "^5.0.0"
-  },
-  "peerDependenciesMeta": {
-    "ioredis": {
-      "optional": true
-    }
-  },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/dockerode": "^3.3.42",
@@ -85,7 +77,6 @@
     "@types/ws": "^8.18.1",
     "eslint": "^10.2.0",
     "globals": "^17.4.0",
-    "ioredis": "^5.10.1",
     "lefthook": "^2.1.5",
     "tsup": "^8.5.1",
     "tsx": "^4.20.6",

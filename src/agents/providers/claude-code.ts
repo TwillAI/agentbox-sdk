@@ -7,20 +7,14 @@ import { sleep } from "../../shared/network";
 import { shellQuote } from "../../shared/shell";
 import {
   AgentProvider,
+  type AgentAttachRequest,
   type AgentExecutionRequest,
-  type AgentForkRequest,
-  type AgentForkResult,
   type AgentOptions,
   type AgentProviderAdapter,
   type AgentRunSink,
   type AgentSetupRequest,
   type UserContent,
 } from "../types";
-import {
-  encodeClaudeCwd,
-  forkClaudeTranscript,
-  newClaudeSessionId,
-} from "./claude-code-transcript";
 import { SandboxProvider } from "../../sandboxes/types";
 import { shouldAutoApproveClaudeTools } from "../approval";
 import { mapToClaudeUserContent, validateProviderUserInput } from "../input";
@@ -50,8 +44,8 @@ import { debugClaude, debugRelay, time } from "../../shared/debug";
  * sandbox, or `<os.tmpdir()>/agentbox-claude-code/.claude` on the host.
  *
  * `setup()` writes settings, MCP config, sub-agent / skill / command
- * files under this directory; `execute()` and `forkAt()` derive the
- * same path independently and let the CLI auto-discover everything via
+ * files under this directory; `execute()` derives the same path
+ * independently and lets the CLI auto-discover everything via
  * `CLAUDE_CONFIG_DIR`. There is no setup → execute data channel.
  */
 function claudeConfigDir(options: AgentOptions<"claude-code">): string {
@@ -362,6 +356,72 @@ function relayFromClaude(runId, message) {
   }
 }
 
+// Stateless control endpoints.
+//
+// Any process with the relay's preview URL can issue control commands
+// against a runId without holding the host WebSocket slot. \`abort\`
+// sends an interrupt control_request frame (best-effort) and then
+// destroys the relay's claude-side socket so the in-sandbox claude
+// CLI loses its SDK channel and exits. \`sendMessage\` synthesizes a
+// fresh user frame on the live claude socket.
+function handleControlAbort(runId, response) {
+  const channel = channels.get(runId);
+  if (!channel || !channel.claude) {
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: false, error: "no claude channel for runId" }));
+    return;
+  }
+  try {
+    const interrupt = {
+      type: "control_request",
+      request_id: crypto.randomUUID(),
+      request: { subtype: "interrupt" },
+    };
+    sendFrame(channel.claude, Buffer.from(JSON.stringify(interrupt) + "\\n", "utf8"));
+  } catch {}
+  try {
+    channel.claude.destroy();
+  } catch {}
+  channel.claude = null;
+  response.writeHead(200, { "content-type": "application/json" });
+  response.end(JSON.stringify({ ok: true }));
+}
+
+function handleControlSendMessage(runId, body, response) {
+  const channel = getChannel(runId);
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch (error) {
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: false, error: "invalid json body" }));
+    return;
+  }
+  const content = parsed?.content;
+  if (!Array.isArray(content)) {
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: false, error: "content must be an array of claude SDK content blocks" }));
+    return;
+  }
+  const sessionId = typeof parsed.sessionId === "string" ? parsed.sessionId : "";
+  const messageUuid = crypto.randomUUID();
+  const message = {
+    type: "user",
+    message: { role: "user", content },
+    parent_tool_use_id: null,
+    session_id: sessionId,
+    uuid: messageUuid,
+  };
+  const payload = JSON.stringify(message) + "\\n";
+  if (channel.claude) {
+    sendFrame(channel.claude, Buffer.from(payload, "utf8"));
+  } else {
+    channel.pending.claude.push(payload);
+  }
+  response.writeHead(200, { "content-type": "application/json" });
+  response.end(JSON.stringify({ ok: true, messageId: messageUuid }));
+}
+
 function registerClaudePeer(socket, runId) {
   const channel = getChannel(runId);
   channel.claude = socket;
@@ -498,7 +558,42 @@ function registerHostPeer(socket) {
   socket.on("error", clearHost);
 }
 
-const server = http.createServer((_request, response) => {
+const RELAY_PROTOCOL_VERSION = "2";
+
+const server = http.createServer((request, response) => {
+  if (request.method === "GET" && request.url === "/__version") {
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.end(RELAY_PROTOCOL_VERSION);
+    return;
+  }
+  if (request.method === "POST" && typeof request.url === "string") {
+    const url = new URL(request.url, "http://127.0.0.1");
+    const abortMatch = url.pathname.match(/^\\/runs\\/([^/]+)\\/abort$/);
+    if (abortMatch) {
+      handleControlAbort(decodeURIComponent(abortMatch[1]), response);
+      return;
+    }
+    const sendMatch = url.pathname.match(/^\\/runs\\/([^/]+)\\/sendMessage$/);
+    if (sendMatch) {
+      let body = "";
+      request.setEncoding("utf8");
+      request.on("data", (chunk) => {
+        body += chunk;
+        if (body.length > 1024 * 1024) {
+          request.destroy();
+        }
+      });
+      request.on("end", () => {
+        try {
+          handleControlSendMessage(decodeURIComponent(sendMatch[1]), body, response);
+        } catch (error) {
+          response.writeHead(500, { "content-type": "application/json" });
+          response.end(JSON.stringify({ ok: false, error: String((error && error.message) || error) }));
+        }
+      });
+      return;
+    }
+  }
   response.writeHead(426, { "content-type": "text/plain" });
   response.end("Upgrade Required");
 });
@@ -634,6 +729,15 @@ async function connectRemoteTransport(
  * never comes up, that timeout surfaces as a connection error after the
  * normal grace period.
  */
+/**
+ * Bumped whenever the embedded relay script's protocol changes (e.g. new
+ * HTTP control endpoints). The probe asks the running relay for its
+ * `/__version` and only reuses it on an exact match — older relays
+ * return 426 and trigger a kill+re-spawn so warm sandboxes pick up the
+ * new code automatically.
+ */
+const RELAY_PROTOCOL_VERSION = "2";
+
 async function ensureRemoteRelay(
   options: AgentOptions<"claude-code">,
   env: Record<string, string>,
@@ -644,31 +748,42 @@ async function ensureRemoteRelay(
     const relayLogPath = "/tmp/agentbox/claude-code/relay.log";
     const relayPidPath = "/tmp/agentbox/claude-code/relay.pid";
 
-    // Fast-path: probe the relay over a single `sandbox.run` (no
-    // tarball upload). On a warm sandbox the relay process from the
-    // previous setup() is still listening, so we can return immediately
-    // without re-shipping the relay script — the previous spawn
-    // already wrote it to disk.
-    const probe = await time(debugRelay, "probe relay", () =>
+    // Fast-path: ask the running relay for its protocol version. We
+    // only reuse if the version matches the one we ship — that protects
+    // warm sandboxes whose existing relay predates a protocol change
+    // (e.g. the HTTP control endpoints) and would otherwise reject our
+    // attach calls.
+    const probe = await time(debugRelay, "probe relay version", () =>
       sandbox.run(
-        `curl -s --max-time 1 -o /dev/null http://127.0.0.1:${REMOTE_SDK_RELAY_PORT}/`,
+        `curl -fsS --max-time 1 http://127.0.0.1:${REMOTE_SDK_RELAY_PORT}/__version 2>/dev/null`,
         { cwd: options.cwd, timeoutMs: 3_000 },
       ),
     );
-    if (probe.exitCode === 0) {
-      debugRelay("relay already running — reusing without upload");
+    if (
+      probe.exitCode === 0 &&
+      probe.combinedOutput.trim() === RELAY_PROTOCOL_VERSION
+    ) {
+      debugRelay(
+        "relay v%s already running — reusing without upload",
+        RELAY_PROTOCOL_VERSION,
+      );
       return;
     }
 
-    // Cold path: upload the relay script + spawn a detached node
-    // process. The launch command is still idempotent (one final probe
-    // before spawn) to defend against TOCTOU between probe and upload.
+    // Cold path: kill any stale relay (old version or unrelated process
+    // squatting on the port), upload the new script, and spawn it. The
+    // kill step is best-effort: `relay.pid` may be missing on a fresh
+    // sandbox or stale on a warm one, and `fuser` is unavailable on
+    // some base images — both branches `|| true` so the launch doesn't
+    // fail.
     //
     // `nohup … & echo $! > pid` must live inside a subshell — `/bin/sh`
     // rejects `cmd & && cmd2` as a syntax error.
     const launchCommand = [
-      `if curl -s --max-time 1 -o /dev/null http://127.0.0.1:${REMOTE_SDK_RELAY_PORT}/ 2>/dev/null; then exit 0; fi`,
       `mkdir -p ${shellQuote(path.posix.dirname(REMOTE_SDK_RELAY_PATH))}`,
+      `if [ -f ${shellQuote(relayPidPath)} ]; then kill -TERM "$(cat ${shellQuote(relayPidPath)})" 2>/dev/null || true; fi`,
+      `(fuser -k -n tcp ${REMOTE_SDK_RELAY_PORT} 2>/dev/null || true)`,
+      `sleep 0.5`,
       `(nohup node ${shellQuote(REMOTE_SDK_RELAY_PATH)} ${REMOTE_SDK_RELAY_PORT} > ${shellQuote(relayLogPath)} 2>&1 & echo $! > ${shellQuote(relayPidPath)})`,
     ].join(" && ");
 
@@ -1146,26 +1261,37 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
           }
 
           if (message.type === "result") {
+            // `result` is the terminal message for a turn. Whether the
+            // subtype is `success` or a non-success variant
+            // (`error_during_execution`, an interrupt-induced result,
+            // etc.) the turn is done — the SDK should unwind cleanly
+            // either way. Rejecting on non-success used to surface
+            // every external interrupt as `Claude Code run failed.`,
+            // which is wrong: an `Agent.attach({...}).abort()` from
+            // another instance feeds an `interrupt` control_request
+            // into the relay, claude responds with a non-success
+            // result, and the originating run should resolve with
+            // whatever text streamed before the interrupt — not throw.
+            //
+            // Genuine fatal failures still propagate via other paths:
+            // - `auth_status` (handled below) → reject for auth errors,
+            // - transport close before any result → reject by the
+            //   "Claude transport closed before run completed" branch,
+            // - thrown adapter errors → bubble up naturally.
             const subtype = String(message.subtype ?? "success");
-            if (subtype === "success") {
-              pendingMessages--;
-              if (pendingMessages <= 0) {
-                resolve({ text: accumulatedText });
-                return;
-              }
-              continue;
-            } else {
-              reject(
-                new Error(
-                  String(
-                    message.result ??
-                      message.error ??
-                      "Claude Code run failed.",
-                  ),
-                ),
+            if (subtype !== "success") {
+              debugClaude(
+                "result subtype=%s (non-success) — resolving turn as terminal; reason=%s",
+                subtype,
+                String(message.result ?? message.error ?? ""),
               );
             }
-            return;
+            pendingMessages--;
+            if (pendingMessages <= 0) {
+              resolve({ text: accumulatedText });
+              return;
+            }
+            continue;
           }
 
           if (
@@ -1269,168 +1395,86 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     return async () => undefined;
   }
 
-  async forkAt(
-    request: AgentForkRequest<"claude-code">,
-  ): Promise<AgentForkResult> {
-    const newSessionId = newClaudeSessionId();
-    if (request.options.sandbox) {
-      await forkClaudeSessionInSandbox(request, newSessionId);
-    } else {
-      await forkClaudeSessionLocally(request, newSessionId);
+  /**
+   * Stateless abort. POST to the in-sandbox relay's
+   * `/runs/<runId>/abort` HTTP endpoint. The relay sends an interrupt
+   * SDK control_request frame on its claude-side socket and then
+   * destroys the socket — the in-sandbox claude CLI loses its SDK
+   * channel and exits, the originating instance's host WS sees the
+   * channel close and settles the run.
+   */
+  async attachAbort(request: AgentAttachRequest<"claude-code">): Promise<void> {
+    if (request.sandbox.provider === SandboxProvider.LocalDocker) {
+      throw new Error(
+        "claude-code stateless attach is not supported for local-docker sandboxes; the relay is host-resident.",
+      );
     }
-    return { sessionId: newSessionId };
-  }
-}
-
-/**
- * Locate the source transcript inside the sandbox, rewrite it via the
- * `forkClaudeTranscript` helper, and write the result to a new file under
- * the same `<claudeDir>/projects/<encoded-cwd>/` directory keyed by the
- * new sessionId.
- *
- * `claudeDir` is the deterministic layout location (the same one
- * `setup()` populated and `execute()` points the CLI at via
- * `CLAUDE_CONFIG_DIR`). We do NOT read `$HOME/.claude/...` here — that
- * would diverge from where the agent actually writes transcripts.
- *
- * If the encoded-cwd directory doesn't contain `<sessionId>.jsonl`, we
- * fall back to a `find` across `<claudeDir>/projects/` so the fork
- * still works if Claude tweaks its encoding rule in a future release.
- */
-async function forkClaudeSessionInSandbox(
-  request: AgentForkRequest<"claude-code">,
-  newSessionId: string,
-): Promise<void> {
-  const sandbox = request.options.sandbox!;
-  const cwd = request.options.cwd ?? "/workspace";
-  const encoded = encodeClaudeCwd(cwd);
-  const projectsDir = path.posix.join(
-    claudeConfigDir(request.options),
-    "projects",
-  );
-
-  const pathDelim = `__AGENTBOX_FORK_PATH_${Math.random().toString(36).slice(2)}__`;
-  const contentDelim = `__AGENTBOX_FORK_CONTENT_${Math.random().toString(36).slice(2)}__`;
-  const locate = await sandbox.run(
-    [
-      `set -e`,
-      `DIR=${shellQuote(path.posix.join(projectsDir, encoded))}`,
-      `SRC="$DIR/${shellQuote(`${request.sessionId}.jsonl`)}"`,
-      `if [ ! -f "$SRC" ]; then`,
-      `  SRC="$(find ${shellQuote(projectsDir)} -type f -name ${shellQuote(`${request.sessionId}.jsonl`)} -print -quit 2>/dev/null || true)"`,
-      `fi`,
-      `if [ -z "$SRC" ] || [ ! -f "$SRC" ]; then`,
-      `  echo "claude-code session ${request.sessionId} not found" >&2`,
-      `  exit 1`,
-      `fi`,
-      `printf '%s\\n' ${shellQuote(pathDelim)}`,
-      `printf '%s\\n' "$SRC"`,
-      `printf '%s\\n' ${shellQuote(contentDelim)}`,
-      `cat "$SRC"`,
-    ].join("\n"),
-    { cwd },
-  );
-  if (locate.exitCode !== 0) {
-    throw new Error(
-      `Could not locate claude-code session ${request.sessionId}: ${locate.combinedOutput || locate.stderr}`,
-    );
-  }
-  const stdout = locate.stdout ?? "";
-  const pathStart = stdout.indexOf(pathDelim);
-  const contentStart = stdout.indexOf(contentDelim);
-  if (pathStart < 0 || contentStart < 0 || contentStart <= pathStart) {
-    throw new Error(
-      `Unexpected output while locating claude-code session ${request.sessionId}.`,
-    );
-  }
-  const sourcePath = stdout
-    .slice(pathStart + pathDelim.length, contentStart)
-    .trim();
-  // Skip the content-delimiter line (and its trailing newline).
-  const sourceContent = stdout.slice(contentStart + contentDelim.length + 1);
-
-  const { content } = forkClaudeTranscript(
-    sourceContent,
-    request.messageId,
-    newSessionId,
-  );
-
-  const dirPath = path.posix.dirname(sourcePath);
-  const destPath = path.posix.join(dirPath, `${newSessionId}.jsonl`);
-  const marker = `__AGENTBOX_FORK_${Math.random().toString(36).slice(2)}__`;
-  await sandbox.run(
-    `mkdir -p ${shellQuote(dirPath)} && cat > ${shellQuote(destPath)} <<'${marker}'\n${content}${marker}\n`,
-    { cwd },
-  );
-}
-
-/**
- * Local-host fork: read/write the JSONL transcript directly via `fs`,
- * scoped to the deterministic layout's `<claudeDir>/projects/...`. We
- * never look at the user's actual `$HOME/.claude/projects/` because
- * `CLAUDE_CONFIG_DIR` redirects all session history into our layout.
- */
-async function forkClaudeSessionLocally(
-  request: AgentForkRequest<"claude-code">,
-  newSessionId: string,
-): Promise<void> {
-  const fs = await import("node:fs/promises");
-  const cwd = request.options.cwd ?? process.cwd();
-  const encoded = encodeClaudeCwd(cwd);
-  const projectsDir = path.join(claudeConfigDir(request.options), "projects");
-  const candidateDir = path.join(projectsDir, encoded);
-  const candidatePath = path.join(candidateDir, `${request.sessionId}.jsonl`);
-
-  let sourcePath = candidatePath;
-  let sourceContent: string | undefined;
-  try {
-    sourceContent = await fs.readFile(candidatePath, "utf8");
-  } catch {
-    sourceContent = undefined;
-  }
-  if (sourceContent === undefined) {
-    sourcePath = await findClaudeSessionFile(
-      projectsDir,
-      `${request.sessionId}.jsonl`,
-    );
-    sourceContent = await fs.readFile(sourcePath, "utf8");
-  }
-
-  const { content } = forkClaudeTranscript(
-    sourceContent,
-    request.messageId,
-    newSessionId,
-  );
-
-  const dir = path.dirname(sourcePath);
-  await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(path.join(dir, `${newSessionId}.jsonl`), content, "utf8");
-}
-
-async function findClaudeSessionFile(
-  projectsDir: string,
-  filename: string,
-): Promise<string> {
-  const fs = await import("node:fs/promises");
-  let entries;
-  try {
-    entries = await fs.readdir(projectsDir, { withFileTypes: true });
-  } catch {
-    throw new Error(
-      `claude-code session file ${filename} not found under ${projectsDir}.`,
-    );
-  }
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const candidate = path.join(projectsDir, entry.name, filename);
+    const previewUrl = (
+      await request.sandbox.getPreviewLink(REMOTE_SDK_RELAY_PORT)
+    ).replace(/\/$/, "");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3_000);
     try {
-      await fs.access(candidate);
-      return candidate;
-    } catch {
-      // try next
+      await fetch(
+        `${previewUrl}/runs/${encodeURIComponent(request.runId)}/abort`,
+        {
+          method: "POST",
+          signal: controller.signal,
+          headers: request.sandbox.previewHeaders,
+        },
+      ).catch((error) => {
+        debugClaude(
+          "attachAbort runId=%s POST /abort failed: %o",
+          request.runId,
+          error,
+        );
+      });
+    } finally {
+      clearTimeout(timeout);
     }
   }
-  throw new Error(
-    `claude-code session file ${filename} not found under ${projectsDir}.`,
-  );
+
+  /**
+   * Stateless message injection. POST `{ content, sessionId }` to the
+   * relay's `/runs/<runId>/sendMessage`. The relay synthesizes a fresh
+   * `user` SDK frame on the live claude socket; the originating
+   * instance picks it up through its existing event stream.
+   */
+  async attachSendMessage(
+    request: AgentAttachRequest<"claude-code">,
+    content: UserContent,
+  ): Promise<void> {
+    if (request.sandbox.provider === SandboxProvider.LocalDocker) {
+      throw new Error(
+        "claude-code stateless attach is not supported for local-docker sandboxes; the relay is host-resident.",
+      );
+    }
+    const previewUrl = (
+      await request.sandbox.getPreviewLink(REMOTE_SDK_RELAY_PORT)
+    ).replace(/\/$/, "");
+    const inputParts = await validateProviderUserInput(
+      AgentProvider.ClaudeCode,
+      content,
+    );
+    const mapped = mapToClaudeUserContent(inputParts);
+    const response = await fetch(
+      `${previewUrl}/runs/${encodeURIComponent(request.runId)}/sendMessage`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...request.sandbox.previewHeaders,
+        },
+        body: JSON.stringify({
+          content: mapped,
+          sessionId: request.sessionId ?? "",
+        }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(
+        `claude-code attachSendMessage failed: ${response.status} ${await response.text().catch(() => "")}`,
+      );
+    }
+  }
 }

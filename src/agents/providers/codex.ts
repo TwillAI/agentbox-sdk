@@ -8,9 +8,8 @@ import {
 } from "../../events";
 import {
   AgentProvider,
+  type AgentAttachRequest,
   type AgentExecutionRequest,
-  type AgentForkRequest,
-  type AgentForkResult,
   type AgentOptions,
   type AgentProviderAdapter,
   type AgentRunSink,
@@ -75,8 +74,8 @@ type CodexRpcClient = {
  * `<os.tmpdir()>/agentbox-codex/.codex` on the host.
  *
  * Setup writes config.toml, hooks.json, sub-agent .toml files, and
- * skills/ under this directory. Execute / forkAt point the codex CLI
- * at it via `CODEX_HOME`.
+ * skills/ under this directory. Execute points the codex CLI at it via
+ * `CODEX_HOME`.
  */
 function codexConfigDir(options: AgentOptions<"codex">): string {
   return path.join(
@@ -624,6 +623,42 @@ function toRemoteCodexWebSocketUrl(url: string): string {
   const parsed = new URL(url);
   parsed.protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
   return parsed.toString();
+}
+
+/**
+ * Open a short-lived JSON-RPC client against the in-sandbox codex
+ * app-server, run `body`, and close. Used by `attachAbort` /
+ * `attachSendMessage` to perform a single RPC and disconnect.
+ */
+async function withCodexAppServer<T>(
+  request: AgentAttachRequest<"codex">,
+  body: (client: JsonRpcLineClient<CodexNotification>) => Promise<T>,
+): Promise<T> {
+  const sandbox = request.sandbox;
+  if (sandbox.provider === SandboxProvider.LocalDocker) {
+    throw new Error(
+      "Codex stateless attach is not supported for local-docker sandboxes; the app-server is in-process.",
+    );
+  }
+  const previewUrl = await sandbox.getPreviewLink(REMOTE_CODEX_APP_SERVER_PORT);
+  const transport = await connectJsonRpcWebSocket(
+    toRemoteCodexWebSocketUrl(previewUrl),
+    { headers: sandbox.previewHeaders },
+  );
+  const client = new JsonRpcLineClient<CodexNotification>(
+    transport.source,
+    transport.send,
+  );
+  try {
+    await client.request("initialize", {
+      clientInfo: { title: "AgentBox", name: "AgentBox", version: "0.1.0" },
+      capabilities: { experimentalApi: true },
+    });
+    await client.notify("initialized", {});
+    return await body(client);
+  } finally {
+    await transport.close().catch(() => undefined);
+  }
 }
 
 async function connectRemoteCodexAppServer(
@@ -1253,80 +1288,82 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
     return async () => undefined;
   }
 
-  async forkAt(request: AgentForkRequest<"codex">): Promise<AgentForkResult> {
-    const runtime = await createCodexForkRuntime(request.options);
-    const client =
-      runtime.client ??
-      new JsonRpcLineClient<CodexNotification>(
-        runtime.source!,
-        runtime.writeLine!,
+  /**
+   * Stateless abort. Calls `turn/interrupt` against the in-sandbox
+   * app-server using `(sessionId, turnId)` provided by the caller —
+   * the SDK does not persist turn state itself; bookkeeping the
+   * current turnId is the caller's responsibility (e.g. via Redis,
+   * driven by the normalized `message.started` event whose
+   * `messageId` IS the codex turnId).
+   *
+   * If `sessionId` or `turnId` is missing the call is a no-op.
+   */
+  async attachAbort(request: AgentAttachRequest<"codex">): Promise<void> {
+    const threadId = request.sessionId;
+    const turnId = request.turnId;
+    if (!threadId || !turnId) {
+      debugCodex(
+        "attachAbort runId=%s skipped: threadId=%s turnId=%s",
+        request.runId,
+        threadId,
+        turnId,
       );
-
-    try {
-      if (!runtime.client) {
-        await client.request("initialize", {
-          clientInfo: {
-            title: "AgentBox",
-            name: "AgentBox",
-            version: "0.1.0",
-          },
-          capabilities: {
-            experimentalApi: true,
-          },
-        });
-        await client.notify("initialized", {});
-      }
-
-      const fork = await client.request<{ thread: { id: string } }>(
-        "thread/fork",
-        { threadId: request.sessionId },
-      );
-      const newThreadId = fork.thread.id;
-
-      const read = await client.request<{
-        thread: { turns?: Array<{ id?: string }> };
-      }>("thread/read", { threadId: newThreadId, includeTurns: true });
-      const turns = read.thread.turns ?? [];
-      const targetIdx = turns.findIndex(
-        (turn) => typeof turn.id === "string" && turn.id === request.messageId,
-      );
-      if (targetIdx < 0) {
-        throw new Error(
-          `Cannot fork codex thread ${request.sessionId}: turn ${request.messageId} not found.`,
-        );
-      }
-      const dropCount = turns.length - targetIdx;
-      if (dropCount > 0) {
-        await client.request("thread/rollback", {
-          threadId: newThreadId,
-          turnCount: dropCount,
-        });
-      }
-
-      return { sessionId: newThreadId };
-    } finally {
-      await runtime.cleanup().catch(() => undefined);
+      return;
     }
+    await withCodexAppServer(request, async (client) => {
+      await Promise.race([
+        client.request("turn/interrupt", { threadId, turnId }),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error("codex turn/interrupt timed out")),
+            3_000,
+          ),
+        ),
+      ]).catch((error) => {
+        debugCodex(
+          "attachAbort runId=%s turn/interrupt failed: %o",
+          request.runId,
+          error,
+        );
+      });
+    });
   }
-}
 
-/**
- * Build a minimal Codex runtime for one-off RPC calls like `forkAt`.
- *
- * Same contract as `execute()`: agent-config stays out of this path.
- * The caller is expected to have run `agent.setup()` already so the
- * app-server is up and the codex layout exists on disk; this function
- * just dials the app-server / spawns the local binary using the same
- * spawn-context the real run would.
- */
-async function createCodexForkRuntime(
-  options: AgentOptions<"codex">,
-): Promise<CodexRuntime> {
-  const syntheticRequest: AgentExecutionRequest<"codex"> = {
-    runId: `fork-${Date.now()}`,
-    provider: AgentProvider.Codex,
-    options,
-    run: { input: "" },
-  };
-  return createRuntime(syntheticRequest, []);
+  /**
+   * Stateless message injection. Uses `request.sessionId` as the codex
+   * threadId and starts a fresh turn against it via `turn/start`.
+   */
+  async attachSendMessage(
+    request: AgentAttachRequest<"codex">,
+    content: UserContent,
+  ): Promise<void> {
+    const threadId = request.sessionId;
+    if (!threadId) {
+      throw new Error(
+        `Cannot attachSendMessage to codex run ${request.runId}: sessionId (threadId) is required.`,
+      );
+    }
+    const parts = normalizeUserInput(content);
+    const text = joinTextParts(
+      parts.filter(
+        (part): part is Extract<typeof part, { type: "text" }> =>
+          part.type === "text",
+      ),
+    );
+    const inputItems: Array<Record<string, unknown>> = [];
+    if (text.trim().length > 0) {
+      inputItems.push({ type: "text", text, text_elements: [] });
+    }
+
+    await withCodexAppServer(request, async (client) => {
+      await client.request("turn/start", {
+        threadId,
+        input: inputItems,
+        approvalPolicy: "never",
+        model: null,
+        effort: null,
+        outputSchema: null,
+      });
+    });
+  }
 }

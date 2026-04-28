@@ -212,29 +212,60 @@ export interface AgentExecutionRequest<
 }
 
 /**
- * Request to truncate a session at a specific message and produce a forked
- * sessionId that can be passed to `Agent.stream({ resumeSessionId })`.
+ * Stateless attach request used by {@link Agent.attach} to issue control
+ * commands (abort, sendMessage) against a run that lives on a different
+ * Twill instance.
  *
- * Each provider interprets `messageId` natively:
- * - claude-code: a user message UUID from the session JSONL transcript
- * - codex: a turn id (returned in `turn/started` notifications)
- * - open-code: a server-generated message id (from `message.updated` SSE)
- *
- * The fork drops the message at `messageId` and everything after it. The
- * caller is then expected to start a new run with `resumeSessionId` set to
- * the returned sessionId, sending an edited input that effectively replaces
- * the dropped message.
+ * The attach call dials the in-sandbox provider server directly via
+ * `sandbox.getPreviewLink(...)` — no shared in-memory state, no broker.
+ * The originating instance still owns the run's event stream and reacts
+ * naturally to whatever the provider emits as a consequence of the
+ * attached command (e.g. `turn/aborted` for codex, message events for
+ * claude-code/opencode).
  */
-export interface AgentForkRequest<
+export interface AgentAttachRequest<
   P extends AgentProviderName = AgentProviderName,
 > {
-  sessionId: string;
-  messageId: string;
-  options: AgentOptions<P>;
+  provider: P;
+  sandbox: Sandbox;
+  /**
+   * The {@link AgentRunConfig.runId} the originating instance used in
+   * `agent.stream({ runId, ... })`. Required for claude-code (the relay
+   * keys channels by runId) and useful as an idempotency / log id for
+   * the other providers.
+   */
+  runId: string;
+  /**
+   * Provider-native session id captured from {@link AgentRun.sessionIdReady}.
+   *
+   * - codex: the threadId
+   * - opencode: the sessionId
+   * - claude-code: the claude session uuid (optional — runId is the
+   *   primary key inside the relay)
+   */
+  sessionId?: string;
+  /**
+   * Codex only: the in-flight turn id, captured by the originating
+   * caller from the {@link NormalizedAgentEvent} `message.started`
+   * event (whose `messageId` is the codex turnId). `attachAbort` uses
+   * it for `turn/interrupt`. When omitted the codex attach is a no-op.
+   *
+   * The SDK does not persist this itself — bookkeeping it across
+   * processes is the caller's responsibility (e.g. Redis), since
+   * sandbox-side files don't compose well under concurrency.
+   */
+  turnId?: string;
 }
 
-export interface AgentForkResult {
-  sessionId: string;
+/**
+ * Thin handle returned by {@link Agent.attach}. Methods are short-lived:
+ * each call opens a fresh transport to the in-sandbox server, performs
+ * the operation, and tears the transport down. There is no "close" —
+ * the handle holds no resources between calls.
+ */
+export interface AttachedRun {
+  abort(): Promise<void>;
+  sendMessage(content: UserContent): Promise<void>;
 }
 
 export interface AgentProviderAdapter<
@@ -260,5 +291,18 @@ export interface AgentProviderAdapter<
     request: AgentExecutionRequest<P>,
     sink: AgentRunSink,
   ): Promise<() => Promise<void> | void>;
-  forkAt(request: AgentForkRequest<P>): Promise<AgentForkResult>;
+  /**
+   * Stateless abort. Dial the in-sandbox provider server, issue the
+   * provider's "interrupt the in-flight turn" primitive, close.
+   */
+  attachAbort(request: AgentAttachRequest<P>): Promise<void>;
+  /**
+   * Stateless message injection. Dial the in-sandbox provider server,
+   * append `content` as a new user turn against the existing session,
+   * close.
+   */
+  attachSendMessage(
+    request: AgentAttachRequest<P>,
+    content: UserContent,
+  ): Promise<void>;
 }
