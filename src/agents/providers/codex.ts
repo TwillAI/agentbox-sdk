@@ -597,9 +597,10 @@ async function ensureCodexLoginViaConfig(
   if (openAiBaseUrl) {
     extraEnv.OPENAI_BASE_URL = openAiBaseUrl;
   }
-  // `CODEX_HOME` is inherited from `target.env` so the login token
-  // lands in our layout's `<codexDir>/auth.json` (where the app-server
-  // will look for it), not in the user's actual `~/.codex/`. We have
+  // `CODEX_HOME` is injected by `target.runCommand` (from the layout
+  // env) so the login token lands in our layout's `<codexDir>/auth.json`
+  // (where the app-server will look for it), not in the user's actual
+  // `~/.codex/`. We have
   // to `mkdir -p` first because sandbox layouts only get materialized
   // by the subsequent tar-extract during `applyDifferentialSetup`, and
   // `codex login` would otherwise fail trying to write `auth.json`

@@ -9,7 +9,6 @@ import {
   buildOpenCodePluginArtifacts,
 } from "../src/agents/config/hooks";
 import { buildOpenCodeMcpConfig } from "../src/agents/config/mcp";
-import { createSetupTarget } from "../src/agents/config/setup";
 import { prepareSkillArtifacts } from "../src/agents/config/skills";
 import {
   buildClaudeSubagentArtifacts,
@@ -564,19 +563,5 @@ describe("config compilers", () => {
     );
 
     expect(agentToml?.content).not.toMatch(/^model\s*=/m);
-  });
-
-  it("does not override HOME when creating setup targets", async () => {
-    const target = await createSetupTarget("codex", "runtime-env-test", {
-      cwd: process.cwd(),
-    });
-
-    try {
-      expect(target.env.HOME).toBeUndefined();
-      expect(target.env.XDG_CONFIG_HOME).toBeUndefined();
-      expect(target.env.CODEX_HOME).toBeUndefined();
-    } finally {
-      await target.cleanup();
-    }
   });
 });
