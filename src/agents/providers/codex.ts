@@ -9,8 +9,12 @@ import {
 import {
   AgentProvider,
   type AgentExecutionRequest,
+  type AgentForkRequest,
+  type AgentForkResult,
+  type AgentOptions,
   type AgentProviderAdapter,
   type AgentRunSink,
+  type AgentSetupRequest,
   type UserContent,
 } from "../types";
 import { SandboxProvider } from "../../sandboxes/types";
@@ -25,10 +29,11 @@ import {
 import { assertCommandsSupported } from "../config/commands";
 import { assertHooksSupported, buildCodexHooksFile } from "../config/hooks";
 import { buildCodexConfigToml } from "../config/mcp";
-import { createRuntimeTarget } from "../config/runtime";
-import { installSkills, prepareSkillArtifacts } from "../config/skills";
+import { agentboxRoot, createSetupTarget } from "../config/setup";
+import { applyDifferentialSetup } from "../config/setup-manifest";
+import { prepareSkillArtifacts } from "../config/skills";
 import { buildCodexSubagentArtifacts } from "../config/subagents";
-import type { PreparedSkill, RuntimeTarget } from "../config/types";
+import type { SetupTarget } from "../config/types";
 import {
   connectJsonRpcWebSocket,
   JsonRpcLineClient,
@@ -37,6 +42,8 @@ import { linesFromNodeStream, spawnCommand } from "../transports/spawn";
 import { linesFromTextChunks } from "../../shared/streams";
 import { shellQuote } from "../../shared/shell";
 import { sleep } from "../../shared/network";
+import { extractCodexCostData } from "../cost";
+import { debugCodex, time } from "../../shared/debug";
 
 type CodexNotification = {
   id?: number;
@@ -61,6 +68,22 @@ type CodexRpcClient = {
   messages(): AsyncIterable<CodexNotification>;
   bindThread?(threadId: string): void;
 };
+
+/**
+ * Path to the on-disk `.codex` config directory agentbox uses for a
+ * given run. Resolves to `/tmp/agentbox/codex/.codex` in a sandbox, or
+ * `<os.tmpdir()>/agentbox-codex/.codex` on the host.
+ *
+ * Setup writes config.toml, hooks.json, sub-agent .toml files, and
+ * skills/ under this directory. Execute / forkAt point the codex CLI
+ * at it via `CODEX_HOME`.
+ */
+function codexConfigDir(options: AgentOptions<"codex">): string {
+  return path.join(
+    agentboxRoot(AgentProvider.Codex, Boolean(options.sandbox)),
+    ".codex",
+  );
+}
 
 const REMOTE_CODEX_APP_SERVER_PORT = 43181;
 const REMOTE_CODEX_APP_SERVER_ID = "shared-app-server";
@@ -143,15 +166,42 @@ function buildTurnSandboxPolicy(
 function buildTurnCollaborationMode(
   request: AgentExecutionRequest<"codex">,
 ): Record<string, unknown> | undefined {
-  if (!request.run.systemPrompt) {
+  // The system prompt is per-RUN (in `AgentRunConfig`), so it can vary
+  // between runs even on a shared app-server. Pushing it through a
+  // per-turn collaboration override avoids re-spawning the app-server
+  // and keeps `execute()` independent of any setup-time config files.
+  const systemPrompt = request.run.systemPrompt;
+  if (!systemPrompt) {
     return undefined;
   }
 
   return {
     mode: "custom",
     settings: {
-      developer_instructions: request.run.systemPrompt,
+      developer_instructions: systemPrompt,
     },
+  };
+}
+
+export function buildCodexTurnStartParams(params: {
+  threadId: string;
+  inputItems: Array<Record<string, unknown>>;
+  request: AgentExecutionRequest<"codex">;
+  turnStartOverrides?: Record<string, unknown>;
+}): Record<string, unknown> {
+  const { threadId, inputItems, request, turnStartOverrides } = params;
+  const sandboxPolicy = buildTurnSandboxPolicy(request.options);
+  return {
+    threadId,
+    input: inputItems,
+    approvalPolicy: isInteractiveApproval(request.options)
+      ? "untrusted"
+      : "never",
+    ...(sandboxPolicy ? { sandboxPolicy } : {}),
+    ...(turnStartOverrides ?? {}),
+    model: request.run.model ?? null,
+    effort: request.run.reasoning ?? null,
+    outputSchema: null,
   };
 }
 
@@ -178,7 +228,13 @@ function shouldIgnoreCodexError(notification: CodexNotification): boolean {
 }
 
 function buildCodexCommandArgs(binary: string, args: string[]): string[] {
-  return ["-u", "CODEX_HOME", "-u", "XDG_CONFIG_HOME", binary, ...args];
+  // We want codex to read its config from our deterministic layout
+  // (`CODEX_HOME` is set by `SetupTarget` to `layout.codexDir`), so
+  // unlike older versions of this code we do NOT strip `CODEX_HOME`
+  // before launching. We still strip `XDG_CONFIG_HOME` because some
+  // sandbox base images set it to a system path that codex would
+  // otherwise prefer over `CODEX_HOME`.
+  return ["-u", "XDG_CONFIG_HOME", binary, ...args];
 }
 
 function toNormalizedCodexEvents(
@@ -192,7 +248,41 @@ function toNormalizedCodexEvents(
   };
 
   if (notification.method === "turn/started") {
-    return [createNormalizedEvent("message.started", base)];
+    const turn = notification.params?.turn as
+      | Record<string, unknown>
+      | undefined;
+    const turnId =
+      typeof turn?.id === "string" ? (turn.id as string) : undefined;
+    return [
+      createNormalizedEvent(
+        "message.started",
+        base,
+        turnId ? { messageId: turnId } : undefined,
+      ),
+    ];
+  }
+
+  if (notification.method === "item/agentMessage/delta") {
+    const delta =
+      typeof notification.params?.delta === "string"
+        ? notification.params.delta
+        : "";
+    return delta ? [createNormalizedEvent("text.delta", base, { delta })] : [];
+  }
+
+  if (
+    notification.method === "item/reasoning/summaryTextDelta" ||
+    notification.method === "item/reasoning/textDelta"
+  ) {
+    const delta =
+      typeof notification.params?.delta === "string"
+        ? notification.params.delta
+        : typeof notification.params?.text === "string"
+          ? notification.params.text
+          : "";
+    return delta
+      ? [createNormalizedEvent("reasoning.delta", base, { delta })]
+      : [];
   }
 
   if (notification.method === "item/completed") {
@@ -416,27 +506,6 @@ function toCodexApprovalDecision(
   return "accept";
 }
 
-function buildCodexSkillInputItems(
-  skills: PreparedSkill[],
-): Array<Record<string, unknown>> {
-  return skills.map((skill) => ({
-    type: "skill",
-    name: skill.name,
-    path: skill.skillFilePath,
-  }));
-}
-
-function buildCodexPromptText(prompt: string, skills: PreparedSkill[]): string {
-  if (skills.length === 0) {
-    return prompt;
-  }
-
-  return [
-    `Available skills for this run: ${skills.map((skill) => `$${skill.name}`).join(", ")}.`,
-    prompt,
-  ].join("\n\n");
-}
-
 function codexImageExtension(mediaType: string): string {
   switch (mediaType) {
     case "image/gif":
@@ -452,8 +521,19 @@ function codexImageExtension(mediaType: string): string {
   }
 }
 
+/**
+ * Materialize a per-turn image attachment to disk so codex can
+ * reference it by path. Per-RUN concern — this is part of the user's
+ * input for the current turn, not agent-config — so it lives on the
+ * execute path. We dispatch on `options.sandbox`:
+ *
+ *  - **Sandbox**: stage the base64 payload via `sandbox.uploadAndRun`
+ *    so the upload + decode + cleanup happen in a single RPC.
+ *  - **Local host**: decode in JS and write the binary directly with
+ *    `fs.writeFile`, avoiding a shell round-trip entirely.
+ */
 async function materializeCodexImage(
-  target: RuntimeTarget,
+  options: AgentOptions<"codex">,
   part: ResolvedImagePart,
   index: number,
 ): Promise<string> {
@@ -461,45 +541,50 @@ async function materializeCodexImage(
     return part.source.url;
   }
 
+  // Per-turn image attachments live alongside the codex layout root,
+  // not inside `<codexDir>` itself, so codex doesn't try to load them
+  // as discoverable config artifacts.
+  const root = agentboxRoot(AgentProvider.Codex, Boolean(options.sandbox));
   const imagePath = path.join(
-    target.layout.rootDir,
+    root,
     "inputs",
     `codex-image-${index}${codexImageExtension(part.mediaType)}`,
   );
-  const encodedPath = `${imagePath}.b64`;
 
-  await target.writeArtifact({
-    path: encodedPath,
-    content: part.source.data,
-  });
-  await target.runCommand(
-    [
-      `mkdir -p ${shellQuote(path.posix.dirname(imagePath))}`,
-      `(base64 --decode < ${shellQuote(encodedPath)} > ${shellQuote(imagePath)} || base64 -D < ${shellQuote(encodedPath)} > ${shellQuote(imagePath)})`,
-      `rm -f ${shellQuote(encodedPath)}`,
-    ].join(" && "),
-  );
+  if (options.sandbox) {
+    const encodedPath = `${imagePath}.b64`;
+    await options.sandbox.uploadAndRun(
+      [{ path: encodedPath, content: part.source.data }],
+      [
+        `mkdir -p ${shellQuote(path.posix.dirname(imagePath))}`,
+        `(base64 --decode < ${shellQuote(encodedPath)} > ${shellQuote(imagePath)} || base64 -D < ${shellQuote(encodedPath)} > ${shellQuote(imagePath)})`,
+        `rm -f ${shellQuote(encodedPath)}`,
+      ].join(" && "),
+      { cwd: options.cwd, env: options.env },
+    );
+    return imagePath;
+  }
 
+  const fs = await import("node:fs/promises");
+  await fs.mkdir(path.dirname(imagePath), { recursive: true });
+  await fs.writeFile(imagePath, Buffer.from(part.source.data, "base64"));
   return imagePath;
 }
 
-function resolveCodexOpenAiBaseUrl(
-  request: AgentExecutionRequest<"codex">,
+function resolveCodexOpenAiBaseUrlFromOptions(
+  options: AgentOptions<"codex">,
 ): string | undefined {
-  return (
-    request.options.env?.OPENAI_BASE_URL ??
-    request.options.provider?.env?.OPENAI_BASE_URL
-  );
+  return options.env?.OPENAI_BASE_URL ?? options.provider?.env?.OPENAI_BASE_URL;
 }
 
-async function ensureCodexLogin(
-  request: AgentExecutionRequest<"codex">,
-  target: RuntimeTarget,
+async function ensureCodexLoginViaConfig(
+  request: AgentSetupRequest<"codex">,
+  target: SetupTarget,
 ): Promise<void> {
+  const options = request.options;
   const openAiApiKey =
-    request.options.env?.OPENAI_API_KEY ??
-    request.options.provider?.env?.OPENAI_API_KEY;
-  const openAiBaseUrl = resolveCodexOpenAiBaseUrl(request);
+    options.env?.OPENAI_API_KEY ?? options.provider?.env?.OPENAI_API_KEY;
+  const openAiBaseUrl = resolveCodexOpenAiBaseUrlFromOptions(options);
 
   // Best-effort login. If OPENAI_API_KEY is exposed via the agent options, the
   // sandbox's base env, or the host process env, the shell guard below detects
@@ -513,8 +598,24 @@ async function ensureCodexLogin(
   if (openAiBaseUrl) {
     extraEnv.OPENAI_BASE_URL = openAiBaseUrl;
   }
+  // `CODEX_HOME` is inherited from `target.env` so the login token
+  // lands in our layout's `<codexDir>/auth.json` (where the app-server
+  // will look for it), not in the user's actual `~/.codex/`. We have
+  // to `mkdir -p` first because sandbox layouts only get materialized
+  // by the subsequent tar-extract during `applyDifferentialSetup`, and
+  // `codex login` would otherwise fail trying to write `auth.json`
+  // into a non-existent directory.
+  //
+  // We deliberately do NOT silence stdout/stderr — if `codex login`
+  // fails, the sandbox surfaces the error and the operator can see why
+  // (bad key, network, missing binary, etc.) instead of a bare
+  // "exit 1".
   await target.runCommand(
-    'if [ -z "${OPENAI_API_KEY:-}" ]; then exit 0; fi; printenv OPENAI_API_KEY | env -u CODEX_HOME -u XDG_CONFIG_HOME codex login --with-api-key >/dev/null 2>&1',
+    [
+      'if [ -z "${OPENAI_API_KEY:-}" ]; then exit 0; fi',
+      'mkdir -p "${CODEX_HOME:-$HOME/.codex}"',
+      "printenv OPENAI_API_KEY | env -u XDG_CONFIG_HOME codex login --with-api-key",
+    ].join("; "),
     Object.keys(extraEnv).length > 0 ? extraEnv : undefined,
   );
 }
@@ -529,110 +630,128 @@ async function connectRemoteCodexAppServer(
   url: string,
   headers: Record<string, string> = {},
 ) {
-  const startedAt = Date.now();
-  let lastError: unknown;
+  return time(debugCodex, "connectRemoteCodexAppServer", async () => {
+    const startedAt = Date.now();
+    let attempt = 0;
+    let lastError: unknown;
 
-  while (Date.now() - startedAt < 30_000) {
-    try {
-      return await connectJsonRpcWebSocket(url, { headers });
-    } catch (error) {
-      lastError = error;
-      await sleep(250);
+    while (Date.now() - startedAt < 30_000) {
+      attempt++;
+      try {
+        const conn = await connectJsonRpcWebSocket(url, { headers });
+        if (attempt > 1) {
+          debugCodex("connected after %d attempt(s)", attempt);
+        }
+        return conn;
+      } catch (error) {
+        lastError = error;
+        await sleep(250);
+      }
     }
-  }
 
-  throw (
-    lastError ?? new Error(`Could not connect to Codex app-server at ${url}.`)
-  );
+    throw (
+      lastError ?? new Error(`Could not connect to Codex app-server at ${url}.`)
+    );
+  });
 }
 
-async function waitForInternalCodexReady(
-  sandbox: NonNullable<AgentExecutionRequest<"codex">["options"]["sandbox"]>,
-  port: number,
-  cwd: string,
-  env: Record<string, string>,
-): Promise<void> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < 60_000) {
-    const result = await sandbox
-      .run(`curl -fsS http://127.0.0.1:${port}/readyz >/dev/null`, {
-        cwd,
-        env,
-        timeoutMs: 5_000,
-      })
-      .catch(() => undefined);
-    if (result?.exitCode === 0) {
-      return;
-    }
-    await sleep(250);
-  }
-  throw new Error(`Codex internal app-server did not become ready on ${port}.`);
-}
-
-async function createRuntime(
-  request: AgentExecutionRequest<"codex">,
-  inputParts: Awaited<ReturnType<typeof validateProviderUserInput>>,
-): Promise<CodexRuntime> {
+/**
+ * Sandbox-side preparation for codex.
+ *
+ * `setup()` is the ONLY place agent-config (skills, commands, MCPs,
+ * hooks, sub-agents) is read. All of it lands on disk under
+ * `target.layout.codexDir` so the codex CLI auto-discovers it on the
+ * next launch and `execute()` doesn't have to thread any of it through
+ * the wire protocol.
+ *
+ * Side effects (all idempotent):
+ *   1. `codex login` (writes `<codexDir>/auth.json` if missing).
+ *   2. Upload artifacts: mcp/hook/sub-agent/skill files + `config.toml`
+ *      with feature flags (`skills`, `multi_agent`, `codex_hooks`) and
+ *      static `openai_base_url` baked in.
+ *   3. For remote sandboxes, ensure the codex app-server is running
+ *      on `REMOTE_CODEX_APP_SERVER_PORT` (probe + spawn on cold path).
+ *
+ * No system-prompt file is written: the system prompt is per-RUN
+ * (`AgentRunConfig`) and threaded through the per-turn collaboration
+ * mode override in `execute()` instead.
+ */
+async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
   const options = request.options;
+  const provider = request.provider;
+  const hooks = assertHooksSupported(provider, options);
+  assertCommandsSupported(provider, options.commands);
+
   const usesRemoteWebSocket =
     options.sandbox && options.sandbox.provider !== SandboxProvider.LocalDocker;
-  const hooks = assertHooksSupported(request.provider, options);
-  assertCommandsSupported(request.provider, options.commands);
+
+  // Build everything that goes on disk in one place. The same
+  // `buildCodexConfigToml` powers both modes; only WHERE we write the
+  // artifacts (sharedTarget vs target) and whether we additionally
+  // launch the remote app-server changes.
+  function buildArtifactsFor(layoutTarget: SetupTarget): {
+    artifacts: Array<{ path: string; content: string; executable?: boolean }>;
+    installCommands: string[];
+  } {
+    const { artifacts: subAgentArtifacts, agentSections } =
+      buildCodexSubagentArtifacts(options.subAgents, layoutTarget.layout);
+    const hooksFile = buildCodexHooksFile(hooks);
+    const enableMultiAgent = (options.subAgents?.length ?? 0) > 0;
+    const enableSkills = (options.skills?.length ?? 0) > 0;
+    const openAiBaseUrl = resolveCodexOpenAiBaseUrlFromOptions(options);
+
+    const configToml = buildCodexConfigToml({
+      mcps: options.mcps,
+      agentSections,
+      enableHooks: Boolean(hooksFile),
+      enableSkills,
+      enableMultiAgent,
+      openAiBaseUrl,
+    });
+
+    const artifacts: Array<{
+      path: string;
+      content: string;
+      executable?: boolean;
+    }> = [...subAgentArtifacts];
+
+    if (configToml) {
+      artifacts.push({
+        path: path.join(layoutTarget.layout.codexDir, "config.toml"),
+        content: configToml,
+      });
+    }
+    if (hooksFile) {
+      artifacts.push({
+        path: path.join(layoutTarget.layout.codexDir, "hooks.json"),
+        content: JSON.stringify(hooksFile, null, 2),
+      });
+    }
+
+    return { artifacts, installCommands: [] };
+  }
 
   if (usesRemoteWebSocket && options.sandbox) {
     const sandbox = options.sandbox;
-    await sandbox.openPort(REMOTE_CODEX_APP_SERVER_PORT);
-    const sharedTarget = await createRuntimeTarget(
-      request.provider,
+    const sharedTarget = await createSetupTarget(
+      provider,
       REMOTE_CODEX_APP_SERVER_ID,
       options,
     );
-    await ensureCodexLogin(request, sharedTarget);
+    const target = await createSetupTarget(provider, "shared-setup", options);
     const env = compactEnv({
       ...(options.env ?? {}),
       ...sharedTarget.env,
       ...(options.provider?.env ?? {}),
     });
-    const serverCwd = sharedTarget.layout.rootDir;
-    const previewUrl = await sandbox.getPreviewLink(
-      REMOTE_CODEX_APP_SERVER_PORT,
+
+    await time(debugCodex, "ensureCodexLogin", () =>
+      ensureCodexLoginViaConfig(request, sharedTarget),
     );
-    const {
-      artifacts: subAgentArtifacts,
-      agentSections,
-      enableMultiAgent,
-    } = buildCodexSubagentArtifacts(options.subAgents, sharedTarget.layout);
 
-    const serverArtifacts = [...subAgentArtifacts];
-    const hooksFile = buildCodexHooksFile(hooks);
-    const configToml = buildCodexConfigToml(
-      options.mcps,
-      agentSections,
-      Boolean(hooksFile),
-    );
-    if (configToml) {
-      serverArtifacts.push({
-        path: path.join(sharedTarget.layout.codexDir, "config.toml"),
-        content: configToml,
-      });
-    }
-    if (hooksFile) {
-      serverArtifacts.push({
-        path: path.join(sharedTarget.layout.codexDir, "hooks.json"),
-        content: JSON.stringify(hooksFile, null, 2),
-      });
-    }
+    const { artifacts: serverArtifacts } = buildArtifactsFor(sharedTarget);
+    await applyDifferentialSetup(sharedTarget, serverArtifacts, []);
 
-    for (const artifact of serverArtifacts) {
-      await sharedTarget.writeArtifact(artifact);
-    }
-
-    const configArgs: string[] = [];
-    configArgs.push("-c", `features.multi_agent=${enableMultiAgent}`);
-    const openAiBaseUrl = resolveCodexOpenAiBaseUrl(request);
-    if (openAiBaseUrl) {
-      configArgs.push("-c", `openai_base_url=${JSON.stringify(openAiBaseUrl)}`);
-    }
     const binary = options.provider?.binary ?? "codex";
     const pidFilePath = path.posix.join(
       sharedTarget.layout.rootDir,
@@ -642,237 +761,143 @@ async function createRuntime(
       sharedTarget.layout.rootDir,
       "codex-app-server.log",
     );
-    const launchResult = await sandbox.run(
-      [
-        `mkdir -p ${shellQuote(sharedTarget.layout.rootDir)}`,
-        `if curl -fsS http://127.0.0.1:${REMOTE_CODEX_APP_SERVER_PORT}/readyz >/dev/null 2>&1; then exit 0; fi`,
-        `if [ -f ${shellQuote(pidFilePath)} ]; then kill "$(cat ${shellQuote(pidFilePath)})" >/dev/null 2>&1 || true; rm -f ${shellQuote(pidFilePath)}; fi`,
-        `(${[
-          `nohup ${[
-            "env",
-            ...buildCodexCommandArgs(binary, [
-              ...configArgs,
-              "app-server",
-              "--listen",
-              `ws://0.0.0.0:${REMOTE_CODEX_APP_SERVER_PORT}`,
-            ]),
-          ]
-            .map(shellQuote)
-            .join(" ")} > ${shellQuote(logFilePath)} 2>&1 &`,
-          `echo $! > ${shellQuote(pidFilePath)}`,
-        ].join(" ")})`,
-      ].join(" && "),
-      {
-        cwd: serverCwd,
-        env,
-      },
+    const serverCwd = sharedTarget.layout.rootDir;
+    const launchResult = await time(
+      debugCodex,
+      "launch app-server (probe + spawn-if-cold)",
+      () =>
+        sandbox.run(
+          [
+            `mkdir -p ${shellQuote(sharedTarget.layout.rootDir)}`,
+            `if curl -fsS http://127.0.0.1:${REMOTE_CODEX_APP_SERVER_PORT}/readyz >/dev/null 2>&1; then exit 0; fi`,
+            `if [ -f ${shellQuote(pidFilePath)} ]; then kill "$(cat ${shellQuote(pidFilePath)})" >/dev/null 2>&1 || true; rm -f ${shellQuote(pidFilePath)}; fi`,
+            `(${[
+              `nohup ${[
+                "env",
+                ...buildCodexCommandArgs(binary, [
+                  "app-server",
+                  "--listen",
+                  `ws://0.0.0.0:${REMOTE_CODEX_APP_SERVER_PORT}`,
+                ]),
+              ]
+                .map(shellQuote)
+                .join(" ")} > ${shellQuote(logFilePath)} 2>&1 &`,
+              `echo $! > ${shellQuote(pidFilePath)}`,
+            ].join(" ")})`,
+          ].join(" && "),
+          {
+            cwd: serverCwd,
+            env,
+          },
+        ),
     );
     if (launchResult.exitCode !== 0) {
       throw new Error(
         `Could not start Codex app-server: ${launchResult.combinedOutput || launchResult.stderr}`,
       );
     }
-    await waitForInternalCodexReady(
-      sandbox,
-      REMOTE_CODEX_APP_SERVER_PORT,
-      serverCwd,
-      env,
-    );
 
-    const target = await createRuntimeTarget(
-      request.provider,
-      request.runId,
-      options,
-    );
+    // Skills land on the per-run `target` layout (not the shared
+    // app-server one) because the skills CLI is allowed to mutate
+    // sandboxed paths. The skill files end up at
+    // `<codexDir>/skills/<name>/SKILL.md` which codex auto-discovers.
     try {
-      const {
-        artifacts: skillArtifacts,
-        installCommands,
-        preparedSkills,
-      } = await prepareSkillArtifacts(
-        request.provider,
-        options.skills,
-        target.layout,
-      );
-
-      for (const artifact of skillArtifacts) {
-        await target.writeArtifact(artifact);
-      }
-      await installSkills(target, installCommands);
-
-      const textPrompt = joinTextParts(
-        inputParts.filter(
-          (part): part is Extract<typeof part, { type: "text" }> =>
-            part.type === "text",
-        ),
-      );
-      const codexPromptText = buildCodexPromptText(textPrompt, preparedSkills);
-      const inputItems: Array<Record<string, unknown>> = [];
-
-      if (codexPromptText.trim().length > 0) {
-        inputItems.push({
-          type: "text",
-          text: codexPromptText,
-          text_elements: [],
-        });
-      }
-
-      inputItems.push(
-        ...(await mapToCodexPromptParts(inputParts, async (part, index) =>
-          materializeCodexImage(target, part, index),
-        )),
-      );
-      inputItems.push(...buildCodexSkillInputItems(preparedSkills));
-
-      const transport = await connectRemoteCodexAppServer(
-        toRemoteCodexWebSocketUrl(previewUrl),
-        sandbox.previewHeaders,
-      );
-      return {
-        source: transport.source,
-        writeLine: transport.send,
-        cleanup: async () => {
-          await transport?.close().catch(() => undefined);
-          await target.cleanup().catch(() => undefined);
-        },
-        raw: {
-          transport: transport.raw,
-          previewUrl,
-          port: REMOTE_CODEX_APP_SERVER_PORT,
-          serverLayout: sharedTarget.layout,
-          layout: target.layout,
-        },
-        inputItems,
-        turnStartOverrides: buildTurnCollaborationMode(request),
-      };
+      const { artifacts: skillArtifacts, installCommands } =
+        await prepareSkillArtifacts(provider, options.skills, target.layout);
+      await applyDifferentialSetup(target, skillArtifacts, installCommands);
     } catch (error) {
       await target.cleanup().catch(() => undefined);
       throw error;
     }
+
+    return;
   }
 
-  const target = await createRuntimeTarget(
-    request.provider,
-    request.runId,
-    options,
-  );
+  // Local mode: everything goes on the same target.
+  const target = await createSetupTarget(provider, "shared-setup", options);
   try {
-    await ensureCodexLogin(request, target);
+    await ensureCodexLoginViaConfig(request, target);
   } catch (error) {
     await target.cleanup().catch(() => undefined);
     throw error;
   }
+
+  const { artifacts: skillArtifacts, installCommands } =
+    await prepareSkillArtifacts(provider, options.skills, target.layout);
+  const { artifacts: configArtifacts } = buildArtifactsFor(target);
+
+  await applyDifferentialSetup(
+    target,
+    [...skillArtifacts, ...configArtifacts],
+    installCommands,
+  );
+}
+
+async function createRuntime(
+  request: AgentExecutionRequest<"codex">,
+  inputParts: Awaited<ReturnType<typeof validateProviderUserInput>>,
+): Promise<CodexRuntime> {
+  const options = request.options;
+  // Spawn context — constants only. `setup()` already wrote
+  // config.toml, hooks.json, agents/, skills/ under `codexDir`; the
+  // codex CLI auto-discovers them via `CODEX_HOME`.
+  const codexDir = codexConfigDir(options);
   const env = compactEnv({
     ...(options.env ?? {}),
-    ...target.env,
+    CODEX_HOME: codexDir,
     ...(options.provider?.env ?? {}),
   });
-  const runtimeCwd = target.layout.rootDir;
+  // The codex daemon launches with cwd=<root>. The thread it runs
+  // operates on whatever cwd the per-thread `thread/start` params
+  // specify, which is `options.cwd` set by the caller.
+  const runtimeCwd = path.dirname(codexDir);
+  const inputItems = await buildCodexInputItems(options, inputParts);
 
-  const {
-    artifacts: skillArtifacts,
-    installCommands,
-    preparedSkills,
-  } = await prepareSkillArtifacts(
-    request.provider,
-    options.skills,
-    target.layout,
-  );
-  const {
-    artifacts: subAgentArtifacts,
-    agentSections,
-    enableMultiAgent,
-  } = buildCodexSubagentArtifacts(options.subAgents, target.layout);
+  const usesRemoteWebSocket =
+    options.sandbox && options.sandbox.provider !== SandboxProvider.LocalDocker;
 
-  const artifacts = [...skillArtifacts, ...subAgentArtifacts];
-  const hooksFile = buildCodexHooksFile(hooks);
-  const configToml = buildCodexConfigToml(
-    options.mcps,
-    agentSections,
-    Boolean(hooksFile),
-  );
-  if (configToml) {
-    artifacts.push({
-      path: path.join(target.layout.codexDir, "config.toml"),
-      content: configToml,
-    });
-  }
-  if (hooksFile) {
-    artifacts.push({
-      path: path.join(target.layout.codexDir, "hooks.json"),
-      content: JSON.stringify(hooksFile, null, 2),
-    });
-  }
-
-  let instructionsFilePath: string | undefined;
-  if (request.run.systemPrompt) {
-    instructionsFilePath = path.join(
-      target.layout.codexDir,
-      "prompts",
-      "agentbox-system.md",
+  if (usesRemoteWebSocket && options.sandbox) {
+    const sandbox = options.sandbox;
+    const previewUrl = await time(debugCodex, "getPreviewLink app-server", () =>
+      sandbox.getPreviewLink(REMOTE_CODEX_APP_SERVER_PORT),
     );
-    artifacts.push({
-      path: instructionsFilePath,
-      content: request.run.systemPrompt,
-    });
-  }
 
-  for (const artifact of artifacts) {
-    await target.writeArtifact(artifact);
-  }
-  await installSkills(target, installCommands);
-
-  const configArgs: string[] = [];
-  if (instructionsFilePath) {
-    configArgs.push(
-      "-c",
-      `model_instructions_file=${JSON.stringify(instructionsFilePath)}`,
+    const transport = await connectRemoteCodexAppServer(
+      toRemoteCodexWebSocketUrl(previewUrl),
+      sandbox.previewHeaders,
     );
-  }
-  configArgs.push("-c", `features.multi_agent=${enableMultiAgent}`);
-  const openAiBaseUrl = resolveCodexOpenAiBaseUrl(request);
-  if (openAiBaseUrl) {
-    configArgs.push("-c", `openai_base_url=${JSON.stringify(openAiBaseUrl)}`);
-  }
-
-  const textPrompt = joinTextParts(
-    inputParts.filter(
-      (part): part is Extract<typeof part, { type: "text" }> =>
-        part.type === "text",
-    ),
-  );
-  const codexPromptText = buildCodexPromptText(textPrompt, preparedSkills);
-  const inputItems: Array<Record<string, unknown>> = [];
-
-  if (codexPromptText.trim().length > 0) {
-    inputItems.push({
-      type: "text",
-      text: codexPromptText,
-      text_elements: [],
-    });
+    debugCodex("★ codex transport established");
+    return {
+      source: transport.source,
+      writeLine: transport.send,
+      cleanup: async () => {
+        await transport?.close().catch(() => undefined);
+      },
+      raw: {
+        transport: transport.raw,
+        previewUrl,
+        port: REMOTE_CODEX_APP_SERVER_PORT,
+        codexDir,
+      },
+      inputItems,
+      turnStartOverrides: buildTurnCollaborationMode(request),
+    };
   }
 
-  inputItems.push(
-    ...(await mapToCodexPromptParts(inputParts, async (part, index) =>
-      materializeCodexImage(target, part, index),
-    )),
-  );
-  inputItems.push(...buildCodexSkillInputItems(preparedSkills));
+  // Local mode launches the codex binary fresh per execute call.
+  // Every config flag previously passed via `-c` (multi_agent, skills,
+  // openai_base_url, model_instructions_file) now lives in
+  // `config.toml` written by `setup()`, so the CLI args are
+  // spawn-context only.
+  const codexArgs = buildCodexCommandArgs(options.provider?.binary ?? "codex", [
+    "app-server",
+  ]);
 
   if (options.sandbox) {
-    const handle = await options.sandbox.runAsync(
-      [
-        "env",
-        ...buildCodexCommandArgs(options.provider?.binary ?? "codex", [
-          ...configArgs,
-          "app-server",
-        ]),
-      ],
-      {
-        cwd: runtimeCwd,
-        env,
-      },
-    );
+    const handle = await options.sandbox.runAsync(["env", ...codexArgs], {
+      cwd: runtimeCwd,
+      env,
+    });
 
     if (!handle.write) {
       throw new Error(
@@ -899,19 +924,16 @@ async function createRuntime(
       },
       cleanup: async () => {
         await handle.kill();
-        await target.cleanup();
       },
-      raw: { handle, layout: target.layout },
+      raw: { handle, codexDir },
       inputItems,
+      turnStartOverrides: buildTurnCollaborationMode(request),
     };
   }
 
   const processHandle = spawnCommand({
     command: "env",
-    args: buildCodexCommandArgs(options.provider?.binary ?? "codex", [
-      ...configArgs,
-      "app-server",
-    ]),
+    args: codexArgs,
     cwd: runtimeCwd,
     env: {
       ...process.env,
@@ -926,23 +948,70 @@ async function createRuntime(
     },
     cleanup: async () => {
       await processHandle.kill();
-      await target.cleanup();
     },
-    raw: { processHandle, layout: target.layout },
+    raw: { processHandle, codexDir },
     inputItems,
+    turnStartOverrides: buildTurnCollaborationMode(request),
   };
 }
 
+/**
+ * Build the per-turn `inputItems` array consumed by codex's
+ * `turn/start`. Carries only the user prompt and materialized image
+ * attachments — skill discovery is file-based (codex picks up
+ * `<CODEX_HOME>/skills/<name>/SKILL.md` at startup), so no per-turn
+ * skill input items are emitted here.
+ */
+async function buildCodexInputItems(
+  options: AgentOptions<"codex">,
+  inputParts: Awaited<ReturnType<typeof validateProviderUserInput>>,
+): Promise<Array<Record<string, unknown>>> {
+  const textPrompt = joinTextParts(
+    inputParts.filter(
+      (part): part is Extract<typeof part, { type: "text" }> =>
+        part.type === "text",
+    ),
+  );
+  const inputItems: Array<Record<string, unknown>> = [];
+
+  if (textPrompt.trim().length > 0) {
+    inputItems.push({
+      type: "text",
+      text: textPrompt,
+      text_elements: [],
+    });
+  }
+
+  inputItems.push(
+    ...(await mapToCodexPromptParts(inputParts, async (part, index) =>
+      materializeCodexImage(options, part, index),
+    )),
+  );
+
+  return inputItems;
+}
+
 export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
+  async setup(request: AgentSetupRequest<"codex">): Promise<void> {
+    await setupCodex(request);
+  }
+
   async execute(
     request: AgentExecutionRequest<"codex">,
     sink: AgentRunSink,
   ): Promise<() => Promise<void>> {
-    const inputParts = await validateProviderUserInput(
-      request.provider,
-      request.run.input,
+    const executeStartedAt = Date.now();
+    debugCodex("execute() start runId=%s", request.runId);
+    const inputParts = await time(debugCodex, "validateProviderUserInput", () =>
+      validateProviderUserInput(request.provider, request.run.input),
     );
-    const runtime = await createRuntime(request, inputParts);
+    // The system prompt is per-RUN and is delivered via the per-turn
+    // `buildTurnCollaborationMode` override; agent-config is on disk
+    // and discovered via `CODEX_HOME`. `createRuntime` does the wire
+    // dial / binary spawn from `request.options` directly.
+    const runtime = await time(debugCodex, "createRuntime", () =>
+      createRuntime(request, inputParts),
+    );
     sink.setRaw(runtime.raw);
     sink.emitEvent(
       createNormalizedEvent("run.started", {
@@ -996,7 +1065,9 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       await runtime.cleanup().catch(() => undefined);
     });
 
-    const sendTurn = async (content: UserContent) => {
+    const sendTurn = async (
+      content: UserContent,
+    ): Promise<{ messageId?: string }> => {
       if (!rootThreadId) {
         throw new Error("Cannot send message before thread is started.");
       }
@@ -1010,22 +1081,24 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
         inputItems.push({ type: "text", text, text_elements: [] });
       }
       pendingTurns++;
-      const sandboxPolicy = buildTurnSandboxPolicy(request.options);
-      await client.request<{ turn?: { id?: string } }>("turn/start", {
-        threadId: rootThreadId,
-        input: inputItems,
-        approvalPolicy: isInteractiveApproval(request.options)
-          ? "untrusted"
-          : "never",
-        ...(sandboxPolicy ? { sandboxPolicy } : {}),
-        model: request.run.model ?? null,
-        effort: null,
-        outputSchema: null,
-      });
+      const response = await client.request<{ turn?: { id?: string } }>(
+        "turn/start",
+        buildCodexTurnStartParams({
+          threadId: rootThreadId,
+          inputItems,
+          request,
+        }),
+      );
+      return {
+        ...(typeof response?.turn?.id === "string"
+          ? { messageId: response.turn.id }
+          : {}),
+      };
     };
 
     sink.onMessage(sendTurn);
 
+    const rawPayloads: Array<Record<string, unknown>> = [];
     const completion = new Promise<{
       text?: string;
       turnId?: string;
@@ -1034,8 +1107,18 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       let finalText = "";
 
       void (async () => {
+        let firstClientMessageLogged = false;
         for await (const message of client.messages()) {
+          if (!firstClientMessageLogged) {
+            firstClientMessageLogged = true;
+            debugCodex(
+              "★ first transport message (%dms since execute start) method=%s",
+              Date.now() - executeStartedAt,
+              message.method,
+            );
+          }
           const raw = toRawEvent(request.runId, message, message.method);
+          rawPayloads.push(message);
           sink.emitRaw(raw);
 
           if (
@@ -1135,6 +1218,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
         client.bindThread(threadResponse.thread.id);
       }
       sink.setSessionId(threadResponse.thread.id);
+      rawPayloads.push(threadResponse);
       sink.emitRaw(
         toRawEvent(
           request.runId,
@@ -1145,26 +1229,104 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
         ),
       );
 
-      const sandboxPolicy = buildTurnSandboxPolicy(request.options);
-      await client.request<{ turn?: { id?: string } }>("turn/start", {
-        threadId: threadResponse.thread.id,
-        input: runtime.inputItems,
-        approvalPolicy: isInteractiveApproval(request.options)
-          ? "untrusted"
-          : "never",
-        ...(sandboxPolicy ? { sandboxPolicy } : {}),
-        ...(runtime.turnStartOverrides ?? {}),
-        model: request.run.model ?? null,
-        effort: null,
-        outputSchema: null,
-      });
+      await client.request<{ turn?: { id?: string } }>(
+        "turn/start",
+        buildCodexTurnStartParams({
+          threadId: threadResponse.thread.id,
+          inputItems: runtime.inputItems,
+          request,
+          turnStartOverrides: runtime.turnStartOverrides,
+        }),
+      );
 
       const { text } = await completion;
-      sink.complete({ text });
+      debugCodex(
+        "★ run.completed (%dms since execute start) chars=%d",
+        Date.now() - executeStartedAt,
+        text?.length ?? 0,
+      );
+      sink.complete({ text, costData: extractCodexCostData(rawPayloads) });
     } finally {
       await runtime.cleanup().catch(() => undefined);
     }
 
     return async () => undefined;
   }
+
+  async forkAt(request: AgentForkRequest<"codex">): Promise<AgentForkResult> {
+    const runtime = await createCodexForkRuntime(request.options);
+    const client =
+      runtime.client ??
+      new JsonRpcLineClient<CodexNotification>(
+        runtime.source!,
+        runtime.writeLine!,
+      );
+
+    try {
+      if (!runtime.client) {
+        await client.request("initialize", {
+          clientInfo: {
+            title: "AgentBox",
+            name: "AgentBox",
+            version: "0.1.0",
+          },
+          capabilities: {
+            experimentalApi: true,
+          },
+        });
+        await client.notify("initialized", {});
+      }
+
+      const fork = await client.request<{ thread: { id: string } }>(
+        "thread/fork",
+        { threadId: request.sessionId },
+      );
+      const newThreadId = fork.thread.id;
+
+      const read = await client.request<{
+        thread: { turns?: Array<{ id?: string }> };
+      }>("thread/read", { threadId: newThreadId, includeTurns: true });
+      const turns = read.thread.turns ?? [];
+      const targetIdx = turns.findIndex(
+        (turn) => typeof turn.id === "string" && turn.id === request.messageId,
+      );
+      if (targetIdx < 0) {
+        throw new Error(
+          `Cannot fork codex thread ${request.sessionId}: turn ${request.messageId} not found.`,
+        );
+      }
+      const dropCount = turns.length - targetIdx;
+      if (dropCount > 0) {
+        await client.request("thread/rollback", {
+          threadId: newThreadId,
+          turnCount: dropCount,
+        });
+      }
+
+      return { sessionId: newThreadId };
+    } finally {
+      await runtime.cleanup().catch(() => undefined);
+    }
+  }
+}
+
+/**
+ * Build a minimal Codex runtime for one-off RPC calls like `forkAt`.
+ *
+ * Same contract as `execute()`: agent-config stays out of this path.
+ * The caller is expected to have run `agent.setup()` already so the
+ * app-server is up and the codex layout exists on disk; this function
+ * just dials the app-server / spawns the local binary using the same
+ * spawn-context the real run would.
+ */
+async function createCodexForkRuntime(
+  options: AgentOptions<"codex">,
+): Promise<CodexRuntime> {
+  const syntheticRequest: AgentExecutionRequest<"codex"> = {
+    runId: `fork-${Date.now()}`,
+    provider: AgentProvider.Codex,
+    options,
+    run: { input: "" },
+  };
+  return createRuntime(syntheticRequest, []);
 }

@@ -32,6 +32,7 @@ Run-time config must stay minimal:
 
 - `input`
 - `model`
+- `reasoning`
 - `systemPrompt`
 - `resumeSessionId`
 
@@ -61,18 +62,23 @@ Use `Sandbox` as the primary public abstraction.
 
 Keep the common surface stable:
 
+- `findOrProvision()` — attach to or create the underlying sandbox
 - `gitClone()`
 - `run()`
 - `runAsync()`
+- `uploadAndRun()`
 - `setSecret()` / `setSecrets()`
 - `list()`
 - `snapshot()`
 - `stop()`
 - `delete()`
+- `openPort()`
 - `getPreviewLink()`
 - `raw`
 
 Provider-specific settings belong under `provider`.
+
+Provisioning is **explicit**: `new Sandbox(...)` only stores config; the live sandbox is created or attached lazily when the caller invokes `findOrProvision()`. `run`, `runAsync`, `gitClone`, `uploadAndRun`, `getPreviewLink`, `snapshot`, etc. throw a clear error if `findOrProvision()` has not been called yet — they no longer auto-provision behind the caller's back. `openPort()` stays usable before provisioning so reserved ports can be staged at create time.
 
 ## Design Principles
 

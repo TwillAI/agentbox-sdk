@@ -9,6 +9,8 @@ const sandbox = new Sandbox(SandboxProvider.LocalDocker, {
   },
 });
 
+await sandbox.findOrProvision();
+
 const agent = new Agent(AgentProvider.ClaudeCode, {
   sandbox,
   cwd: "/workspace",
@@ -19,6 +21,8 @@ const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
 });
+
+await agent.setup();
 
 const run = agent.stream({
   model: "sonnet",

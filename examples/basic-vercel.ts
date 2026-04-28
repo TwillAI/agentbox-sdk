@@ -16,6 +16,8 @@ const sandbox = new Sandbox(SandboxProvider.Vercel, {
   },
 });
 
+await sandbox.findOrProvision();
+
 // Vercel sandboxes run under /vercel/sandbox by default and cannot use
 // an arbitrary workspace root like the other providers.
 await sandbox.gitClone({

@@ -8,10 +8,19 @@ import { shellQuote } from "../../shared/shell";
 import {
   AgentProvider,
   type AgentExecutionRequest,
+  type AgentForkRequest,
+  type AgentForkResult,
+  type AgentOptions,
   type AgentProviderAdapter,
   type AgentRunSink,
+  type AgentSetupRequest,
   type UserContent,
 } from "../types";
+import {
+  encodeClaudeCwd,
+  forkClaudeTranscript,
+  newClaudeSessionId,
+} from "./claude-code-transcript";
 import { SandboxProvider } from "../../sandboxes/types";
 import { shouldAutoApproveClaudeTools } from "../approval";
 import { mapToClaudeUserContent, validateProviderUserInput } from "../input";
@@ -20,11 +29,11 @@ import {
   buildClaudeCommandArtifacts,
 } from "../config/commands";
 import { buildClaudeHookSettings, assertHooksSupported } from "../config/hooks";
-import { buildClaudeMcpArtifact } from "../config/mcp";
-import { createRuntimeTarget } from "../config/runtime";
-import { installSkills, prepareSkillArtifacts } from "../config/skills";
-import { buildClaudeAgentsConfig } from "../config/subagents";
-import type { RuntimeTarget } from "../config/types";
+import { buildClaudeMcpConfig } from "../config/mcp";
+import { agentboxRoot, createSetupTarget } from "../config/setup";
+import { applyDifferentialSetup } from "../config/setup-manifest";
+import { prepareSkillArtifacts } from "../config/skills";
+import { buildClaudeSubagentArtifacts } from "../config/subagents";
 import {
   SharedSdkWsConnection,
   SdkWsServer,
@@ -32,33 +41,70 @@ import {
   type SdkWsTransport,
 } from "../transports/sdk-ws";
 import { spawnCommand } from "../transports/spawn";
-import type { AsyncCommandHandle, CommandResult } from "../../sandboxes";
+import { extractClaudeCostData } from "../cost";
+import { debugClaude, debugRelay, time } from "../../shared/debug";
 
-type ClaudeRuntime = {
-  transport: SdkWsTransport;
-  cleanup: () => Promise<void>;
-  raw: unknown;
-  initializeRequest?: Record<string, unknown>;
-};
+/**
+ * Path to the on-disk `.claude` config directory agentbox uses for a
+ * given run. Resolves to `/tmp/agentbox/claude-code/.claude` in a
+ * sandbox, or `<os.tmpdir()>/agentbox-claude-code/.claude` on the host.
+ *
+ * `setup()` writes settings, MCP config, sub-agent / skill / command
+ * files under this directory; `execute()` and `forkAt()` derive the
+ * same path independently and let the CLI auto-discover everything via
+ * `CLAUDE_CONFIG_DIR`. There is no setup → execute data channel.
+ */
+function claudeConfigDir(options: AgentOptions<"claude-code">): string {
+  return path.join(
+    agentboxRoot(AgentProvider.ClaudeCode, Boolean(options.sandbox)),
+    ".claude",
+  );
+}
 
-type SharedRemoteRelay = {
-  relayPort: number;
-  relayPath: string;
-  previewUrl: string;
-  handle?: AsyncCommandHandle;
-};
-
-type SharedRemoteHostConnection = {
-  previewUrl: string;
-  connection: SharedSdkWsConnection;
-};
+export function buildClaudeCliArgs(params: {
+  sdkUrl: string;
+  request: AgentExecutionRequest<"claude-code">;
+  /**
+   * `settingsPath` and `mcpConfigPath` are deterministic per-sandbox
+   * locations; `setup()` ensures both files exist (with empty
+   * placeholders if no hooks / no MCPs were configured), so `execute()`
+   * always passes both flags without inspecting any agent-config.
+   */
+  settingsPath: string;
+  mcpConfigPath: string;
+}): string[] {
+  const { sdkUrl, request, settingsPath, mcpConfigPath } = params;
+  const provider = request.options.provider;
+  return [
+    "--sdk-url",
+    sdkUrl,
+    "--print",
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "stream-json",
+    ...(provider?.verbose ? ["--verbose"] : []),
+    ...(request.run.model ? ["--model", request.run.model] : []),
+    ...(request.run.reasoning ? ["--effort", request.run.reasoning] : []),
+    ...(provider?.permissionMode
+      ? ["--permission-mode", provider.permissionMode]
+      : []),
+    ...(provider?.allowedTools?.length
+      ? ["--allowedTools", provider.allowedTools.join(",")]
+      : []),
+    ...(request.run.resumeSessionId ? ["-r", request.run.resumeSessionId] : []),
+    "--settings",
+    settingsPath,
+    "--mcp-config",
+    mcpConfigPath,
+    ...(provider?.args ?? []),
+    "-p",
+    "",
+  ];
+}
 
 const REMOTE_SDK_RELAY_PORT = 43180;
 const REMOTE_SDK_RELAY_PATH = "/tmp/agentbox/claude-code/relay.mjs";
-const sharedRemoteConnectionBySandbox = new WeakMap<
-  object,
-  Promise<SharedRemoteHostConnection>
->();
 
 function toRawEvent(
   runId: string,
@@ -115,6 +161,45 @@ function extractStreamDelta(message: SdkWsMessage): string {
   return "";
 }
 
+function extractThinkingDelta(message: SdkWsMessage): string {
+  const event = message.event as Record<string, unknown> | undefined;
+  const delta = event?.delta as Record<string, unknown> | undefined;
+  if (typeof delta?.thinking === "string") {
+    return delta.thinking;
+  }
+  if (typeof delta?.reasoning === "string") {
+    return delta.reasoning;
+  }
+  if (typeof event?.thinking === "string") {
+    return event.thinking;
+  }
+  if (typeof event?.reasoning === "string") {
+    return event.reasoning;
+  }
+  return "";
+}
+
+function extractAssistantThinking(message: SdkWsMessage): string {
+  const content = message.message as
+    | Array<Record<string, unknown>>
+    | Record<string, unknown>
+    | undefined;
+
+  const blocks = Array.isArray(content)
+    ? content
+    : content && Array.isArray(content.content)
+      ? (content.content as Array<Record<string, unknown>>)
+      : [];
+
+  return blocks
+    .filter((block) => block.type === "thinking" || block.type === "reasoning")
+    .map((block) =>
+      String(block.thinking ?? block.reasoning ?? block.text ?? ""),
+    )
+    .filter(Boolean)
+    .join("");
+}
+
 function createClaudePermissionEvent(
   request: AgentExecutionRequest<"claude-code">,
   message: SdkWsMessage,
@@ -136,113 +221,6 @@ function createClaudePermissionEvent(
       canRemember: false,
     },
   ) as PermissionRequestedEvent;
-}
-
-async function prepareClaudeRuntime(
-  request: AgentExecutionRequest<"claude-code">,
-): Promise<{
-  target: RuntimeTarget;
-  buildArgs: (sdkUrl: string) => string[];
-  env: Record<string, string>;
-  initializeRequest?: Record<string, unknown>;
-}> {
-  const options = request.options;
-  const provider = options.provider;
-  const target = await createRuntimeTarget(
-    request.provider,
-    request.runId,
-    options,
-  );
-
-  const hooks = assertHooksSupported(request.provider, options);
-  assertCommandsSupported(request.provider, options.commands);
-
-  const { artifacts: skillArtifacts, installCommands } =
-    await prepareSkillArtifacts(
-      request.provider,
-      options.skills,
-      target.layout,
-    );
-
-  const artifacts = [
-    ...skillArtifacts,
-    ...buildClaudeCommandArtifacts(options.commands, target.layout),
-  ];
-
-  const mcpArtifact = buildClaudeMcpArtifact(
-    options.mcps,
-    target.layout.claudeDir,
-  );
-  if (mcpArtifact) {
-    artifacts.push(mcpArtifact);
-  }
-
-  const hookSettings = buildClaudeHookSettings(hooks);
-  let settingsPath: string | undefined;
-  if (hookSettings) {
-    settingsPath = path.join(target.layout.claudeDir, "settings.json");
-    artifacts.push({
-      path: settingsPath,
-      content: JSON.stringify(hookSettings, null, 2),
-    });
-  }
-
-  for (const artifact of artifacts) {
-    await target.writeArtifact(artifact);
-  }
-  await installSkills(target, installCommands);
-
-  const agents = buildClaudeAgentsConfig(options.subAgents);
-  const initializeRequest = Object.keys({
-    ...(request.run.systemPrompt
-      ? { systemPrompt: request.run.systemPrompt }
-      : {}),
-    ...(agents ? { agents } : {}),
-  }).length
-    ? {
-        subtype: "initialize",
-        ...(request.run.systemPrompt
-          ? { systemPrompt: request.run.systemPrompt }
-          : {}),
-        ...(agents ? { agents } : {}),
-      }
-    : undefined;
-
-  const buildArgs = (sdkUrl: string): string[] => [
-    "--sdk-url",
-    sdkUrl,
-    "--print",
-    "--output-format",
-    "stream-json",
-    "--input-format",
-    "stream-json",
-    ...(provider?.verbose ? ["--verbose"] : []),
-    ...(request.run.model ? ["--model", request.run.model] : []),
-    ...(provider?.permissionMode
-      ? ["--permission-mode", provider.permissionMode]
-      : []),
-    ...(provider?.allowedTools?.length
-      ? ["--allowedTools", provider.allowedTools.join(",")]
-      : []),
-    ...(request.run.resumeSessionId ? ["-r", request.run.resumeSessionId] : []),
-    ...(settingsPath ? ["--settings", settingsPath] : []),
-    ...(mcpArtifact ? ["--mcp-config", mcpArtifact.path] : []),
-    ...(provider?.args ?? []),
-    "-p",
-    "",
-  ];
-
-  const env = {
-    ...(options.env ?? {}),
-    ...target.env,
-  };
-
-  return {
-    target,
-    buildArgs,
-    env,
-    initializeRequest,
-  };
 }
 
 function createRemoteSdkRelayScript(): string {
@@ -642,252 +620,194 @@ async function connectRemoteTransport(
   );
 }
 
-async function canConnectToRemoteRelay(
-  previewUrl: string,
-  headers: Record<string, string> = {},
-): Promise<boolean> {
-  const parsed = new URL(toWebSocketUrl(previewUrl));
-  parsed.searchParams.set("role", "claude");
-  parsed.searchParams.set("runId", "__probe__");
-  const client = new SharedSdkWsConnection(parsed.toString(), headers);
-  try {
-    await Promise.race([
-      client.start(),
-      sleep(2_000).then(() => {
-        throw new Error("Timed out connecting to remote relay.");
-      }),
-    ]);
-    return true;
-  } catch {
-    return false;
-  } finally {
-    await client.close().catch(() => undefined);
-  }
-}
-
-async function ensureSharedRemoteConnection(
-  sandbox: NonNullable<
-    AgentExecutionRequest<"claude-code">["options"]["sandbox"]
-  >,
-  previewUrl: string,
-): Promise<SharedRemoteHostConnection> {
-  const key = sandbox as object;
-  const existing = sharedRemoteConnectionBySandbox.get(key);
-  if (existing) {
-    try {
-      const connection = await existing;
-      await connection.connection.waitForConnection(1_000);
-      return connection;
-    } catch {
-      try {
-        const stale = await existing;
-        await stale.connection.close().catch(() => undefined);
-      } catch {
-        // Ignore stale connection cleanup failures.
-      }
-      sharedRemoteConnectionBySandbox.delete(key);
-    }
-  }
-
-  const created = (async () => {
-    const url = toSharedHostWebSocketUrl(previewUrl);
-    const connection = await connectRemoteTransport(url, sandbox.previewHeaders);
-    return { previewUrl, connection };
-  })();
-
-  sharedRemoteConnectionBySandbox.set(key, created);
-  try {
-    return await created;
-  } catch (error) {
-    sharedRemoteConnectionBySandbox.delete(key);
-    throw error;
-  }
-}
-
+/**
+ * Resolve the relay endpoint for `sandbox`, starting the in-sandbox relay
+ * process if it isn't already running.
+ *
+ * One Modal exec covers everything: the relay script is shipped via the
+ * tarball, then a single bash command short-circuits if the port is
+ * already listening (warm sandbox: the previously-spawned relay is still
+ * around) and otherwise daemonizes a fresh `node relay.mjs`.
+ *
+ * No sandbox-side WS probe runs: the host's `connectRemoteTransport`
+ * retries until success, which IS the readiness check. If the relay
+ * never comes up, that timeout surfaces as a connection error after the
+ * normal grace period.
+ */
 async function ensureRemoteRelay(
-  request: AgentExecutionRequest<"claude-code">,
-  prepared: Awaited<ReturnType<typeof prepareClaudeRuntime>>,
-): Promise<SharedRemoteRelay> {
-  const sandbox = request.options.sandbox!;
-  await sandbox.openPort(REMOTE_SDK_RELAY_PORT);
-  const previewUrl = await sandbox.getPreviewLink(REMOTE_SDK_RELAY_PORT);
-  const previewHeaders = sandbox.previewHeaders;
+  options: AgentOptions<"claude-code">,
+  env: Record<string, string>,
+): Promise<void> {
+  return time(debugRelay, "ensureRemoteRelay", async () => {
+    const sandbox = options.sandbox!;
 
-  if (await canConnectToRemoteRelay(previewUrl, previewHeaders)) {
-    return {
-      relayPort: REMOTE_SDK_RELAY_PORT,
-      relayPath: REMOTE_SDK_RELAY_PATH,
-      previewUrl,
-    };
-  }
+    const relayLogPath = "/tmp/agentbox/claude-code/relay.log";
+    const relayPidPath = "/tmp/agentbox/claude-code/relay.pid";
 
-  await prepared.target.writeArtifact({
-    path: REMOTE_SDK_RELAY_PATH,
-    content: createRemoteSdkRelayScript(),
-  });
-
-  const relayLogPath = "/tmp/agentbox/claude-code/relay.log";
-  const relayHandle = await sandbox.runAsync(
-    [
-      `mkdir -p ${shellQuote(path.posix.dirname(REMOTE_SDK_RELAY_PATH))}`,
-      `mkdir -p ${shellQuote(path.posix.dirname(relayLogPath))}`,
-      `node ${shellQuote(REMOTE_SDK_RELAY_PATH)} ${shellQuote(String(REMOTE_SDK_RELAY_PORT))} > ${shellQuote(relayLogPath)} 2>&1`,
-    ].join(" && "),
-    {
-      cwd: request.options.cwd,
-      env: { ...prepared.env, IS_SANDBOX: "1" },
-    },
-  );
-  let relayExit: CommandResult | unknown;
-  void relayHandle
-    .wait()
-    .then((result) => {
-      relayExit = result;
-    })
-    .catch((error) => {
-      relayExit = error;
-    });
-
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < 30_000) {
-    if (await canConnectToRemoteRelay(previewUrl, previewHeaders)) {
-      return {
-        relayPort: REMOTE_SDK_RELAY_PORT,
-        relayPath: REMOTE_SDK_RELAY_PATH,
-        previewUrl,
-        handle: relayHandle,
-      };
-    }
-    if (relayExit !== undefined) {
-      break;
-    }
-    await sleep(250);
-  }
-
-  await relayHandle.kill().catch(() => undefined);
-  throw new Error(`Timed out waiting for Claude relay on ${previewUrl}.`);
-}
-
-async function createLocalRuntime(
-  request: AgentExecutionRequest<"claude-code">,
-  prepared: Awaited<ReturnType<typeof prepareClaudeRuntime>>,
-): Promise<ClaudeRuntime> {
-  const sandboxProvider = request.options.sandbox?.provider;
-  const transport = new SdkWsServer({
-    host:
-      sandboxProvider === SandboxProvider.LocalDocker ? "0.0.0.0" : "127.0.0.1",
-  });
-  await transport.start();
-
-  const args = prepared.buildArgs(buildLocalSdkUrl(transport, sandboxProvider));
-
-  if (request.options.sandbox) {
-    const handle = await request.options.sandbox.runAsync(
-      [request.options.provider?.binary ?? "claude", ...args],
-      {
-        cwd: request.options.cwd,
-        env: {
-          ...prepared.env,
-        },
-        pty: true,
-      },
+    // Fast-path: probe the relay over a single `sandbox.run` (no
+    // tarball upload). On a warm sandbox the relay process from the
+    // previous setup() is still listening, so we can return immediately
+    // without re-shipping the relay script — the previous spawn
+    // already wrote it to disk.
+    const probe = await time(debugRelay, "probe relay", () =>
+      sandbox.run(
+        `curl -s --max-time 1 -o /dev/null http://127.0.0.1:${REMOTE_SDK_RELAY_PORT}/`,
+        { cwd: options.cwd, timeoutMs: 3_000 },
+      ),
     );
+    if (probe.exitCode === 0) {
+      debugRelay("relay already running — reusing without upload");
+      return;
+    }
 
-    return {
-      transport,
-      cleanup: async () => {
-        await handle.kill();
-        await transport.close();
-        await prepared.target.cleanup();
-      },
-      raw: { transport, handle, layout: prepared.target.layout },
-      initializeRequest: prepared.initializeRequest,
-    };
-  }
+    // Cold path: upload the relay script + spawn a detached node
+    // process. The launch command is still idempotent (one final probe
+    // before spawn) to defend against TOCTOU between probe and upload.
+    //
+    // `nohup … & echo $! > pid` must live inside a subshell — `/bin/sh`
+    // rejects `cmd & && cmd2` as a syntax error.
+    const launchCommand = [
+      `if curl -s --max-time 1 -o /dev/null http://127.0.0.1:${REMOTE_SDK_RELAY_PORT}/ 2>/dev/null; then exit 0; fi`,
+      `mkdir -p ${shellQuote(path.posix.dirname(REMOTE_SDK_RELAY_PATH))}`,
+      `(nohup node ${shellQuote(REMOTE_SDK_RELAY_PATH)} ${REMOTE_SDK_RELAY_PORT} > ${shellQuote(relayLogPath)} 2>&1 & echo $! > ${shellQuote(relayPidPath)})`,
+    ].join(" && ");
 
-  const processHandle = spawnCommand({
-    command: request.options.provider?.binary ?? "claude",
-    args,
-    cwd: request.options.cwd,
-    env: {
-      ...process.env,
-      ...prepared.env,
-    },
+    await time(debugRelay, "uploadAndRun relay (write + spawn)", () =>
+      sandbox.uploadAndRun(
+        [
+          {
+            path: REMOTE_SDK_RELAY_PATH,
+            content: createRemoteSdkRelayScript(),
+            mode: 0o644,
+          },
+        ],
+        launchCommand,
+        {
+          cwd: options.cwd,
+          env: { ...env, IS_SANDBOX: "1" },
+        },
+      ),
+    );
   });
-
-  return {
-    transport,
-    cleanup: async () => {
-      await processHandle.kill();
-      await transport.close();
-      await prepared.target.cleanup();
-    },
-    raw: { transport, processHandle, layout: prepared.target.layout },
-    initializeRequest: prepared.initializeRequest,
-  };
-}
-
-async function createRemoteSandboxRuntime(
-  request: AgentExecutionRequest<"claude-code">,
-  prepared: Awaited<ReturnType<typeof prepareClaudeRuntime>>,
-): Promise<ClaudeRuntime> {
-  const sandbox = request.options.sandbox!;
-  const relay = await ensureRemoteRelay(request, prepared);
-
-  const args = prepared.buildArgs(
-    toClaudeRelayUrl(relay.relayPort, request.runId),
-  );
-  const handle = await sandbox.runAsync(
-    [request.options.provider?.binary ?? "claude", ...args],
-    {
-      cwd: request.options.cwd,
-      env: { ...prepared.env, IS_SANDBOX: "1" },
-      pty: true,
-    },
-  );
-
-  const sharedConnection = await ensureSharedRemoteConnection(
-    sandbox,
-    relay.previewUrl,
-  );
-  const transport = sharedConnection.connection.createChannel(request.runId);
-
-  return {
-    transport,
-    cleanup: async () => {
-      await handle.kill().catch(() => undefined);
-      await transport.close().catch(() => undefined);
-      await prepared.target.cleanup();
-    },
-    raw: { transport, handle, relay, layout: prepared.target.layout },
-    initializeRequest: prepared.initializeRequest,
-  };
-}
-
-async function createRuntime(
-  request: AgentExecutionRequest<"claude-code">,
-): Promise<ClaudeRuntime> {
-  if (
-    request.options.sandbox &&
-    request.options.sandbox.provider !== SandboxProvider.LocalDocker
-  ) {
-    await request.options.sandbox.openPort(REMOTE_SDK_RELAY_PORT);
-    const prepared = await prepareClaudeRuntime(request);
-    return createRemoteSandboxRuntime(request, prepared);
-  }
-
-  const prepared = await prepareClaudeRuntime(request);
-  return createLocalRuntime(request, prepared);
 }
 
 export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code"> {
+  /**
+   * Sandbox-side preparation for the claude-code runtime.
+   *
+   * `setup()` is the ONLY place agent-config (skills, commands, MCPs,
+   * hooks, sub-agents) is read. All of it is persisted to deterministic
+   * file paths under the sandbox layout's `.claude/` dir. With
+   * `CLAUDE_CONFIG_DIR` pointed at that dir from `execute()`, the CLI
+   * picks everything up at startup. There is no wire-protocol fallback.
+   *
+   * Side effects (all idempotent):
+   *   1. Upload artifacts via the differential-setup manifest:
+   *      - skills/, commands/, agents/<name>.md (sub-agents)
+   *      - settings.json (always — `{}` if no hooks)
+   *      - agentbox-mcp.json (always — `{"mcpServers":{}}` if no MCPs)
+   *   2. For remote sandboxes, ensure the in-sandbox SDK relay is
+   *      listening on `REMOTE_SDK_RELAY_PORT` (curl probe + spawn on
+   *      cold path).
+   */
+  async setup(request: AgentSetupRequest<"claude-code">): Promise<void> {
+    await time(debugClaude, "claude-code setup()", async () => {
+      const options = request.options;
+      const provider = request.provider;
+
+      const target = await createSetupTarget(provider, "shared-setup", options);
+      const settingsPath = path.join(target.layout.claudeDir, "settings.json");
+      const mcpConfigPath = path.join(
+        target.layout.claudeDir,
+        "agentbox-mcp.json",
+      );
+
+      const hooks = assertHooksSupported(provider, options);
+      assertCommandsSupported(provider, options.commands);
+
+      const { artifacts: skillArtifacts, installCommands } = await time(
+        debugClaude,
+        "prepareSkillArtifacts",
+        () => prepareSkillArtifacts(provider, options.skills, target.layout),
+      );
+
+      // settings.json and agentbox-mcp.json are ALWAYS written, even
+      // when the user configured no hooks / no MCPs. That way
+      // `execute()` can pass `--settings <static-path>` and
+      // `--mcp-config <static-path>` unconditionally without ever
+      // needing to read agent-config to decide.
+      const hookSettings = buildClaudeHookSettings(hooks) ?? {};
+      const mcpConfigJson =
+        buildClaudeMcpConfig(options.mcps) ??
+        JSON.stringify({ mcpServers: {} }, null, 2);
+
+      const artifacts = [
+        ...skillArtifacts,
+        ...buildClaudeCommandArtifacts(options.commands, target.layout),
+        ...buildClaudeSubagentArtifacts(options.subAgents, target.layout),
+        {
+          path: settingsPath,
+          content: JSON.stringify(hookSettings, null, 2),
+        },
+        {
+          path: mcpConfigPath,
+          content: mcpConfigJson,
+        },
+      ];
+
+      // Upload artifacts and (in parallel) start the relay on remote
+      // sandboxes. The two operations don't depend on each other —
+      // artifact paths are stable and the relay script is shipped via
+      // its own tarball inside `ensureRemoteRelay`.
+      const env = { ...(options.env ?? {}), ...target.env };
+      const tasks: Array<Promise<void>> = [
+        time(debugClaude, "applyDifferentialSetup", () =>
+          applyDifferentialSetup(target, artifacts, installCommands),
+        ),
+      ];
+
+      const isRemoteSandbox =
+        options.sandbox &&
+        options.sandbox.provider !== SandboxProvider.LocalDocker;
+      if (isRemoteSandbox) {
+        tasks.push(ensureRemoteRelay(options, env));
+      }
+
+      await Promise.all(tasks);
+    });
+  }
+
   async execute(
     request: AgentExecutionRequest<"claude-code">,
     sink: AgentRunSink,
   ): Promise<() => Promise<void>> {
-    const inputParts = await validateProviderUserInput(
-      request.provider,
-      request.run.input,
+    const executeStartedAt = Date.now();
+    debugClaude("execute() start runId=%s", request.runId);
+
+    // Spawn context. Constants only — no agent-config touched.
+    // `setup()` wrote skills/hooks/mcps/commands/subAgents into
+    // `<claudeDir>/...`; the CLI auto-discovers them via
+    // `CLAUDE_CONFIG_DIR`. settings.json and the MCP config still get
+    // explicit CLI flags so claude is unambiguous about which files
+    // to read.
+    const claudeDir = claudeConfigDir(request.options);
+    const settingsPath = path.join(claudeDir, "settings.json");
+    const mcpConfigPath = path.join(claudeDir, "agentbox-mcp.json");
+    const env: Record<string, string> = {
+      ...(request.options.env ?? {}),
+      CLAUDE_CONFIG_DIR: claudeDir,
+    };
+    // The system prompt is per-RUN (AgentRunConfig); we forward it
+    // through the CLI's `initialize` control message at the start of
+    // the stream.
+    const initializeRequest = request.run.systemPrompt
+      ? { subtype: "initialize", systemPrompt: request.run.systemPrompt }
+      : undefined;
+
+    const inputParts = await time(
+      debugClaude,
+      "validateProviderUserInput",
+      () => validateProviderUserInput(request.provider, request.run.input),
     );
     const userContent = mapToClaudeUserContent(inputParts);
 
@@ -895,15 +815,16 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     let accumulatedText = "";
     let usedStreaming = false;
     let pendingMessages = 1;
+    let firstTransportMessageLogged = false;
+    let firstTextDeltaLogged = false;
     const autoApproveTools = shouldAutoApproveClaudeTools(request.options);
 
     // Register `onMessage` synchronously so callers can send follow-up
-    // messages as soon as they have the run handle, even while the runtime
-    // (sandbox + relay + WebSocket) is still coming up. Messages that arrive
-    // before the transport is connected are queued and flushed once it is.
-    type ClaudeTransport = Awaited<ReturnType<typeof createRuntime>>["transport"];
-    const transportRef: { current?: ClaudeTransport } = {};
-    const queuedSends: Array<Parameters<ClaudeTransport["send"]>[0]> = [];
+    // messages as soon as they have the run handle, even while the
+    // transport is still coming up. Messages that arrive before the
+    // transport is connected are queued and flushed once it is.
+    const transportRef: { current?: SdkWsTransport } = {};
+    const queuedSends: Array<Parameters<SdkWsTransport["send"]>[0]> = [];
 
     sink.onMessage(async (content: UserContent) => {
       pendingMessages++;
@@ -911,24 +832,140 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       const mapped = mapToClaudeUserContent(parts);
       accumulatedText = "";
       usedStreaming = false;
+      const messageUuid = randomUUID();
       const payload = {
         type: "user" as const,
         message: { role: "user" as const, content: mapped },
         parent_tool_use_id: null,
         session_id: sessionId || request.run.resumeSessionId || "",
-        uuid: randomUUID(),
+        uuid: messageUuid,
       };
       if (transportRef.current) {
         await transportRef.current.send(payload);
       } else {
         queuedSends.push(payload);
       }
+      return { messageId: messageUuid };
     });
 
-    const runtime = await createRuntime(request);
-    transportRef.current = runtime.transport;
-    sink.setRaw(runtime.raw);
-    sink.setAbort(runtime.cleanup);
+    // Spawn the claude CLI + open the host-side transport. There are
+    // exactly three transport modes — branched inline (no createRuntime
+    // indirection):
+    //
+    //   - Host (no sandbox): SdkWsServer on 127.0.0.1, claude spawned via
+    //     spawnCommand.
+    //   - LocalDocker: SdkWsServer on 0.0.0.0, claude spawned via
+    //     sandbox.runAsync, --sdk-url points at host.docker.internal.
+    //   - Remote sandbox: claude spawned via sandbox.runAsync targeting
+    //     the in-sandbox relay (started in setup()), host dials the
+    //     relay's preview URL.
+    const sandbox = request.options.sandbox;
+    const isRemoteSandbox =
+      sandbox && sandbox.provider !== SandboxProvider.LocalDocker;
+
+    let transport: SdkWsTransport;
+    let raw: unknown;
+    let cleanup: () => Promise<void>;
+
+    if (isRemoteSandbox) {
+      const previewUrl = await time(debugClaude, "getPreviewLink relay", () =>
+        sandbox!.getPreviewLink(REMOTE_SDK_RELAY_PORT),
+      );
+
+      const args = buildClaudeCliArgs({
+        sdkUrl: toClaudeRelayUrl(REMOTE_SDK_RELAY_PORT, request.runId),
+        request,
+        settingsPath: settingsPath,
+        mcpConfigPath: mcpConfigPath,
+      });
+
+      // Spawn claude AND dial the host-side WebSocket in parallel. The
+      // relay buffers frames bound for claude until the claude process
+      // attaches, so the order in which these two land is safe. Each run
+      // opens its own host-side WebSocket — we do NOT cache connections
+      // in process memory because that can't be reasoned about across
+      // instances in a multi-instance deployment (e.g. Cloud Run).
+      const [handle, connection] = await time(
+        debugClaude,
+        "spawn claude binary || connectRemoteTransport (parallel)",
+        () =>
+          Promise.all([
+            sandbox!.runAsync(
+              [request.options.provider?.binary ?? "claude", ...args],
+              {
+                cwd: request.options.cwd,
+                env: { ...env, IS_SANDBOX: "1" },
+                pty: true,
+              },
+            ),
+            connectRemoteTransport(
+              toSharedHostWebSocketUrl(previewUrl),
+              sandbox!.previewHeaders,
+            ),
+          ]),
+      );
+      const channel = connection.createChannel(request.runId);
+      transport = channel;
+      raw = { transport: channel, handle, claudeDir };
+      cleanup = async () => {
+        await handle.kill().catch(() => undefined);
+        await channel.close().catch(() => undefined);
+        await connection.close().catch(() => undefined);
+      };
+    } else {
+      const sandboxProvider = sandbox?.provider;
+      const server = new SdkWsServer({
+        host:
+          sandboxProvider === SandboxProvider.LocalDocker
+            ? "0.0.0.0"
+            : "127.0.0.1",
+      });
+      await server.start();
+
+      const args = buildClaudeCliArgs({
+        sdkUrl: buildLocalSdkUrl(server, sandboxProvider),
+        request,
+        settingsPath: settingsPath,
+        mcpConfigPath: mcpConfigPath,
+      });
+
+      if (sandbox) {
+        const handle = await sandbox.runAsync(
+          [request.options.provider?.binary ?? "claude", ...args],
+          {
+            cwd: request.options.cwd,
+            env: { ...env },
+            pty: true,
+          },
+        );
+        transport = server;
+        raw = { transport: server, handle, claudeDir };
+        cleanup = async () => {
+          await handle.kill();
+          await server.close();
+        };
+      } else {
+        const processHandle = spawnCommand({
+          command: request.options.provider?.binary ?? "claude",
+          args,
+          cwd: request.options.cwd,
+          env: {
+            ...process.env,
+            ...env,
+          },
+        });
+        transport = server;
+        raw = { transport: server, processHandle, claudeDir };
+        cleanup = async () => {
+          await processHandle.kill();
+          await server.close();
+        };
+      }
+    }
+
+    transportRef.current = transport;
+    sink.setRaw(raw);
+    sink.setAbort(cleanup);
     sink.emitEvent(
       createNormalizedEvent("run.started", {
         provider: request.provider,
@@ -936,9 +973,19 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       }),
     );
 
+    const rawPayloads: Array<Record<string, unknown>> = [];
     const completion = new Promise<{ text: string }>((resolve, reject) => {
       void (async () => {
-        for await (const message of runtime.transport.messages()) {
+        for await (const message of transport.messages()) {
+          if (!firstTransportMessageLogged) {
+            firstTransportMessageLogged = true;
+            debugClaude(
+              "★ first transport message (%dms since execute start) type=%s",
+              Date.now() - executeStartedAt,
+              message.type,
+            );
+          }
+          rawPayloads.push(message);
           sink.emitRaw(toRawEvent(request.runId, message, message.type));
 
           if (message.type === "system" && message.subtype === "init") {
@@ -982,7 +1029,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
               );
             }
 
-            await runtime.transport.send({
+            await transport.send({
               type: "control_response",
               response: {
                 subtype: "success",
@@ -1003,8 +1050,30 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
           }
 
           if (message.type === "stream_event") {
+            const thinkingDelta = extractThinkingDelta(message);
+            if (thinkingDelta) {
+              sink.emitEvent(
+                createNormalizedEvent(
+                  "reasoning.delta",
+                  {
+                    provider: request.provider,
+                    runId: request.runId,
+                  },
+                  {
+                    delta: thinkingDelta,
+                  },
+                ),
+              );
+            }
             const delta = extractStreamDelta(message);
             if (delta) {
+              if (!firstTextDeltaLogged) {
+                firstTextDeltaLogged = true;
+                debugClaude(
+                  "★ first text delta (%dms since execute start)",
+                  Date.now() - executeStartedAt,
+                );
+              }
               usedStreaming = true;
               accumulatedText += delta;
               sink.emitEvent(
@@ -1024,6 +1093,21 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
           }
 
           if (message.type === "assistant") {
+            const thinking = extractAssistantThinking(message);
+            if (thinking) {
+              sink.emitEvent(
+                createNormalizedEvent(
+                  "reasoning.delta",
+                  {
+                    provider: request.provider,
+                    runId: request.runId,
+                  },
+                  {
+                    delta: thinking,
+                  },
+                ),
+              );
+            }
             const text = extractAssistantText(message);
             if (!usedStreaming && text) {
               accumulatedText = text;
@@ -1041,6 +1125,10 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
               );
             }
 
+            const assistantId =
+              typeof (message as Record<string, unknown>).uuid === "string"
+                ? String((message as Record<string, unknown>).uuid)
+                : undefined;
             sink.emitEvent(
               createNormalizedEvent(
                 "message.completed",
@@ -1050,6 +1138,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
                 },
                 {
                   text,
+                  ...(assistantId ? { messageId: assistantId } : {}),
                 },
               ),
             );
@@ -1095,35 +1184,71 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     });
 
     try {
-      await runtime.transport.waitForConnection(30_000);
-      if (runtime.initializeRequest) {
-        const response = await runtime.transport.request(
-          runtime.initializeRequest,
-        );
-        sink.emitRaw(
-          toRawEvent(request.runId, response, "control_response:initialize"),
-        );
+      await time(debugClaude, "transport.waitForConnection", () =>
+        transport.waitForConnection(30_000),
+      );
+      // Pipeline `initialize` + the first user message: we fire-and-forget
+      // the `initialize` control request, then send the user message
+      // immediately. WebSocket guarantees in-order delivery, so claude
+      // processes init before the user message — we just don't wait for
+      // the init reply on the host. This saves one round-trip-time
+      // (typically ~1.3s on Modal) per run.
+      let initPromise: Promise<Record<string, unknown>> | undefined;
+      if (initializeRequest) {
+        initPromise = transport.request(initializeRequest);
+        // Surface init failures as debug logs, but don't block the rest
+        // of the path on the response arriving.
+        void initPromise
+          .then((response: Record<string, unknown>) => {
+            rawPayloads.push(response);
+            sink.emitRaw(
+              toRawEvent(
+                request.runId,
+                response,
+                "control_response:initialize",
+              ),
+            );
+          })
+          .catch((error: unknown) => {
+            debugClaude("initialize failed: %s", String(error));
+          });
       }
-      await runtime.transport.send({
-        type: "user",
-        message: {
-          role: "user",
-          content: userContent,
-        },
-        parent_tool_use_id: null,
-        session_id: request.run.resumeSessionId ?? "",
-        uuid: randomUUID(),
-      });
-      sink.emitEvent(
-        createNormalizedEvent("message.started", {
-          provider: request.provider,
-          runId: request.runId,
+      const initialUserUuid = randomUUID();
+      await time(debugClaude, "send initial user message", () =>
+        transport.send({
+          type: "user",
+          message: {
+            role: "user",
+            content: userContent,
+          },
+          parent_tool_use_id: null,
+          session_id: request.run.resumeSessionId ?? "",
+          uuid: initialUserUuid,
         }),
       );
+      debugClaude(
+        "★ ready for first model output (%dms since execute start)",
+        Date.now() - executeStartedAt,
+      );
+      sink.emitEvent(
+        createNormalizedEvent(
+          "message.started",
+          {
+            provider: request.provider,
+            runId: request.runId,
+          },
+          { messageId: initialUserUuid },
+        ),
+      );
       for (const queued of queuedSends.splice(0)) {
-        await runtime.transport.send(queued);
+        await transport.send(queued);
       }
       const { text } = await completion;
+      debugClaude(
+        "★ run.completed (%dms since execute start) chars=%d",
+        Date.now() - executeStartedAt,
+        text.length,
+      );
       sink.emitEvent(
         createNormalizedEvent(
           "run.completed",
@@ -1136,11 +1261,176 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
           },
         ),
       );
-      sink.complete({ text });
+      sink.complete({ text, costData: extractClaudeCostData(rawPayloads) });
     } finally {
-      await runtime.cleanup().catch(() => undefined);
+      await cleanup().catch(() => undefined);
     }
 
     return async () => undefined;
   }
+
+  async forkAt(
+    request: AgentForkRequest<"claude-code">,
+  ): Promise<AgentForkResult> {
+    const newSessionId = newClaudeSessionId();
+    if (request.options.sandbox) {
+      await forkClaudeSessionInSandbox(request, newSessionId);
+    } else {
+      await forkClaudeSessionLocally(request, newSessionId);
+    }
+    return { sessionId: newSessionId };
+  }
+}
+
+/**
+ * Locate the source transcript inside the sandbox, rewrite it via the
+ * `forkClaudeTranscript` helper, and write the result to a new file under
+ * the same `<claudeDir>/projects/<encoded-cwd>/` directory keyed by the
+ * new sessionId.
+ *
+ * `claudeDir` is the deterministic layout location (the same one
+ * `setup()` populated and `execute()` points the CLI at via
+ * `CLAUDE_CONFIG_DIR`). We do NOT read `$HOME/.claude/...` here — that
+ * would diverge from where the agent actually writes transcripts.
+ *
+ * If the encoded-cwd directory doesn't contain `<sessionId>.jsonl`, we
+ * fall back to a `find` across `<claudeDir>/projects/` so the fork
+ * still works if Claude tweaks its encoding rule in a future release.
+ */
+async function forkClaudeSessionInSandbox(
+  request: AgentForkRequest<"claude-code">,
+  newSessionId: string,
+): Promise<void> {
+  const sandbox = request.options.sandbox!;
+  const cwd = request.options.cwd ?? "/workspace";
+  const encoded = encodeClaudeCwd(cwd);
+  const projectsDir = path.posix.join(
+    claudeConfigDir(request.options),
+    "projects",
+  );
+
+  const pathDelim = `__AGENTBOX_FORK_PATH_${Math.random().toString(36).slice(2)}__`;
+  const contentDelim = `__AGENTBOX_FORK_CONTENT_${Math.random().toString(36).slice(2)}__`;
+  const locate = await sandbox.run(
+    [
+      `set -e`,
+      `DIR=${shellQuote(path.posix.join(projectsDir, encoded))}`,
+      `SRC="$DIR/${shellQuote(`${request.sessionId}.jsonl`)}"`,
+      `if [ ! -f "$SRC" ]; then`,
+      `  SRC="$(find ${shellQuote(projectsDir)} -type f -name ${shellQuote(`${request.sessionId}.jsonl`)} -print -quit 2>/dev/null || true)"`,
+      `fi`,
+      `if [ -z "$SRC" ] || [ ! -f "$SRC" ]; then`,
+      `  echo "claude-code session ${request.sessionId} not found" >&2`,
+      `  exit 1`,
+      `fi`,
+      `printf '%s\\n' ${shellQuote(pathDelim)}`,
+      `printf '%s\\n' "$SRC"`,
+      `printf '%s\\n' ${shellQuote(contentDelim)}`,
+      `cat "$SRC"`,
+    ].join("\n"),
+    { cwd },
+  );
+  if (locate.exitCode !== 0) {
+    throw new Error(
+      `Could not locate claude-code session ${request.sessionId}: ${locate.combinedOutput || locate.stderr}`,
+    );
+  }
+  const stdout = locate.stdout ?? "";
+  const pathStart = stdout.indexOf(pathDelim);
+  const contentStart = stdout.indexOf(contentDelim);
+  if (pathStart < 0 || contentStart < 0 || contentStart <= pathStart) {
+    throw new Error(
+      `Unexpected output while locating claude-code session ${request.sessionId}.`,
+    );
+  }
+  const sourcePath = stdout
+    .slice(pathStart + pathDelim.length, contentStart)
+    .trim();
+  // Skip the content-delimiter line (and its trailing newline).
+  const sourceContent = stdout.slice(contentStart + contentDelim.length + 1);
+
+  const { content } = forkClaudeTranscript(
+    sourceContent,
+    request.messageId,
+    newSessionId,
+  );
+
+  const dirPath = path.posix.dirname(sourcePath);
+  const destPath = path.posix.join(dirPath, `${newSessionId}.jsonl`);
+  const marker = `__AGENTBOX_FORK_${Math.random().toString(36).slice(2)}__`;
+  await sandbox.run(
+    `mkdir -p ${shellQuote(dirPath)} && cat > ${shellQuote(destPath)} <<'${marker}'\n${content}${marker}\n`,
+    { cwd },
+  );
+}
+
+/**
+ * Local-host fork: read/write the JSONL transcript directly via `fs`,
+ * scoped to the deterministic layout's `<claudeDir>/projects/...`. We
+ * never look at the user's actual `$HOME/.claude/projects/` because
+ * `CLAUDE_CONFIG_DIR` redirects all session history into our layout.
+ */
+async function forkClaudeSessionLocally(
+  request: AgentForkRequest<"claude-code">,
+  newSessionId: string,
+): Promise<void> {
+  const fs = await import("node:fs/promises");
+  const cwd = request.options.cwd ?? process.cwd();
+  const encoded = encodeClaudeCwd(cwd);
+  const projectsDir = path.join(claudeConfigDir(request.options), "projects");
+  const candidateDir = path.join(projectsDir, encoded);
+  const candidatePath = path.join(candidateDir, `${request.sessionId}.jsonl`);
+
+  let sourcePath = candidatePath;
+  let sourceContent: string | undefined;
+  try {
+    sourceContent = await fs.readFile(candidatePath, "utf8");
+  } catch {
+    sourceContent = undefined;
+  }
+  if (sourceContent === undefined) {
+    sourcePath = await findClaudeSessionFile(
+      projectsDir,
+      `${request.sessionId}.jsonl`,
+    );
+    sourceContent = await fs.readFile(sourcePath, "utf8");
+  }
+
+  const { content } = forkClaudeTranscript(
+    sourceContent,
+    request.messageId,
+    newSessionId,
+  );
+
+  const dir = path.dirname(sourcePath);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, `${newSessionId}.jsonl`), content, "utf8");
+}
+
+async function findClaudeSessionFile(
+  projectsDir: string,
+  filename: string,
+): Promise<string> {
+  const fs = await import("node:fs/promises");
+  let entries;
+  try {
+    entries = await fs.readdir(projectsDir, { withFileTypes: true });
+  } catch {
+    throw new Error(
+      `claude-code session file ${filename} not found under ${projectsDir}.`,
+    );
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidate = path.join(projectsDir, entry.name, filename);
+    try {
+      await fs.access(candidate);
+      return candidate;
+    } catch {
+      // try next
+    }
+  }
+  throw new Error(
+    `claude-code session file ${filename} not found under ${projectsDir}.`,
+  );
 }

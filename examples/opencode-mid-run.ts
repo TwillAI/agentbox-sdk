@@ -75,12 +75,13 @@ const sandbox = new Sandbox(SandboxProvider.Modal, {
     appName: process.env.MODAL_APP_NAME ?? "twill-sandboxes",
     tokenId: modalTokenId,
     tokenSecret: modalTokenSecret,
-    unencryptedPorts: [...AGENT_RESERVED_PORTS.opencode],
+    unencryptedPorts: [...AGENT_RESERVED_PORTS["open-code"]],
   },
 });
 
 try {
   console.log("Provisioning Modal sandbox…");
+  await sandbox.findOrProvision();
   await sandbox.run("opencode --version", { timeoutMs: 60_000 });
 
   const agent = new Agent(AgentProvider.OpenCode, {
@@ -88,6 +89,8 @@ try {
     cwd: "/workspace",
     approvalMode: "auto",
   });
+
+  await agent.setup();
 
   const run = agent.stream({
     model,
@@ -191,7 +194,9 @@ try {
     `event counts: message.injected=${messageInjectedCount}, text.delta=${textDeltaCount}, run.completed=${runCompletedCount}`,
   );
   if (messageInjectedCount !== 1) {
-    fail(`Expected exactly 1 message.injected event, got ${messageInjectedCount}.`);
+    fail(
+      `Expected exactly 1 message.injected event, got ${messageInjectedCount}.`,
+    );
   }
   if (textDeltaCount < 2) {
     fail(

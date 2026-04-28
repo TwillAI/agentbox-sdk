@@ -8,11 +8,15 @@ const sandbox = new Sandbox(SandboxProvider.LocalDocker, {
   },
 });
 
+await sandbox.findOrProvision();
+
 const agent = new Agent(AgentProvider.ClaudeCode, {
   sandbox,
   cwd: "/workspace",
   approvalMode: "auto",
 });
+
+await agent.setup();
 
 const run = agent.stream({
   model: "sonnet",

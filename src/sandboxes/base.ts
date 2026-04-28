@@ -8,7 +8,10 @@ import type {
   SandboxOptions,
   SandboxProviderName,
 } from "./types";
+import type { TarballEntry } from "./tarball";
 import { buildGitCloneCommand } from "./git";
+import { shellQuote } from "../shared/shell";
+import { debugSandbox, time } from "../shared/debug";
 
 export abstract class SandboxAdapter<
   TProvider extends SandboxProviderName = SandboxProviderName,
@@ -20,6 +23,13 @@ export abstract class SandboxAdapter<
   protected readonly baseEnv: Record<string, string>;
   private provisioned = false;
   private provisioning?: Promise<void>;
+  /**
+   * Whether `provision()` warm-attached to a pre-existing tagged sandbox
+   * (true) or had to create a fresh one (false). Set by adapter
+   * `provision()` implementations. Stays `false` until `findOrProvision()`
+   * has resolved.
+   */
+  protected wasFoundFlag = false;
 
   constructor(options: TOptions) {
     this.options = options;
@@ -64,21 +74,90 @@ export abstract class SandboxAdapter<
     );
   }
 
-  protected async ensureProvisioned(): Promise<void> {
+  /**
+   * Upload a tarball of files into the sandbox and execute a command in
+   * the same round-trip. Used by setup paths that would otherwise need one
+   * sandbox RPC per file plus another to run the install script — Modal-
+   * style providers pay ~700ms per RPC, so collapsing N+1 calls into one
+   * is the single biggest win on cold setup.
+   *
+   * Default implementation falls back to `uploadFile` per entry + a final
+   * `run`. Providers that support stdin streaming (Modal) override this to
+   * do the upload + extract + exec in a single sandbox `exec` call.
+   */
+  async uploadAndRun(
+    files: TarballEntry[],
+    command: string,
+    options?: CommandOptions,
+  ): Promise<CommandResult> {
+    this.requireProvisioned();
+    for (const entry of files) {
+      const content =
+        typeof entry.content === "string"
+          ? Buffer.from(entry.content, "utf8")
+          : entry.content;
+      await this.uploadFile(content, entry.path);
+    }
+    if (files.length > 0) {
+      const chmodCmd = files
+        .filter((entry) => entry.mode && (entry.mode & 0o111) !== 0)
+        .map(
+          (entry) =>
+            `chmod ${entry.mode!.toString(8)} ${shellQuote(entry.path)}`,
+        );
+      if (chmodCmd.length > 0) {
+        await this.run(chmodCmd.join(" && "), options);
+      }
+    }
+    return this.run(command, options);
+  }
+
+  /**
+   * Public hook that callers must invoke before they touch the sandbox
+   * (running commands, cloning repos, uploading files, opening preview
+   * links, …). It either attaches to an existing tagged sandbox or creates
+   * a new one. The result is cached so repeated calls are cheap.
+   *
+   * Provisioning is no longer triggered implicitly by `run`, `runAsync`,
+   * `gitClone`, `uploadAndRun`, etc. Those methods now throw a clear error
+   * when the adapter has not been provisioned yet, which makes the
+   * lifecycle explicit and gives callers control over when the
+   * (potentially slow) sandbox attach / create happens.
+   */
+  async findOrProvision(): Promise<void> {
     if (this.provisioned) {
       return;
     }
 
     if (!this.provisioning) {
-      this.provisioning = (async () => {
-        await this.provision();
-        this.provisioned = true;
-      })().finally(() => {
+      this.provisioning = time(
+        debugSandbox,
+        `provision [${this.provider}] (find-or-create)`,
+        async () => {
+          await this.provision();
+          this.provisioned = true;
+        },
+      ).finally(() => {
         this.provisioning = undefined;
       });
     }
 
     await this.provisioning;
+  }
+
+  /**
+   * Throw a consistent error when a method that needs a provisioned
+   * sandbox is called before `findOrProvision()`. Provider adapters call
+   * this at the top of `run`, `runAsync`, `uploadFile`, etc.
+   */
+  protected requireProvisioned(): void {
+    if (!this.provisioned) {
+      throw new Error(
+        `Sandbox (${this.provider}) is not provisioned. ` +
+          `Call \`sandbox.findOrProvision()\` once before running commands, ` +
+          `cloning repos, or uploading files.`,
+      );
+    }
   }
 
   get tags(): Record<string, string> {
@@ -87,6 +166,16 @@ export abstract class SandboxAdapter<
 
   get workingDir(): string {
     return this.options.workingDir ?? "/workspace";
+  }
+
+  /**
+   * Whether `findOrProvision()` warm-attached to a pre-existing tagged
+   * sandbox (`true`) or created a fresh one (`false`). Useful to skip
+   * idempotent setup that the previous run already performed (e.g.
+   * `agent.setup()`). Always `false` before `findOrProvision()` resolves.
+   */
+  get wasFound(): boolean {
+    return this.wasFoundFlag;
   }
 
   /**
@@ -115,7 +204,7 @@ export abstract class SandboxAdapter<
   }
 
   async gitClone(options: GitCloneOptions): Promise<CommandResult> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     return this.run(buildGitCloneCommand(options), {
       cwd: this.workingDir,
       env: this.getMergedEnv(),

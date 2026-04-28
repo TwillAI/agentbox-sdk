@@ -98,7 +98,7 @@ const COMMON_SANDBOX_ENV = {
 
 const BINARY_BY_PROVIDER: Record<LiveMatrixAgentProvider, string> = {
   codex: "codex",
-  opencode: "opencode",
+  "open-code": "opencode",
   "claude-code": "claude",
 };
 
@@ -164,24 +164,30 @@ async function runScenarioWithSandbox(
   image: string,
 ): Promise<LiveMatrixScenarioResult> {
   const version = await prepareSandboxForCombination(combination, sandbox);
-  const sessions = Array.from(
-    { length: LIVE_MATRIX_CONCURRENT_SESSION_COUNT },
-    (_, index) => {
-      const expectedText = `matrix-ok-${combination.sandboxProvider}-${combination.agentProvider}-${index + 1}-${randomUUID()}`;
-      const agent = createAgentForCombination(combination, sandbox);
-      const run = agent.stream({
-        input: `Reply with exactly ${expectedText} and nothing else.`,
-        model: getModelForCombination(combination.agentProvider),
-      });
-      void run.finished.catch(() => undefined);
+  const sessions = await Promise.all(
+    Array.from(
+      { length: LIVE_MATRIX_CONCURRENT_SESSION_COUNT },
+      async (_, index) => {
+        const expectedText = `matrix-ok-${combination.sandboxProvider}-${combination.agentProvider}-${index + 1}-${randomUUID()}`;
+        const agent = createAgentForCombination(combination, sandbox);
+        // setup() must come before stream(): it uploads artifacts and
+        // boots the in-sandbox relay/app-server. Idempotent across the
+        // parallel sessions sharing a sandbox.
+        await agent.setup();
+        const run = agent.stream({
+          input: `Reply with exactly ${expectedText} and nothing else.`,
+          model: getModelForCombination(combination.agentProvider),
+        });
+        void run.finished.catch(() => undefined);
 
-      return {
-        expectedText,
-        run,
-        eventTypes: [] as NormalizedAgentEvent["type"][],
-        streamedText: "",
-      };
-    },
+        return {
+          expectedText,
+          run,
+          eventTypes: [] as NormalizedAgentEvent["type"][],
+          streamedText: "",
+        };
+      },
+    ),
   );
 
   const abortAllRuns = async () => {
@@ -540,6 +546,8 @@ async function prepareSandboxForCombination(
   if (combination.sandboxProvider === SandboxProvider.LocalDocker) {
     assertLocalDockerPrerequisites(combination.agentProvider);
   }
+
+  await sandbox.findOrProvision();
 
   const version = await sandbox.run(
     `${BINARY_BY_PROVIDER[combination.agentProvider]} --version`,

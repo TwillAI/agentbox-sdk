@@ -8,11 +8,17 @@ const sandbox = new Sandbox(SandboxProvider.LocalDocker, {
   },
 });
 
-const result = await new Agent(AgentProvider.ClaudeCode, {
+await sandbox.findOrProvision();
+
+const agent = new Agent(AgentProvider.ClaudeCode, {
   sandbox,
   cwd: "/workspace",
   approvalMode: "auto",
-}).run({
+});
+
+await agent.setup();
+
+const result = await agent.run({
   model: "sonnet",
   input: "Create a hello world Express server in /workspace/server.ts",
 });

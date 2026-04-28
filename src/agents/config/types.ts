@@ -192,7 +192,7 @@ export interface AgentCommandConfig {
   subtask?: boolean;
 }
 
-export interface RuntimeLayout {
+export interface SetupLayout {
   rootDir: string;
   homeDir: string;
   xdgConfigHome: string;
@@ -237,11 +237,25 @@ export interface CodexPreparedConfig extends PreparedAgentConfig {
   inputItems?: Array<Record<string, unknown>>;
 }
 
-export interface RuntimeTarget {
+import type { TarballEntry } from "../../sandboxes/tarball";
+import type { CommandResult } from "../../sandboxes/types";
+
+export interface SetupTarget {
   readonly provider: AgentProviderName;
-  readonly layout: RuntimeLayout;
+  readonly layout: SetupLayout;
   readonly env: Record<string, string>;
-  writeArtifact(artifact: TextArtifact): Promise<void>;
+  /**
+   * Upload `files` as a tarball and execute `command` in a single round-
+   * trip. Used by `applyDifferentialSetup` to ship every artifact + the
+   * install script in one Modal exec; falls back to a non-bundled write +
+   * run on host or simpler providers.
+   */
+  uploadAndRun(files: TarballEntry[], command: string): Promise<CommandResult>;
+  /**
+   * Run a one-off shell command. Still used by sandbox-resident server
+   * launches (Codex app-server, OpenCode serve) and by the legacy local
+   * setup path.
+   */
   runCommand(command: string, extraEnv?: Record<string, string>): Promise<void>;
   cleanup(): Promise<void>;
 }

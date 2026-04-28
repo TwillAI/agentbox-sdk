@@ -65,6 +65,7 @@ export class E2bSandboxAdapter extends SandboxAdapter<
     const existing = await this.findMatchingSandbox();
     if (existing) {
       this.sandbox = existing;
+      this.wasFoundFlag = true;
       return;
     }
 
@@ -96,7 +97,7 @@ export class E2bSandboxAdapter extends SandboxAdapter<
     command: string | string[],
     options?: CommandOptions,
   ): Promise<CommandResult> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
     const { CommandExitError } = await loadE2bModule();
     if (options?.pty) {
@@ -129,7 +130,7 @@ export class E2bSandboxAdapter extends SandboxAdapter<
     command: string | string[],
     options?: CommandOptions,
   ): Promise<AsyncCommandHandle> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
     const { CommandExitError } = await loadE2bModule();
     const queue = new AsyncQueue<CommandEvent>();
@@ -334,7 +335,7 @@ export class E2bSandboxAdapter extends SandboxAdapter<
   }
 
   async snapshot(): Promise<string | null> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
     const snapshot = await sandbox.createSnapshot();
     return snapshot.snapshotId;
@@ -361,7 +362,7 @@ export class E2bSandboxAdapter extends SandboxAdapter<
   }
 
   async getPreviewLink(port: number): Promise<string> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
     const host = sandbox.getHost(port);
     return host.startsWith("localhost:") ? `http://${host}` : `https://${host}`;

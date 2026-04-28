@@ -1,5 +1,10 @@
 export { SandboxProvider } from "../enums";
 import type { SandboxProvider } from "../enums";
+import type { SandboxCreateParams } from "modal";
+import type {
+  CreateSandboxFromImageParams,
+  CreateSandboxFromSnapshotParams,
+} from "@daytonaio/sdk";
 
 export type SandboxProviderName = SandboxProvider;
 
@@ -91,6 +96,16 @@ export interface ModalProviderOptions {
   unencryptedPorts?: number[];
   command?: string[];
   verbose?: boolean;
+  /**
+   * Escape hatch: extra parameters spread into Modal's
+   * `client.sandboxes.create()` call. Lets callers use Modal-specific
+   * features that are not surfaced as typed fields here (e.g.
+   * `experimentalOptions`, `gpu`, `cloudBucketMounts`, `regions`).
+   *
+   * Typed fields on `ModalProviderOptions` and `SandboxOptionsBase` take
+   * precedence over keys provided via `createParams`.
+   */
+  createParams?: Partial<SandboxCreateParams>;
 }
 
 export interface DaytonaProviderOptions {
@@ -103,6 +118,18 @@ export interface DaytonaProviderOptions {
   language?: string;
   user?: string;
   public?: boolean;
+  /**
+   * Escape hatch: extra parameters spread into Daytona's `client.create()`
+   * call. Lets callers use Daytona-specific features that are not surfaced
+   * as typed fields here (e.g. `volumes`, `networkBlockAll`,
+   * `networkAllowList`, `ephemeral`, `autoArchiveInterval`).
+   *
+   * Typed fields on `DaytonaProviderOptions` and `SandboxOptionsBase` take
+   * precedence over keys provided via `createParams`.
+   */
+  createParams?: Partial<
+    CreateSandboxFromSnapshotParams & CreateSandboxFromImageParams
+  >;
 }
 
 export interface VercelGitSource {

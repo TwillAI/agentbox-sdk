@@ -62,6 +62,7 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
     if (existing) {
       this.sandbox = existing;
       await existing.start();
+      this.wasFoundFlag = true;
       return;
     }
 
@@ -98,6 +99,7 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
     };
 
     const sandbox = await this.client.create({
+      ...this.options.provider?.createParams,
       ...createBase,
       snapshot: image,
     });
@@ -110,7 +112,7 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
     command: string | string[],
     options?: CommandOptions,
   ): Promise<CommandResult> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
     const result = await sandbox.process.executeCommand(
       toShellCommand(command),
@@ -133,7 +135,7 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
     command: string | string[],
     options?: CommandOptions,
   ): Promise<AsyncCommandHandle> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
     const sessionId = `agentbox-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     await sandbox.process.createSession(sessionId);
@@ -287,12 +289,12 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
   }
 
   async openPort(port: number): Promise<void> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     await this.requireSandbox().getPreviewLink(port);
   }
 
   async getPreviewLink(port: number): Promise<string> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const sandbox = this.requireSandbox();
     const preview = await sandbox.getPreviewLink(port);
     return preview.url;

@@ -4,15 +4,15 @@ import { AgentProvider, type AgentProviderName } from "../types";
 import { shellQuote } from "../../shared/shell";
 import type {
   AgentSkillConfig,
-  RuntimeTarget,
+  SetupTarget,
   PreparedSkill,
-  RuntimeLayout,
+  SetupLayout,
   TextArtifact,
 } from "./types";
 
 function getSkillTargetDir(
   provider: AgentProviderName,
-  layout: RuntimeLayout,
+  layout: SetupLayout,
   skillName: string,
 ): string {
   switch (provider) {
@@ -21,8 +21,19 @@ function getSkillTargetDir(
     case AgentProvider.OpenCode:
       return path.join(layout.opencodeDir, "skills", skillName);
     case AgentProvider.Codex:
-      return path.join(layout.agentsDir, "skills", skillName);
+      // Codex auto-discovers skills from `<CODEX_HOME>/skills/<name>/SKILL.md`
+      // (and `${cwd}/.codex/skills/...`). Writing them under `codexDir`
+      // means the codex CLI picks them up at startup with no per-turn
+      // wire-protocol injection — `execute()` does not need to know
+      // anything about which skills were configured.
+      return path.join(layout.codexDir, "skills", skillName);
   }
+}
+
+// The upstream `skills` CLI keys agents by their binary name, so we translate
+// our provider identifiers to the value that the CLI recognizes.
+function skillsCliAgentName(provider: AgentProviderName): string {
+  return provider === AgentProvider.OpenCode ? "opencode" : provider;
 }
 
 function buildSkillsInstallerCommand(
@@ -30,13 +41,13 @@ function buildSkillsInstallerCommand(
   skill: Exclude<AgentSkillConfig, { source: "embedded" }>,
 ): string {
   const repo = skill.repo ?? "https://github.com/anthropics/skills";
-  return `npx skills add ${shellQuote(repo)} -g --skill ${shellQuote(skill.name)} --agent ${shellQuote(provider)} -y`;
+  return `npx skills add ${shellQuote(repo)} -g --skill ${shellQuote(skill.name)} --agent ${shellQuote(skillsCliAgentName(provider))} -y`;
 }
 
 export async function prepareSkillArtifacts(
   provider: AgentProviderName,
   skills: AgentSkillConfig[] | undefined,
-  layout: RuntimeLayout,
+  layout: SetupLayout,
 ): Promise<{
   artifacts: TextArtifact[];
   installCommands: string[];
@@ -89,11 +100,14 @@ export function buildSkillsSystemAppendix(
 }
 
 export async function installSkills(
-  target: RuntimeTarget,
+  target: SetupTarget,
   installCommands: string[],
   extraEnv?: Record<string, string>,
 ): Promise<void> {
-  for (const command of installCommands) {
-    await target.runCommand(command, extraEnv);
-  }
+  // Each `npx skills add ...` install touches a distinct skill directory so
+  // they're safe to run concurrently. Sequential execution was costing
+  // multiple seconds per skill on remote sandboxes.
+  await Promise.all(
+    installCommands.map((command) => target.runCommand(command, extraEnv)),
+  );
 }

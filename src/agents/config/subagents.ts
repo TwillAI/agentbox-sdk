@@ -1,6 +1,6 @@
 import path from "node:path";
 
-import type { AgentSubAgentConfig, RuntimeLayout, TextArtifact } from "./types";
+import type { AgentSubAgentConfig, SetupLayout, TextArtifact } from "./types";
 
 function toToolsArray(tools?: string[]): string[] | undefined {
   const filtered = tools?.map((tool) => tool.trim()).filter(Boolean);
@@ -11,26 +11,47 @@ function tomlString(value: string): string {
   return JSON.stringify(value);
 }
 
-export function buildClaudeAgentsConfig(
+/**
+ * YAML-frontmatter scalar escaper. Sub-agent descriptions / names are
+ * arbitrary user input so we have to handle quotes, newlines, and
+ * leading/trailing whitespace. Single-quoted YAML is the simplest safe
+ * form: only `'` itself needs escaping (doubled), nothing else gets
+ * special treatment.
+ */
+function yamlScalar(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/**
+ * Write `~/.claude/agents/<name>.md` files (Markdown + YAML frontmatter)
+ * — Claude Code's native sub-agent format. With `CLAUDE_CONFIG_DIR`
+ * pointed at our layout's claudeDir, the CLI auto-discovers these on
+ * startup. There is no wire-protocol fallback: sub-agents go through
+ * the filesystem only, written once by `setup()` and never re-read by
+ * `execute()`.
+ */
+export function buildClaudeSubagentArtifacts(
   subAgents: AgentSubAgentConfig[] | undefined,
-): Record<string, unknown> | undefined {
+  layout: SetupLayout,
+): TextArtifact[] {
   if (!subAgents || subAgents.length === 0) {
-    return undefined;
+    return [];
   }
 
-  return Object.fromEntries(
-    subAgents.map((subAgent) => [
-      subAgent.name,
-      {
-        description: subAgent.description,
-        prompt: subAgent.instructions,
-        ...(subAgent.model ? { model: subAgent.model } : {}),
-        ...(toToolsArray(subAgent.tools)
-          ? { tools: toToolsArray(subAgent.tools) }
-          : {}),
-      },
-    ]),
-  );
+  return subAgents.map((subAgent) => {
+    const tools = toToolsArray(subAgent.tools);
+    const frontmatterLines = [
+      `name: ${yamlScalar(subAgent.name)}`,
+      `description: ${yamlScalar(subAgent.description)}`,
+      ...(subAgent.model ? [`model: ${yamlScalar(subAgent.model)}`] : []),
+      ...(tools ? [`tools: ${tools.join(", ")}`] : []),
+    ];
+    const content = `---\n${frontmatterLines.join("\n")}\n---\n\n${subAgent.instructions.trim()}\n`;
+    return {
+      path: path.join(layout.claudeDir, "agents", `${subAgent.name}.md`),
+      content,
+    };
+  });
 }
 
 function mapOpenCodeTools(
@@ -63,7 +84,7 @@ export function buildOpenCodeSubagentConfig(
 
 export function buildCodexSubagentArtifacts(
   subAgents: AgentSubAgentConfig[] | undefined,
-  layout: RuntimeLayout,
+  layout: SetupLayout,
 ): {
   artifacts: TextArtifact[];
   agentSections: string[];
@@ -73,12 +94,6 @@ export function buildCodexSubagentArtifacts(
   const agentSections: string[] = [];
 
   for (const subAgent of subAgents ?? []) {
-    if (subAgent.model) {
-      throw new Error(
-        `Codex sub-agent "${subAgent.name}" specifies a model override, which is not supported in this package yet.`,
-      );
-    }
-
     const roleConfigRelativePath = `./agents/${subAgent.name}.toml`;
     const roleConfigPromptPath = `../prompts/${subAgent.name}.md`;
 
@@ -86,16 +101,24 @@ export function buildCodexSubagentArtifacts(
       path: path.join(layout.codexDir, "prompts", `${subAgent.name}.md`),
       content: subAgent.instructions,
     });
+
+    const tomlLines: string[] = [
+      `model_instructions_file = ${tomlString(roleConfigPromptPath)}`,
+    ];
+    if (subAgent.model) {
+      tomlLines.push(`model = ${tomlString(subAgent.model)}`);
+    }
+    tomlLines.push(
+      `model_reasoning_effort = ${tomlString("medium")}`,
+      "",
+      "[features]",
+      "multi_agent = false",
+      "",
+    );
+
     artifacts.push({
       path: path.join(layout.codexDir, "agents", `${subAgent.name}.toml`),
-      content: [
-        `model_instructions_file = ${tomlString(roleConfigPromptPath)}`,
-        `model_reasoning_effort = ${tomlString("medium")}`,
-        "",
-        "[features]",
-        "multi_agent = false",
-        "",
-      ].join("\n"),
+      content: tomlLines.join("\n"),
     });
 
     agentSections.push(

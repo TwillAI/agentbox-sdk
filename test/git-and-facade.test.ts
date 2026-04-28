@@ -91,12 +91,12 @@ describe("public facades", () => {
     expect(sandbox.optionsSnapshot.provider?.unencryptedPorts).toEqual([4242]);
   });
 
-  it("opens the OpenCode sandbox port automatically at runtime", async () => {
+  it("does not auto-open agent harness ports — callers pre-declare them at create time", async () => {
     const openPort = vi.fn(async () => undefined);
     const fakeSandbox = {
       openPort,
       run: vi.fn(async () => {
-        throw new Error("stop after opening port");
+        throw new Error("stop on first run");
       }),
     } as unknown as Sandbox<"local-docker">;
 
@@ -106,9 +106,12 @@ describe("public facades", () => {
     });
 
     await expect(agent.run({ input: "hello" })).rejects.toThrow(
-      "stop after opening port",
+      "stop on first run",
     );
-    expect(openPort).toHaveBeenCalledWith(4096);
+    // Auto-open was removed: the agent must not poke openPort behind the
+    // caller's back. Reserved ports are declared via
+    // `provider.unencryptedPorts` / `provider.ports` at create time.
+    expect(openPort).not.toHaveBeenCalled();
   });
 
   it("accepts resumeSessionId in run config", () => {

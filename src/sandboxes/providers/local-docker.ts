@@ -113,7 +113,7 @@ export class LocalDockerSandboxAdapter extends SandboxAdapter<
     command: string | string[],
     options?: CommandOptions,
   ): Promise<CommandResult> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const container = this.requireContainer();
     const exec = await container.exec({
       AttachStdout: true,
@@ -166,7 +166,7 @@ export class LocalDockerSandboxAdapter extends SandboxAdapter<
     command: string | string[],
     options?: CommandOptions,
   ): Promise<AsyncCommandHandle> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const container = this.requireContainer();
     const exec = await container.exec({
       AttachStdin: true,
@@ -370,7 +370,7 @@ export class LocalDockerSandboxAdapter extends SandboxAdapter<
     content: Buffer | string,
     targetPath: string,
   ): Promise<void> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const container = this.requireContainer();
     const pack = tar.pack();
     const body = Buffer.isBuffer(content)
@@ -382,7 +382,7 @@ export class LocalDockerSandboxAdapter extends SandboxAdapter<
   }
 
   async downloadFile(sourcePath: string): Promise<Buffer> {
-    await this.ensureProvisioned();
+    this.requireProvisioned();
     const container = this.requireContainer();
     const archive = await container.getArchive({ path: sourcePath });
     const chunks: Buffer[] = [];
