@@ -443,12 +443,19 @@ export class E2bSandboxAdapter extends SandboxAdapter<
   private getCommandStartOptions(options?: CommandOptions): {
     cwd: string;
     envs: Record<string, string>;
-    timeoutMs?: number;
+    timeoutMs: number;
   } {
     return {
       cwd: options?.cwd ?? this.workingDir,
       envs: this.getMergedEnv(options?.env),
-      timeoutMs: options?.timeoutMs,
+      // E2B is the only provider whose underlying SDK applies its own
+      // per-command timeout (60_000 ms) when nothing is specified.
+      // local-docker / modal / daytona pass through `undefined` and
+      // let the caller decide, so we do the same here by disabling
+      // E2B's default with `0`. Callers that want a wall-clock cap
+      // pass `timeoutMs` explicitly; everyone else relies on the
+      // sandbox lifecycle / their own AbortController.
+      timeoutMs: options?.timeoutMs ?? 0,
     };
   }
 
