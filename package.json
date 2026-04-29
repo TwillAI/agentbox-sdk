@@ -58,6 +58,7 @@
     "bun": ">=1.1.0"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.123",
     "@daytonaio/sdk": "^0.161.0",
     "@types/debug": "^4.1.13",
     "@vercel/sandbox": "2.0.0-beta.13",

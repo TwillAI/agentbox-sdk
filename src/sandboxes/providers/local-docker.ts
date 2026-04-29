@@ -19,6 +19,7 @@ import { suppressUnhandledRejection } from "../../shared/errors";
 import { readNodeStream } from "../../shared/streams";
 import { toShellCommand } from "../../shared/shell";
 import { resolveSandboxImage, resolveSandboxResources } from "../image-utils";
+import { collectAllAgentReservedPorts } from "../../agents/ports";
 
 export type DockerRaw = {
   client: Docker;
@@ -66,13 +67,20 @@ export class LocalDockerSandboxAdapter extends SandboxAdapter<
     const env = Object.entries(this.getMergedEnv()).map(
       ([key, value]) => `${key}=${value}`,
     );
-    const publishedPorts = this.options.provider?.publishedPorts ?? [];
+    const publishedPorts = this.resolveDefaultPublishedPorts();
+    // Bind every published container port with `HostPort: ""` so Docker
+    // assigns a fresh ephemeral host port for each one. This avoids host
+    // port collisions when several local-docker sandboxes (or other
+    // unrelated processes) want the same well-known agent ports
+    // (43180 for claude-code, 4096 for opencode, etc.) at the same
+    // time. The actual host port is recovered via `getPreviewLink`,
+    // which inspects the container at call time.
     const portBindings =
       publishedPorts.length > 0
         ? Object.fromEntries(
             publishedPorts.map((port) => [
               `${port}/tcp`,
-              [{ HostIp: "127.0.0.1", HostPort: String(port) }],
+              [{ HostIp: "127.0.0.1", HostPort: "" }],
             ]),
           )
         : undefined;
@@ -357,13 +365,33 @@ export class LocalDockerSandboxAdapter extends SandboxAdapter<
       return `http://127.0.0.1:${port}`;
     }
 
-    if (this.options.provider?.publishedPorts?.includes(port)) {
-      return `http://127.0.0.1:${port}`;
+    const declared = this.resolveDefaultPublishedPorts();
+    if (!declared.includes(port)) {
+      throw new Error(
+        `Port ${port} is not reachable from the host. Use local-docker provider.networkMode="host" or provider.publishedPorts to expose it.`,
+      );
     }
 
-    throw new Error(
-      `Port ${port} is not reachable from the host. Use local-docker provider.networkMode=\"host\" or provider.publishedPorts to expose it.`,
-    );
+    // The container was started with `HostPort: ""`, so Docker has
+    // assigned a real ephemeral host port that we need to look up via
+    // `inspect()`. This call is only made when the caller actually
+    // needs a preview URL, so the inspect cost is bounded to the slow
+    // path.
+    const container = this.requireContainer();
+    const inspect = await container.inspect();
+    const portsMap = inspect.NetworkSettings?.Ports ?? {};
+    const bindings = portsMap[`${port}/tcp`];
+    const hostPort = Array.isArray(bindings)
+      ? bindings.find((binding) => binding?.HostPort)?.HostPort
+      : undefined;
+    if (!hostPort) {
+      throw new Error(
+        `Port ${port} is not bound on the local-docker container. ` +
+          `Make sure it is listed in provider.publishedPorts (or covered ` +
+          `by AGENT_RESERVED_PORTS) before findOrProvision().`,
+      );
+    }
+    return `http://127.0.0.1:${hostPort}`;
   }
 
   async uploadFile(
@@ -400,6 +428,33 @@ export class LocalDockerSandboxAdapter extends SandboxAdapter<
     }
 
     return this.container;
+  }
+
+  /**
+   * Local-docker requires ports to be declared at container creation
+   * time (the `PortBindings` host config can't be amended on a running
+   * container). To make `openPort` work predictably across providers,
+   * we pre-publish all well-known agent-harness ports on every
+   * local-docker sandbox we create — mirroring the Modal adapter's
+   * `resolveDefaultUnencryptedPorts` behavior. Any explicit
+   * `provider.publishedPorts` is honored AND merged with the reserved
+   * set, so callers don't have to remember to list the agent's
+   * default port for things like the claude-code SDK relay.
+   *
+   * Network-mode "host" containers don't use port bindings at all, so
+   * we skip the merge in that case.
+   */
+  private resolveDefaultPublishedPorts(): number[] {
+    if (this.options.provider?.networkMode === "host") {
+      return [];
+    }
+    const declared = this.options.provider?.publishedPorts;
+    const reserved = collectAllAgentReservedPorts();
+    const merged = new Set<number>(declared ?? []);
+    for (const port of reserved) {
+      merged.add(port);
+    }
+    return Array.from(merged);
   }
 
   private getLabels(): Record<string, string> {

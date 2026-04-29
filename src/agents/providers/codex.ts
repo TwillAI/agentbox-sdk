@@ -226,14 +226,27 @@ function shouldIgnoreCodexError(notification: CodexNotification): boolean {
   return notification.params?.willRetry === true;
 }
 
-function buildCodexCommandArgs(binary: string, args: string[]): string[] {
+function buildCodexCommandArgs(
+  binary: string,
+  args: string[],
+  options?: AgentOptions<"codex">,
+): string[] {
   // We want codex to read its config from our deterministic layout
   // (`CODEX_HOME` is set by `SetupTarget` to `layout.codexDir`), so
   // unlike older versions of this code we do NOT strip `CODEX_HOME`
   // before launching. We still strip `XDG_CONFIG_HOME` because some
   // sandbox base images set it to a system path that codex would
   // otherwise prefer over `CODEX_HOME`.
-  return ["-u", "XDG_CONFIG_HOME", binary, ...args];
+  //
+  // `-c key=value` overrides are inserted before the subcommand so
+  // they apply across both `codex app-server` and the regular
+  // turn-based invocation. Codex parses each `-c` value as TOML.
+  const overrides: Array<[string, string]> = [];
+  if (options?.provider?.supportsWebsockets === false) {
+    overrides.push(["supports_websockets", "false"]);
+  }
+  const overrideArgs = overrides.flatMap(([k, v]) => ["-c", `${k}=${v}`]);
+  return ["-u", "XDG_CONFIG_HOME", binary, ...overrideArgs, ...args];
 }
 
 function toNormalizedCodexEvents(
@@ -293,8 +306,14 @@ function toNormalizedCodexEvents(
     }
 
     if (item.type === "agentMessage" && typeof item.text === "string") {
+      // Codex streams agentMessage text via `item/agentMessage/delta`
+      // which we already turn into `text.delta` events above. Re-emitting
+      // the full text here as another `text.delta` would double the
+      // accumulated stream (the host sums every `text.delta` into the
+      // final `result.text`) — so the completion only carries
+      // `message.completed`, mirroring the claude-code adapter's
+      // post-streaming behavior.
       return [
-        createNormalizedEvent("text.delta", base, { delta: item.text }),
         createNormalizedEvent("message.completed", base, { text: item.text }),
       ];
     }
@@ -597,10 +616,9 @@ async function ensureCodexLoginViaConfig(
   if (openAiBaseUrl) {
     extraEnv.OPENAI_BASE_URL = openAiBaseUrl;
   }
-  // `CODEX_HOME` is injected by `target.runCommand` (from the layout
-  // env) so the login token lands in our layout's `<codexDir>/auth.json`
-  // (where the app-server will look for it), not in the user's actual
-  // `~/.codex/`. We have
+  // `CODEX_HOME` is inherited from `target.env` so the login token
+  // lands in our layout's `<codexDir>/auth.json` (where the app-server
+  // will look for it), not in the user's actual `~/.codex/`. We have
   // to `mkdir -p` first because sandbox layouts only get materialized
   // by the subsequent tar-extract during `applyDifferentialSetup`, and
   // `codex login` would otherwise fail trying to write `auth.json`
@@ -810,11 +828,15 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
             `(${[
               `nohup ${[
                 "env",
-                ...buildCodexCommandArgs(binary, [
-                  "app-server",
-                  "--listen",
-                  `ws://0.0.0.0:${REMOTE_CODEX_APP_SERVER_PORT}`,
-                ]),
+                ...buildCodexCommandArgs(
+                  binary,
+                  [
+                    "app-server",
+                    "--listen",
+                    `ws://0.0.0.0:${REMOTE_CODEX_APP_SERVER_PORT}`,
+                  ],
+                  options,
+                ),
               ]
                 .map(shellQuote)
                 .join(" ")} > ${shellQuote(logFilePath)} 2>&1 &`,
@@ -925,9 +947,11 @@ async function createRuntime(
   // openai_base_url, model_instructions_file) now lives in
   // `config.toml` written by `setup()`, so the CLI args are
   // spawn-context only.
-  const codexArgs = buildCodexCommandArgs(options.provider?.binary ?? "codex", [
-    "app-server",
-  ]);
+  const codexArgs = buildCodexCommandArgs(
+    options.provider?.binary ?? "codex",
+    ["app-server"],
+    options,
+  );
 
   if (options.sandbox) {
     const handle = await options.sandbox.runAsync(["env", ...codexArgs], {
@@ -1116,7 +1140,12 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       if (text.trim().length > 0) {
         inputItems.push({ type: "text", text, text_elements: [] });
       }
-      pendingTurns++;
+      // Codex's app-server consolidates a follow-up `turn/start` into
+      // whichever turn is currently in flight on this thread — it
+      // does NOT fire a separate `turn/started` / `turn/completed`
+      // pair for the queued message. So we must NOT bump
+      // `pendingTurns` here: the run resolves on the next (single)
+      // `turn/completed`, which carries the merged response.
       const response = await client.request<{ turn?: { id?: string } }>(
         "turn/start",
         buildCodexTurnStartParams({

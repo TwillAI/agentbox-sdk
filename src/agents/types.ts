@@ -102,6 +102,14 @@ export interface CodexProviderOptions {
   brokerEndpoint?: string;
   useBroker?: boolean;
   hooks?: CodexHooksConfig;
+  /**
+   * When `false`, writes `supports_websockets = false` into Codex's
+   * config.toml. Useful in environments where outbound WebSocket
+   * connections from the Codex CLI aren't available (proxies, network
+   * policies). When `true` or omitted, no key is emitted and Codex
+   * uses its built-in default.
+   */
+  supportsWebsockets?: boolean;
 }
 
 export interface OpenCodeProviderOptions {

@@ -368,6 +368,33 @@ export class E2bSandboxAdapter extends SandboxAdapter<
     return host.startsWith("localhost:") ? `http://${host}` : `https://${host}`;
   }
 
+  async uploadFile(
+    content: Buffer | string,
+    targetPath: string,
+  ): Promise<void> {
+    this.requireProvisioned();
+    const sandbox = this.requireSandbox();
+    if (typeof content === "string") {
+      await sandbox.files.write(targetPath, content);
+      return;
+    }
+    // E2B's `files.write` types accept `ArrayBuffer | string | Blob |
+    // ReadableStream`. A Node `Buffer` is a Uint8Array view that may
+    // alias a larger ArrayBuffer (sub-pool slabs); copy into a fresh
+    // Uint8Array so the Blob carries exactly the file's bytes (and so
+    // we don't trip TypeScript's `ArrayBuffer | SharedArrayBuffer`
+    // mismatch when handing the Buffer's underlying memory to Blob).
+    const exactBytes = Uint8Array.from(content);
+    await sandbox.files.write(targetPath, new Blob([exactBytes]));
+  }
+
+  async downloadFile(sourcePath: string): Promise<Buffer> {
+    this.requireProvisioned();
+    const sandbox = this.requireSandbox();
+    const bytes = await sandbox.files.read(sourcePath, { format: "bytes" });
+    return Buffer.from(bytes);
+  }
+
   private async findMatchingSandbox(): Promise<E2bSandbox | undefined> {
     const { Sandbox: E2bSandbox } = await loadE2bModule();
     const matches = await this.list();
