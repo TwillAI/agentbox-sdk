@@ -466,7 +466,7 @@ async function ensureClaudeCodeDaemonUncached(
     const probe = await time(debugRelay, "probe daemon version", () =>
       sandbox.run(
         `curl -fsS --max-time 1 http://127.0.0.1:${DAEMON_PORT}/__version 2>/dev/null`,
-        { cwd: options.cwd, timeoutMs: 3_000 },
+        { cwd: options.cwd, timeoutMs: 10_000 },
       ),
     );
     if (
