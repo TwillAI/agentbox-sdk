@@ -43,13 +43,13 @@ export default {
   run: [
     `apt-get update && apt-get install -y --no-install-recommends ${aptPackages.join(" ")} && rm -rf /var/lib/apt/lists/*`,
     "npm cache clean --force",
-    "npm install -g pnpm @anthropic-ai/claude-code @openai/codex opencode-ai agent-browser",
+    "npm install -g pnpm @anthropic-ai/claude-code @anthropic-ai/claude-agent-sdk @anthropic-ai/claude-agent-sdk @openai/codex opencode-ai agent-browser",
     "agent-browser set viewport 1980 1080",
   ],
   workdir: "/workspace",
   cmd: ["sleep", "infinity"],
   resources: {
-    cpu: 4,
-    memoryMiB: 8192,
+    cpu: 1,
+    memoryMiB: 1024,
   },
 };

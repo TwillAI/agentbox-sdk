@@ -76,6 +76,7 @@ const HOST_AUTH_PATHS = {
 } as const;
 const OPENCODE_CONFIG_CONTENT = buildOpenCodeConfigContent();
 const LOCAL_DOCKER_OPENCODE_PORT = 4096;
+const LOCAL_DOCKER_CLAUDE_CODE_PORT = 43180;
 const MODAL_OPENCODE_PORT = 4096;
 const MODAL_CODEX_PORT = 43181;
 const VERCEL_OPENCODE_PORT = 4096;
@@ -434,6 +435,9 @@ function createSandboxForCombination(
         ...(combination.agentProvider === AgentProvider.OpenCode
           ? { publishedPorts: [LOCAL_DOCKER_OPENCODE_PORT] }
           : {}),
+        ...(combination.agentProvider === AgentProvider.ClaudeCode
+          ? { publishedPorts: [LOCAL_DOCKER_CLAUDE_CODE_PORT] }
+          : {}),
       },
     });
   }
@@ -725,6 +729,11 @@ async function buildVercelMatrixSnapshot(): Promise<string> {
 
   try {
     log("provisioning prep sandbox");
+    // The shared `Sandbox` API now requires an explicit `findOrProvision()`
+    // before any `run`/`uploadFile`/`gitClone` etc. — provisioning is no
+    // longer triggered implicitly. Without this call the snapshot build
+    // would fail with `Sandbox (vercel) is not provisioned`.
+    await prep.findOrProvision();
     const install = await prep.run(
       "sudo npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai",
       { timeoutMs: 5 * 60_000 },

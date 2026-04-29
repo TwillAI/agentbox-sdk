@@ -241,6 +241,13 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
     return {
       id: commandId,
       raw: { sessionId, commandId },
+      write: async (input: string) => {
+        await sandbox.process.sendSessionCommandInput(
+          sessionId,
+          commandId,
+          input,
+        );
+      },
       wait: () => completion,
       kill: async () => {
         killed = true;
@@ -298,6 +305,24 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
     const sandbox = this.requireSandbox();
     const preview = await sandbox.getPreviewLink(port);
     return preview.url;
+  }
+
+  async uploadFile(
+    content: Buffer | string,
+    targetPath: string,
+  ): Promise<void> {
+    this.requireProvisioned();
+    const sandbox = this.requireSandbox();
+    const buffer = Buffer.isBuffer(content)
+      ? content
+      : Buffer.from(content, "utf8");
+    await sandbox.fs.uploadFile(buffer, targetPath);
+  }
+
+  async downloadFile(sourcePath: string): Promise<Buffer> {
+    this.requireProvisioned();
+    const sandbox = this.requireSandbox();
+    return sandbox.fs.downloadFile(sourcePath);
   }
 
   private getLabels(): Record<string, string> {

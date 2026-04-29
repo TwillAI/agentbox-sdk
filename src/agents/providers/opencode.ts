@@ -122,6 +122,21 @@ function extractText(value: unknown): string {
   return "";
 }
 
+function extractAssistantMessageId(response: unknown): string | undefined {
+  if (!response || typeof response !== "object") {
+    return undefined;
+  }
+  const record = response as Record<string, unknown>;
+  const info =
+    record.info && typeof record.info === "object"
+      ? (record.info as Record<string, unknown>)
+      : record.message && typeof record.message === "object"
+        ? (record.message as Record<string, unknown>)
+        : undefined;
+  const id = info?.id ?? record.id;
+  return typeof id === "string" ? id : undefined;
+}
+
 function extractReasoning(value: unknown): string {
   if (!value) {
     return "";
@@ -602,6 +617,18 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
 
     let pendingMessages = 0;
     let finalText = "";
+    // Tracks how much text was streamed via SSE `message.part.delta`
+    // events in this run. Used downstream to decide what portion of the
+    // dispatch-response final text still needs to be emitted as a
+    // `text.delta` (everything SSE missed) without double-emitting what
+    // SSE already delivered.
+    let streamedTextFromSse = "";
+    // Once a dispatch has settled and emitted the final text, suppress
+    // subsequent SSE text deltas for that same assistant message —
+    // OpenCode sometimes flushes the trailing deltas after the POST
+    // resolves, which would re-add text already covered by the
+    // dispatch-side emission.
+    const settledMessageIds = new Set<string>();
     let dispatchError: unknown;
     let firstSseEventLogged = false;
     let resolveAllDone!: () => void;
@@ -739,6 +766,16 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
       }
 
       const announcedUserMessageIds = new Set<string>();
+      // Tracks message ids the SSE bus has reported as belonging to a
+      // *different* session. The OpenCode `/event` stream is server-wide,
+      // so when multiple concurrent runs share a sandbox each run's
+      // listener observes every session's `message.part.delta` events.
+      // Deltas don't always carry `sessionID`, so we use this set as a
+      // fallback filter: any delta whose `messageID` is known-foreign
+      // gets dropped. Deltas with unknown messageIDs default to allowed,
+      // since assistant deltas can arrive before that message's own
+      // `message.updated` notification reaches us.
+      const foreignMessageIds = new Set<string>();
       sseTask = (async () => {
         try {
           for await (const event of streamSse(`${runtime.baseUrl}/event`, {
@@ -790,23 +827,27 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
               if (
                 info &&
                 typeof info.id === "string" &&
-                info.role === "user" &&
-                typeof info.sessionID === "string" &&
-                info.sessionID === sessionId &&
-                !announcedUserMessageIds.has(info.id)
+                typeof info.sessionID === "string"
               ) {
-                announcedUserMessageIds.add(info.id);
-                sink.emitEvent(
-                  createNormalizedEvent(
-                    "message.started",
-                    {
-                      provider: request.provider,
-                      runId: request.runId,
-                      raw,
-                    },
-                    { messageId: info.id },
-                  ),
-                );
+                if (info.sessionID !== sessionId) {
+                  foreignMessageIds.add(info.id);
+                } else if (
+                  info.role === "user" &&
+                  !announcedUserMessageIds.has(info.id)
+                ) {
+                  announcedUserMessageIds.add(info.id);
+                  sink.emitEvent(
+                    createNormalizedEvent(
+                      "message.started",
+                      {
+                        provider: request.provider,
+                        runId: request.runId,
+                        raw,
+                      },
+                      { messageId: info.id },
+                    ),
+                  );
+                }
               }
             }
             if (eventType === "permission.asked") {
@@ -890,9 +931,38 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
               const properties = payloadRecord.properties as
                 | Record<string, unknown>
                 | undefined;
+              // The OpenCode `/event` bus is server-wide; concurrent runs
+              // sharing a sandbox each receive every other session's
+              // deltas. Drop foreign deltas using `properties.sessionID`
+              // when present, else fall back to the messageID set built
+              // from `message.updated` (which always carries sessionID).
+              const eventSessionId =
+                typeof properties?.sessionID === "string"
+                  ? properties.sessionID
+                  : undefined;
+              const eventMessageId =
+                typeof properties?.messageID === "string"
+                  ? properties.messageID
+                  : undefined;
+              const isForeignSession =
+                (eventSessionId !== undefined &&
+                  eventSessionId !== sessionId) ||
+                (eventSessionId === undefined &&
+                  eventMessageId !== undefined &&
+                  foreignMessageIds.has(eventMessageId));
+              if (isForeignSession) {
+                continue;
+              }
+              if (
+                eventMessageId !== undefined &&
+                settledMessageIds.has(eventMessageId)
+              ) {
+                continue;
+              }
               const delta =
                 typeof properties?.delta === "string" ? properties.delta : "";
               if (delta && properties?.field === "text") {
+                streamedTextFromSse += delta;
                 sink.emitEvent(
                   createNormalizedEvent(
                     "text.delta",
@@ -956,6 +1026,13 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
       const dispatchMessage = async (
         parts: OpenCodePromptPart[],
       ): Promise<void> => {
+        // Snapshot the SSE-accumulated text length before the POST so
+        // we can tell whether THIS dispatch produced any streaming
+        // deltas — independently of earlier turns in the same run. If
+        // the length didn't grow by the time the POST resolves, SSE
+        // was silent for this turn and we still need to surface the
+        // response's full text via a `text.delta`.
+        const sseTextLengthBeforeDispatch = streamedTextFromSse.length;
         try {
           const response = await fetchJson<unknown>(
             `${runtime.baseUrl}/session/${sessionId}/message`,
@@ -1011,16 +1088,41 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
           const text = extractText(response);
           if (text) {
             finalText = text;
-            sink.emitEvent(
-              createNormalizedEvent(
-                "text.delta",
-                {
-                  provider: request.provider,
-                  runId: request.runId,
-                },
-                { delta: text },
-              ),
+            // SSE may have streamed any prefix of this turn's text
+            // before the POST resolved (or none at all when the server
+            // flushed the response synchronously). Compute what's
+            // missing and emit just that suffix as a `text.delta`,
+            // avoiding both duplication and dropped trailing text.
+            const sseTextForThisDispatch = streamedTextFromSse.slice(
+              sseTextLengthBeforeDispatch,
             );
+            let missing: string;
+            if (text.startsWith(sseTextForThisDispatch)) {
+              missing = text.slice(sseTextForThisDispatch.length);
+            } else if (sseTextForThisDispatch.length === 0) {
+              missing = text;
+            } else {
+              missing = "";
+            }
+            if (missing.length > 0) {
+              streamedTextFromSse += missing;
+              sink.emitEvent(
+                createNormalizedEvent(
+                  "text.delta",
+                  {
+                    provider: request.provider,
+                    runId: request.runId,
+                  },
+                  { delta: missing },
+                ),
+              );
+            }
+            // Block any post-dispatch SSE flush for this assistant
+            // message from re-emitting text we just covered.
+            const assistantMessageId = extractAssistantMessageId(response);
+            if (assistantMessageId) {
+              settledMessageIds.add(assistantMessageId);
+            }
           }
         } catch (error) {
           if (!dispatchError) {

@@ -5,7 +5,7 @@ import {
   type AgentExecutionRequest,
   type AgentReasoningEffort,
 } from "../src";
-import { buildClaudeCliArgs } from "../src/agents/providers/claude-code";
+import { buildClaudeQueryOptions } from "../src/agents/providers/claude-code";
 import { buildCodexTurnStartParams } from "../src/agents/providers/codex";
 import {
   buildOpenCodeConfig,
@@ -76,28 +76,26 @@ describe("reasoning param", () => {
   });
 
   describe("claude-code", () => {
-    it("appends --effort <level> when reasoning is set", () => {
+    it("forwards reasoning to SDK options as effort", () => {
       for (const level of REASONING_LEVELS) {
-        const args = buildClaudeCliArgs({
-          sdkUrl: "ws://example",
+        const options = buildClaudeQueryOptions({
           request: makeClaudeRequest(level),
           settingsPath: "/tmp/agentbox/claude-code/.claude/settings.json",
           mcpConfigPath: "/tmp/agentbox/claude-code/.claude/agentbox-mcp.json",
+          env: {},
         });
-        const idx = args.indexOf("--effort");
-        expect(idx).toBeGreaterThanOrEqual(0);
-        expect(args[idx + 1]).toBe(level);
+        expect(options.effort).toBe(level);
       }
     });
 
-    it("omits --effort when reasoning is unset", () => {
-      const args = buildClaudeCliArgs({
-        sdkUrl: "ws://example",
+    it("omits effort when reasoning is unset", () => {
+      const options = buildClaudeQueryOptions({
         request: makeClaudeRequest(),
         settingsPath: "/tmp/agentbox/claude-code/.claude/settings.json",
         mcpConfigPath: "/tmp/agentbox/claude-code/.claude/agentbox-mcp.json",
+        env: {},
       });
-      expect(args).not.toContain("--effort");
+      expect(options.effort).toBeUndefined();
     });
   });
 
