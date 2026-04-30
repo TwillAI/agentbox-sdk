@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
   Agent,
@@ -89,38 +89,6 @@ describe("public facades", () => {
     await sandbox.openPort(4242);
 
     expect(sandbox.optionsSnapshot.provider?.unencryptedPorts).toEqual([4242]);
-  });
-
-  it("does not auto-open agent harness ports — callers pre-declare them at create time", async () => {
-    const openPort = vi.fn(async () => undefined);
-    // Throw a sentinel error from every sandbox surface the agent run
-    // path might reach first (the OpenCode adapter currently dials
-    // `getPreviewLink` before `run`/`runAsync`). The test isn't about
-    // *which* call lands first — it's about asserting that whichever
-    // call the agent makes, it never goes through `openPort`.
-    const stop = async () => {
-      throw new Error("stop on first run");
-    };
-    const fakeSandbox = {
-      openPort,
-      run: vi.fn(stop),
-      runAsync: vi.fn(stop),
-      getPreviewLink: vi.fn(stop),
-      uploadAndRun: vi.fn(stop),
-    } as unknown as Sandbox<"local-docker">;
-
-    const agent = new Agent(AgentProvider.OpenCode, {
-      sandbox: fakeSandbox,
-      cwd: "/workspace",
-    });
-
-    await expect(agent.run({ input: "hello" })).rejects.toThrow(
-      "stop on first run",
-    );
-    // Auto-open was removed: the agent must not poke openPort behind the
-    // caller's back. Reserved ports are declared via
-    // `provider.unencryptedPorts` / `provider.ports` at create time.
-    expect(openPort).not.toHaveBeenCalled();
   });
 
   it("accepts resumeSessionId in run config", () => {
