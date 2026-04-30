@@ -137,6 +137,7 @@ export function toAISDKEvent(event: NormalizedAgentEvent): AISDKEvent | null {
       };
     case "message.completed":
     case "run.completed":
+    case "run.cancelled":
       return {
         type: "response-finish",
         id: event.runId,

@@ -103,6 +103,7 @@ export function buildClaudeQueryOptions(params: {
     settings: params.settingsPath,
     extraArgs,
     includePartialMessages: true,
+    thinking: { type: "adaptive", display: "summarized" },
     ...(run.model ? { model: run.model } : {}),
     ...(run.reasoning ? { effort: run.reasoning } : {}),
     ...(provider?.permissionMode
@@ -115,6 +116,18 @@ export function buildClaudeQueryOptions(params: {
       ? { allowedTools: provider.allowedTools }
       : {}),
     ...(run.resumeSessionId ? { resume: run.resumeSessionId } : {}),
+    // Fork-at-message: claude-agent-sdk natively supports slicing a
+    // resumed transcript at a message UUID and writing the continuation
+    // under a new session id when `forkSession: true` is set. The
+    // captured message UUID comes from `SDKAssistantMessage.uuid`,
+    // surfaced on normalized `message.started` events.
+    ...(run.forkSessionId
+      ? {
+          resume: run.forkSessionId,
+          resumeSessionAt: run.forkAtMessageId,
+          forkSession: true,
+        }
+      : {}),
   };
 }
 
@@ -815,6 +828,8 @@ export class ClaudeCodeAgentAdapter
     let pendingMessages = 1;
     let firstStreamEventLogged = false;
     let firstTextDeltaLogged = false;
+    let lastTerminalReason: string | undefined;
+    let lastIsError = false;
     const rawPayloads: Array<Record<string, unknown>> = [];
 
     try {
@@ -914,6 +929,8 @@ export class ClaudeCodeAgentAdapter
 
         if (message.type === "result") {
           const result = message as SDKResultMessage;
+          lastTerminalReason = result.terminal_reason;
+          lastIsError = result.is_error;
           const resultText =
             result.subtype === "success" ? result.result : accumulatedText;
           if (resultText && resultText !== accumulatedText) {
@@ -926,22 +943,50 @@ export class ClaudeCodeAgentAdapter
       }
 
       const finalText = accumulatedText;
-      debugClaude(
-        "★ run.completed (%dms since execute start) chars=%d",
-        Date.now() - executeStartedAt,
-        finalText.length,
-      );
-      sink.emitEvent(
-        createNormalizedEvent(
-          "run.completed",
-          { provider: request.provider, runId: request.runId },
-          { text: finalText },
-        ),
-      );
-      sink.complete({
-        text: finalText,
-        costData: extractClaudeCostData(rawPayloads),
-      });
+      const isCancelled =
+        lastTerminalReason === "aborted_streaming" ||
+        lastTerminalReason === "aborted_tools";
+      // is_error is the authoritative error signal — it covers both
+      // explicit error subtypes and cases where subtype=success but
+      // the run failed (e.g. auth errors after retries exhausted).
+      // Cancel is checked first since aborted runs also have is_error=true.
+      const isError = !isCancelled && lastIsError;
+
+      if (isCancelled) {
+        debugClaude(
+          "★ run.cancelled (%dms since execute start) reason=%s",
+          Date.now() - executeStartedAt,
+          lastTerminalReason,
+        );
+        sink.cancel({
+          text: finalText,
+          costData: extractClaudeCostData(rawPayloads),
+        });
+      } else if (isError) {
+        debugClaude(
+          "★ run.error (%dms since execute start) reason=%s",
+          Date.now() - executeStartedAt,
+          lastTerminalReason,
+        );
+        sink.fail(new Error(finalText || `claude-code run failed (terminal_reason: ${lastTerminalReason})`));
+      } else {
+        debugClaude(
+          "★ run.completed (%dms since execute start) chars=%d",
+          Date.now() - executeStartedAt,
+          finalText.length,
+        );
+        sink.emitEvent(
+          createNormalizedEvent(
+            "run.completed",
+            { provider: request.provider, runId: request.runId },
+            { text: finalText },
+          ),
+        );
+        sink.complete({
+          text: finalText,
+          costData: extractClaudeCostData(rawPayloads),
+        });
+      }
     } finally {
       // Daemon's `req.on('close')` handler will tear down its
       // run-side state when this connection closes.

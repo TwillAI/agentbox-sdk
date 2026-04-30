@@ -25,6 +25,28 @@ export async function readStreamAsText(
   return result;
 }
 
+export async function readStreamAsBytes(
+  stream: ReadableStream<Uint8Array>,
+): Promise<Buffer> {
+  const reader = stream.getReader();
+  const chunks: Buffer[] = [];
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      chunks.push(Buffer.isBuffer(value) ? value : Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return Buffer.concat(chunks);
+}
+
 export async function pipeReadableStream(
   stream: ReadableStream<string> | ReadableStream<Uint8Array>,
   onChunk: (chunk: string) => void,

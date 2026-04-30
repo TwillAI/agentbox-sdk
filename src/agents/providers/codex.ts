@@ -57,7 +57,6 @@ type CodexRuntime = {
   cleanup: () => Promise<void>;
   raw: unknown;
   inputItems: Array<Record<string, unknown>>;
-  turnStartOverrides?: Record<string, unknown>;
 };
 
 type CodexRpcClient = {
@@ -116,6 +115,7 @@ function buildThreadParams(
     // `ephemeral: true` threads have no rollout file and resume fails with
     // "no rollout found for thread id ...".
     experimentalRawEvents: true,
+    developerInstructions: request.run.systemPrompt ?? null,
   };
 }
 
@@ -130,6 +130,40 @@ function buildResumeParams(
     model: request.run.model ?? null,
     approvalPolicy: isInteractiveApproval(options) ? "untrusted" : "never",
     sandbox: buildCodexSandboxMode(options),
+    developerInstructions: request.run.systemPrompt ?? null,
+  };
+}
+
+/**
+ * Codex has no native message-level fork: `thread/fork` only accepts a
+ * `threadId` and copies the entire history. We emulate the fork-at-message
+ * primitive by:
+ *
+ *   1. `thread/fork({ threadId: forkSessionId })` — clones the source
+ *      thread into a new id. The response carries the cloned `thread.turns`
+ *      list so we don't need a separate `thread/resume` round-trip.
+ *   2. Locating `forkAtMessageId` (a turn id captured from a prior run)
+ *      in `thread.turns` and computing how many turns follow it.
+ *   3. `thread/rollback({ threadId, numTurns })` to drop those trailing
+ *      turns. No-op when the fork point is already the last turn.
+ *
+ * Schema source of truth:
+ *   - codex-rs/app-server-protocol/schema/typescript/v2/ThreadForkParams.ts
+ *   - codex-rs/app-server-protocol/schema/typescript/v2/ThreadRollbackParams.ts
+ *   - Turn.ts (Turn.id is the message id we match against).
+ */
+function buildForkParams(
+  cwd: string,
+  options: AgentExecutionRequest<"codex">["options"],
+  request: AgentExecutionRequest<"codex">,
+) {
+  return {
+    threadId: request.run.forkSessionId,
+    cwd,
+    model: request.run.model ?? null,
+    approvalPolicy: isInteractiveApproval(options) ? "untrusted" : "never",
+    sandbox: buildCodexSandboxMode(options),
+    developerInstructions: request.run.systemPrompt ?? null,
   };
 }
 
@@ -162,33 +196,12 @@ function buildTurnSandboxPolicy(
   };
 }
 
-function buildTurnCollaborationMode(
-  request: AgentExecutionRequest<"codex">,
-): Record<string, unknown> | undefined {
-  // The system prompt is per-RUN (in `AgentRunConfig`), so it can vary
-  // between runs even on a shared app-server. Pushing it through a
-  // per-turn collaboration override avoids re-spawning the app-server
-  // and keeps `execute()` independent of any setup-time config files.
-  const systemPrompt = request.run.systemPrompt;
-  if (!systemPrompt) {
-    return undefined;
-  }
-
-  return {
-    mode: "custom",
-    settings: {
-      developer_instructions: systemPrompt,
-    },
-  };
-}
-
 export function buildCodexTurnStartParams(params: {
   threadId: string;
   inputItems: Array<Record<string, unknown>>;
   request: AgentExecutionRequest<"codex">;
-  turnStartOverrides?: Record<string, unknown>;
 }): Record<string, unknown> {
-  const { threadId, inputItems, request, turnStartOverrides } = params;
+  const { threadId, inputItems, request } = params;
   const sandboxPolicy = buildTurnSandboxPolicy(request.options);
   return {
     threadId,
@@ -197,7 +210,6 @@ export function buildCodexTurnStartParams(params: {
       ? "untrusted"
       : "never",
     ...(sandboxPolicy ? { sandboxPolicy } : {}),
-    ...(turnStartOverrides ?? {}),
     model: request.run.model ?? null,
     effort: request.run.reasoning ?? null,
     outputSchema: null,
@@ -727,8 +739,8 @@ async function connectRemoteCodexAppServer(
  *      on `REMOTE_CODEX_APP_SERVER_PORT` (probe + spawn on cold path).
  *
  * No system-prompt file is written: the system prompt is per-RUN
- * (`AgentRunConfig`) and threaded through the per-turn collaboration
- * mode override in `execute()` instead.
+ * (`AgentRunConfig`) and passed as `developerInstructions` in the
+ * `thread/start` params inside `execute()` instead.
  */
 async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
   const options = request.options;
@@ -938,7 +950,6 @@ async function createRuntime(
         codexDir,
       },
       inputItems,
-      turnStartOverrides: buildTurnCollaborationMode(request),
     };
   }
 
@@ -987,7 +998,6 @@ async function createRuntime(
       },
       raw: { handle, codexDir },
       inputItems,
-      turnStartOverrides: buildTurnCollaborationMode(request),
     };
   }
 
@@ -1011,7 +1021,6 @@ async function createRuntime(
     },
     raw: { processHandle, codexDir },
     inputItems,
-    turnStartOverrides: buildTurnCollaborationMode(request),
   };
 }
 
@@ -1065,10 +1074,10 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
     const inputParts = await time(debugCodex, "validateProviderUserInput", () =>
       validateProviderUserInput(request.provider, request.run.input),
     );
-    // The system prompt is per-RUN and is delivered via the per-turn
-    // `buildTurnCollaborationMode` override; agent-config is on disk
-    // and discovered via `CODEX_HOME`. `createRuntime` does the wire
-    // dial / binary spawn from `request.options` directly.
+    // The system prompt is per-RUN and delivered via `developerInstructions`
+    // in the `thread/start` params. Agent-config is on disk and discovered
+    // via `CODEX_HOME`. `createRuntime` does the wire dial / binary spawn
+    // from `request.options` directly.
     const runtime = await time(debugCodex, "createRuntime", () =>
       createRuntime(request, inputParts),
     );
@@ -1091,6 +1100,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
     let rootThreadId: string | undefined;
     let turnId: string | undefined;
     let pendingTurns = 1;
+    let abortInvoked = false;
 
     // Abort handler: first issue `turn/interrupt` so codex writes a
     // proper "interrupted" status into the rollout (without this, a
@@ -1102,6 +1112,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
     // the caller's event loop, keeping the run's isRunning state stuck
     // and blocking the next user message.
     sink.setAbort(async () => {
+      abortInvoked = true;
       const threadIdAtAbort = rootThreadId;
       const turnIdAtAbort = turnId;
       if (threadIdAtAbort && turnIdAtAbort) {
@@ -1164,12 +1175,13 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
     sink.onMessage(sendTurn);
 
     const rawPayloads: Array<Record<string, unknown>> = [];
+    let streamedText = "";
     const completion = new Promise<{
       text?: string;
       turnId?: string;
       threadId?: string;
+      interrupted?: boolean;
     }>((resolve, reject) => {
-      let finalText = "";
 
       void (async () => {
         let firstClientMessageLogged = false;
@@ -1215,7 +1227,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
           for (const event of toNormalizedCodexEvents(request.runId, message)) {
             sink.emitEvent(event);
             if (event.type === "text.delta") {
-              finalText += event.delta;
+              streamedText += event.delta;
             }
           }
 
@@ -1238,7 +1250,16 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
           ) {
             pendingTurns--;
             if (pendingTurns <= 0) {
-              resolve({ text: finalText, turnId, threadId: rootThreadId });
+              const turn = message.params?.turn as
+                | Record<string, unknown>
+                | undefined;
+              const interrupted = turn?.status === "interrupted";
+              resolve({
+                text: streamedText,
+                turnId,
+                threadId: rootThreadId,
+                interrupted,
+              });
               return;
             }
           }
@@ -1269,15 +1290,30 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       }
 
       const cwd = request.options.cwd ?? process.cwd();
-      const threadResponse = request.run.resumeSessionId
-        ? await client.request<{ thread: { id: string } }>(
-            "thread/resume",
-            buildResumeParams(cwd, request.options, request),
-          )
-        : await client.request<{ thread: { id: string } }>(
-            "thread/start",
-            buildThreadParams(cwd, request.options, request),
-          );
+      type CodexThreadResponse = {
+        thread: { id: string; turns?: Array<{ id: string }> };
+      };
+      let threadResponse: CodexThreadResponse;
+      let threadResultEventName: string;
+      if (request.run.forkSessionId) {
+        threadResponse = await client.request<CodexThreadResponse>(
+          "thread/fork",
+          buildForkParams(cwd, request.options, request),
+        );
+        threadResultEventName = "thread/fork:result";
+      } else if (request.run.resumeSessionId) {
+        threadResponse = await client.request<CodexThreadResponse>(
+          "thread/resume",
+          buildResumeParams(cwd, request.options, request),
+        );
+        threadResultEventName = "thread/resume:result";
+      } else {
+        threadResponse = await client.request<CodexThreadResponse>(
+          "thread/start",
+          buildThreadParams(cwd, request.options, request),
+        );
+        threadResultEventName = "thread/start:result";
+      }
       rootThreadId = threadResponse.thread.id;
       if ("bindThread" in client && typeof client.bindThread === "function") {
         client.bindThread(threadResponse.thread.id);
@@ -1285,14 +1321,34 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       sink.setSessionId(threadResponse.thread.id);
       rawPayloads.push(threadResponse);
       sink.emitRaw(
-        toRawEvent(
-          request.runId,
-          threadResponse,
-          request.run.resumeSessionId
-            ? "thread/resume:result"
-            : "thread/start:result",
-        ),
+        toRawEvent(request.runId, threadResponse, threadResultEventName),
       );
+
+      if (request.run.forkSessionId) {
+        const targetTurnId = request.run.forkAtMessageId;
+        const turns = threadResponse.thread.turns ?? [];
+        const targetIndex = turns.findIndex((turn) => turn.id === targetTurnId);
+        if (targetIndex < 0) {
+          throw new Error(
+            `Codex fork: turn id ${String(targetTurnId)} not found in source thread ${request.run.forkSessionId}.`,
+          );
+        }
+        const numTurns = turns.length - 1 - targetIndex;
+        if (numTurns > 0) {
+          const rollbackResponse = await client.request<CodexThreadResponse>(
+            "thread/rollback",
+            { threadId: rootThreadId, numTurns },
+          );
+          rawPayloads.push(rollbackResponse);
+          sink.emitRaw(
+            toRawEvent(
+              request.runId,
+              rollbackResponse,
+              "thread/rollback:result",
+            ),
+          );
+        }
+      }
 
       await client.request<{ turn?: { id?: string } }>(
         "turn/start",
@@ -1300,17 +1356,50 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
           threadId: threadResponse.thread.id,
           inputItems: runtime.inputItems,
           request,
-          turnStartOverrides: runtime.turnStartOverrides,
         }),
       );
 
-      const { text } = await completion;
-      debugCodex(
-        "★ run.completed (%dms since execute start) chars=%d",
-        Date.now() - executeStartedAt,
-        text?.length ?? 0,
-      );
-      sink.complete({ text, costData: extractCodexCostData(rawPayloads) });
+      let completionResult:
+        | { text?: string; turnId?: string; threadId?: string; interrupted?: boolean }
+        | undefined;
+      let completionError: unknown;
+      try {
+        completionResult = await completion;
+      } catch (err) {
+        completionError = err;
+      }
+
+      if (completionError !== undefined) {
+        if (abortInvoked) {
+          debugCodex(
+            "★ run.cancelled (%dms since execute start)",
+            Date.now() - executeStartedAt,
+          );
+          sink.cancel({
+            text: streamedText || undefined,
+            costData: extractCodexCostData(rawPayloads),
+          });
+        } else {
+          sink.fail(completionError);
+        }
+      } else {
+        const { text, interrupted } = completionResult!;
+        if (abortInvoked || interrupted) {
+          debugCodex(
+            "★ run.cancelled (%dms since execute start) interrupted=%s",
+            Date.now() - executeStartedAt,
+            interrupted,
+          );
+          sink.cancel({ text, costData: extractCodexCostData(rawPayloads) });
+        } else {
+          debugCodex(
+            "★ run.completed (%dms since execute start) chars=%d",
+            Date.now() - executeStartedAt,
+            text?.length ?? 0,
+          );
+          sink.complete({ text, costData: extractCodexCostData(rawPayloads) });
+        }
+      }
     } finally {
       await runtime.cleanup().catch(() => undefined);
     }

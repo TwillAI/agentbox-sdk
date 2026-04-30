@@ -129,12 +129,29 @@ export function extractCodexCostData(
 
   for (const event of events) {
     const params = asRecord(event.params);
+    // Codex (codex-rs ≥ 0.116) emits a `thread/tokenUsage/updated`
+    // notification at the end of each turn whose
+    // `params.tokenUsage.last` is the per-turn token counts and
+    // `params.tokenUsage.total` is the cumulative thread total.
+    // Summing `last` across this run's events gives "this run's
+    // cost" even when resuming a thread or queuing follow-up turns
+    // via `sendMessage`. Older codex builds shipped usage either at
+    // the top level, on `params.usage`, on `params.turn.usage`, or
+    // directly on `params.tokenUsage`, so we keep probing those
+    // paths as fallbacks.
+    const tokenUsage = asRecord(params?.tokenUsage);
+    const turn = asRecord(params?.turn);
+    const turnTokenUsage = asRecord(turn?.tokenUsage);
     const usageCandidate =
       asRecord(event.usage) ??
       asRecord(params?.usage) ??
-      asRecord(params?.tokenUsage) ??
-      asRecord(asRecord(params?.turn)?.usage) ??
-      asRecord(asRecord(params?.turn)?.tokenUsage);
+      asRecord(tokenUsage?.last) ??
+      asRecord(tokenUsage?.total) ??
+      tokenUsage ??
+      asRecord(turn?.usage) ??
+      asRecord(turnTokenUsage?.last) ??
+      asRecord(turnTokenUsage?.total) ??
+      turnTokenUsage;
 
     if (usageCandidate) {
       sawUsage = true;
