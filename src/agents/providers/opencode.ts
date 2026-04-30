@@ -286,10 +286,18 @@ export function buildOpenCodeConfig(
       { ...baseAgent, reasoningEffort: level },
     ]),
   );
+  const googleBaseUrl = options.env?.GOOGLE_BASE_URL;
+
   return {
     $schema: "https://opencode.ai/config.json",
     ...(mcpConfig ? { mcp: mcpConfig } : {}),
     ...(commandsConfig ? { command: commandsConfig } : {}),
+    provider: {
+      openrouter: { options: { baseURL: "https://openrouter.ai/api/v1" } },
+      ...(googleBaseUrl
+        ? { google: { options: { baseURL: googleBaseUrl } } }
+        : {}),
+    },
     agent: {
       agentbox: baseAgent,
       ...reasoningVariants,
@@ -701,6 +709,8 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
     // or resumed). The abort handler closes over this ref and reads the
     // current value at call time.
     let capturedSessionId: string | undefined;
+    let sessionErrorFromSse: Error | undefined;
+    let sessionAbortedFromSse = false;
 
     // Abort handler: prefer opencode's `POST /session/:id/abort` so the
     // server terminates the turn cleanly and stops billing tokens. Then
@@ -709,7 +719,9 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
     // `runtime.cleanup()` here because the opencode server is shared
     // across runs (see `ensureSandboxOpenCodeServer`); tearing it down
     // would break subsequent chats.
+    let userAbortRequested = false;
     sink.setAbort(async () => {
+      userAbortRequested = true;
       const sessionIdAtAbort = capturedSessionId;
       if (sessionIdAtAbort) {
         try {
@@ -742,23 +754,48 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
 
     try {
       const interactiveApproval = isInteractiveApproval(request.options);
-      const createdSession = request.run.resumeSessionId
-        ? null
-        : await fetchJson<{ id?: string; sessionId?: string }>(
-            `${runtime.baseUrl}/session`,
-            {
-              method: "POST",
-              headers: {
-                "content-type": "application/json",
-                ...runtime.previewHeaders,
-              },
-              body: JSON.stringify({
-                title: `AgentBox ${request.runId}`,
-              }),
+      // Three branches around session resolution:
+      // 1. resumeSessionId — reuse the session id directly, no HTTP call.
+      // 2. forkSessionId   — POST /session/:id/fork { messageID } to slice
+      //    the source session up to the chosen message and continue under
+      //    a new session id.
+      // 3. neither         — POST /session to create a fresh session.
+      let forkedSession: { id?: string; sessionId?: string } | null = null;
+      if (request.run.forkSessionId) {
+        forkedSession = await fetchJson<{ id?: string; sessionId?: string }>(
+          `${runtime.baseUrl}/session/${encodeURIComponent(request.run.forkSessionId)}/fork`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              ...runtime.previewHeaders,
             },
-          );
+            body: JSON.stringify({
+              messageID: request.run.forkAtMessageId,
+            }),
+          },
+        );
+      }
+      const createdSession =
+        request.run.resumeSessionId || forkedSession
+          ? null
+          : await fetchJson<{ id?: string; sessionId?: string }>(
+              `${runtime.baseUrl}/session`,
+              {
+                method: "POST",
+                headers: {
+                  "content-type": "application/json",
+                  ...runtime.previewHeaders,
+                },
+                body: JSON.stringify({
+                  title: `AgentBox ${request.runId}`,
+                }),
+              },
+            );
       const sessionId =
         request.run.resumeSessionId ??
+        forkedSession?.id ??
+        forkedSession?.sessionId ??
         createdSession?.id ??
         createdSession?.sessionId;
       if (!sessionId) {
@@ -918,6 +955,26 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                   ? properties.sessionID
                   : undefined;
               if (!eventSessionId || eventSessionId === sessionId) {
+                if (payloadRecord.type === "session.error") {
+                  const errData = properties?.error as
+                    | Record<string, unknown>
+                    | undefined;
+                  if (errData?.name === "MessageAbortedError") {
+                    // opencode reports user-initiated (or server-side)
+                    // message abort as MessageAbortedError — treat as cancel.
+                    sessionAbortedFromSse = true;
+                  } else {
+                    const errMsg =
+                      typeof (errData?.data as Record<string, unknown>)
+                        ?.message === "string"
+                        ? ((errData!.data as Record<string, unknown>)
+                            .message as string)
+                        : typeof errData?.message === "string"
+                          ? (errData.message as string)
+                          : "OpenCode session error";
+                    sessionErrorFromSse = new Error(errMsg);
+                  }
+                }
                 debugOpencode(
                   "★ %s for session=%s — aborting in-flight dispatch",
                   payloadRecord.type,
@@ -1154,39 +1211,60 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
 
       await allDone;
 
-      // Treat dispatchAbort-induced errors as a clean termination: an
-      // abort is the explicit "stop this turn" signal (either in-process
-      // `run.abort()` or remote `Agent.attach({...}).abort()` whose
-      // server-side `/abort` we then mirror locally via the SSE
-      // `session.idle` listener above). Bubbling the AbortError as a
-      // run failure was wrong — it surfaced a fake "OpenCode failed"
-      // every time a user pressed Stop.
-      if (dispatchError && !dispatchAbort.signal.aborted) {
-        throw dispatchError;
+      if (userAbortRequested || sessionAbortedFromSse) {
+        debugOpencode(
+          "★ run.cancelled (%dms since execute start)",
+          Date.now() - executeStartedAt,
+        );
+        sseAbort.abort();
+        await sseTask;
+        sink.cancel({
+          text: streamedTextFromSse || undefined,
+          costData: extractOpenCodeCostData(rawPayloads),
+        });
+      } else if (sessionErrorFromSse) {
+        sseAbort.abort();
+        await sseTask;
+        sink.fail(sessionErrorFromSse);
+      } else if (
+        dispatchError &&
+        !(
+          dispatchAbort.signal.aborted &&
+          (dispatchError as Error)?.name === "AbortError"
+        )
+      ) {
+        // Only surface real dispatch errors. When dispatchAbort is
+        // signalled (by session.idle or session.error), the in-flight
+        // POST gets an AbortError as a side-effect of our own abort;
+        // that is not a real error — the SSE terminal event is
+        // authoritative. session.error is already handled above via
+        // sessionErrorFromSse; session.idle means clean completion.
+        sseAbort.abort();
+        await sseTask;
+        sink.fail(dispatchError);
+      } else {
+        debugOpencode(
+          "★ run.completed (%dms since execute start) chars=%d",
+          Date.now() - executeStartedAt,
+          finalText.length,
+        );
+        sink.emitEvent(
+          createNormalizedEvent(
+            "run.completed",
+            {
+              provider: request.provider,
+              runId: request.runId,
+            },
+            { text: finalText },
+          ),
+        );
+        sseAbort.abort();
+        await sseTask;
+        sink.complete({
+          text: finalText,
+          costData: extractOpenCodeCostData(rawPayloads),
+        });
       }
-
-      debugOpencode(
-        "★ run.completed (%dms since execute start) chars=%d",
-        Date.now() - executeStartedAt,
-        finalText.length,
-      );
-      sink.emitEvent(
-        createNormalizedEvent(
-          "run.completed",
-          {
-            provider: request.provider,
-            runId: request.runId,
-          },
-          { text: finalText },
-        ),
-      );
-
-      sseAbort.abort();
-      await sseTask;
-      sink.complete({
-        text: finalText,
-        costData: extractOpenCodeCostData(rawPayloads),
-      });
     } finally {
       sseAbort.abort();
       if (sseTask) {

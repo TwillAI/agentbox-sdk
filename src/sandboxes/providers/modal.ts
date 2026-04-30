@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import { ModalClient } from "modal";
 import type { Image as ModalImage } from "modal";
 import type { Sandbox as ModalSandboxObject } from "modal";
@@ -15,8 +17,12 @@ import {
 } from "../types";
 import { AsyncQueue } from "../../shared/async-queue";
 import { suppressUnhandledRejection } from "../../shared/errors";
-import { pipeReadableStream, readStreamAsText } from "../../shared/streams";
-import { toShellCommand } from "../../shared/shell";
+import {
+  pipeReadableStream,
+  readStreamAsBytes,
+  readStreamAsText,
+} from "../../shared/streams";
+import { shellQuote, toShellCommand } from "../../shared/shell";
 import { resolveSandboxImage, resolveSandboxResources } from "../image-utils";
 import { collectAllAgentReservedPorts } from "../../agents/ports";
 import { buildTarball, type TarballEntry } from "../tarball";
@@ -302,6 +308,101 @@ export class ModalSandboxAdapter extends SandboxAdapter<
       combinedOutput: `${stdout}${stderr}`,
       raw: process,
     };
+  }
+
+  /**
+   * Upload `content` to `targetPath` inside the Modal sandbox.
+   *
+   * Modal's TS SDK only exposes a `Sandbox.open()` FileIO handle for direct
+   * filesystem access, which is deprecated and capped at 100 MiB per
+   * operation. To match the cross-provider semantics (works for arbitrarily
+   * large artifacts, parent dirs are created on demand), we instead pipe
+   * raw bytes through stdin into a single `mkdir -p … && cat > …` shell —
+   * the same single-exec pattern `uploadAndRun` uses.
+   */
+  override async uploadFile(
+    content: Buffer | string,
+    targetPath: string,
+  ): Promise<void> {
+    this.requireProvisioned();
+    const sandbox = this.requireSandbox();
+
+    const data = Buffer.isBuffer(content)
+      ? content
+      : Buffer.from(content, "utf8");
+
+    const dir = path.posix.dirname(targetPath);
+    const wrapped =
+      dir && dir !== "." && dir !== "/"
+        ? `set -e; mkdir -p ${shellQuote(dir)}; cat > ${shellQuote(targetPath)}`
+        : `set -e; cat > ${shellQuote(targetPath)}`;
+
+    const proc = await sandbox.exec(["/bin/sh", "-c", wrapped], {
+      mode: "binary",
+    });
+
+    const writer = (
+      proc.stdin as unknown as WritableStream<Uint8Array>
+    ).getWriter();
+    try {
+      await writer.write(data);
+      await writer.close();
+    } finally {
+      try {
+        writer.releaseLock();
+      } catch {
+        // Lock may already be released after close in some runtimes.
+      }
+    }
+
+    const [stderrBytes, exitCode] = await Promise.all([
+      readStreamAsBytes(proc.stderr),
+      proc.wait(),
+    ]);
+
+    if (exitCode !== 0) {
+      const stderr = stderrBytes.toString("utf8").trim();
+      throw new Error(
+        `Failed to upload file to Modal sandbox at ${targetPath} (exit ${exitCode})${
+          stderr ? `: ${stderr}` : ""
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Download a file from the Modal sandbox as raw bytes.
+   *
+   * Implemented by `cat`-ing the file in a binary-mode `exec` and
+   * collecting stdout. This matches the cross-provider contract (returns a
+   * Node `Buffer` of the file's exact bytes) and avoids the deprecated
+   * 100 MiB FileIO cap on `Sandbox.open()`.
+   */
+  override async downloadFile(sourcePath: string): Promise<Buffer> {
+    this.requireProvisioned();
+    const sandbox = this.requireSandbox();
+
+    const proc = await sandbox.exec(
+      ["/bin/sh", "-c", `cat -- ${shellQuote(sourcePath)}`],
+      { mode: "binary" },
+    );
+
+    const [stdoutBytes, stderrBytes, exitCode] = await Promise.all([
+      readStreamAsBytes(proc.stdout),
+      readStreamAsBytes(proc.stderr),
+      proc.wait(),
+    ]);
+
+    if (exitCode !== 0) {
+      const stderr = stderrBytes.toString("utf8").trim();
+      throw new Error(
+        `Failed to download file from Modal sandbox at ${sourcePath} (exit ${exitCode})${
+          stderr ? `: ${stderr}` : ""
+        }`,
+      );
+    }
+
+    return stdoutBytes;
   }
 
   async list(options?: SandboxListOptions): Promise<SandboxDescriptor[]> {

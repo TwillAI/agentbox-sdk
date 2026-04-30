@@ -306,6 +306,169 @@ class OpenCodeLogAssembler {
   }
 }
 
+class ClaudeCodeLogAssembler {
+  private currentMessageId: string | null = null;
+  private readonly textByMessageId = new Map<string, string>();
+  private readonly thinkingByMessageId = new Map<string, string>();
+  private readonly byMessageId = new Map<string, JsonRecord>();
+
+  process(event: unknown): JsonRecord[] {
+    if (!isRecord(event)) return [];
+
+    const type = typeof event.type === "string" ? event.type : "";
+
+    if (type === "stream_event") {
+      const stream = isRecord(event.event) ? event.event : null;
+      if (!stream) return [];
+      const streamType = typeof stream.type === "string" ? stream.type : "";
+
+      if (streamType === "message_start") {
+        const message = isRecord(stream.message) ? stream.message : null;
+        const id = message && typeof message.id === "string" ? message.id : null;
+        if (!id) return [];
+        this.currentMessageId = id;
+        if (!this.textByMessageId.has(id)) this.textByMessageId.set(id, "");
+        if (!this.thinkingByMessageId.has(id))
+          this.thinkingByMessageId.set(id, "");
+        return [this.upsertMessage(id)];
+      }
+
+      if (streamType === "content_block_delta") {
+        const id = this.currentMessageId;
+        if (!id) return [];
+        const delta = isRecord(stream.delta) ? stream.delta : null;
+        if (!delta) return [];
+        if (
+          delta.type === "text_delta" &&
+          typeof delta.text === "string" &&
+          delta.text
+        ) {
+          const text = (this.textByMessageId.get(id) ?? "") + delta.text;
+          this.textByMessageId.set(id, text);
+          return [this.upsertMessage(id)];
+        }
+        if (
+          delta.type === "thinking_delta" &&
+          typeof delta.thinking === "string" &&
+          delta.thinking
+        ) {
+          const thinking =
+            (this.thinkingByMessageId.get(id) ?? "") + delta.thinking;
+          this.thinkingByMessageId.set(id, thinking);
+          return [this.upsertMessage(id)];
+        }
+        return [];
+      }
+
+      // content_block_start/stop, message_delta, message_stop are intentionally
+      // dropped — their per-event uuids would pollute the assembled stream and
+      // their state is captured via deltas / the final assistant message.
+      return [];
+    }
+
+    if (type === "assistant") {
+      const message = isRecord(event.message) ? event.message : null;
+      const id =
+        message && typeof message.id === "string" ? message.id : null;
+      if (!id || !message) {
+        return [clone(event)];
+      }
+
+      const final = extractClaudeAssistantContent(message);
+      this.textByMessageId.set(id, final.text);
+      this.thinkingByMessageId.set(id, final.thinking);
+      const snapshot = this.upsertMessage(id, final.extraBlocks);
+      this.currentMessageId = null;
+      return [snapshot];
+    }
+
+    return [clone(event)];
+  }
+
+  seed(snapshots: JsonRecord[]): void {
+    this.currentMessageId = null;
+    this.textByMessageId.clear();
+    this.thinkingByMessageId.clear();
+    this.byMessageId.clear();
+
+    for (const snapshot of snapshots) {
+      if (!isRecord(snapshot)) continue;
+      if (snapshot.type !== "message.updated") continue;
+      const messageId =
+        typeof snapshot.messageId === "string" ? snapshot.messageId : null;
+      if (!messageId) continue;
+      this.byMessageId.set(messageId, clone(snapshot));
+      const message = isRecord(snapshot.message) ? snapshot.message : null;
+      const content =
+        message && Array.isArray(message.content) ? message.content : [];
+      let text = "";
+      let thinking = "";
+      for (const block of content) {
+        if (!isRecord(block)) continue;
+        if (block.type === "text" && typeof block.text === "string") {
+          text += block.text;
+        } else if (
+          block.type === "thinking" &&
+          typeof block.thinking === "string"
+        ) {
+          thinking += block.thinking;
+        }
+      }
+      this.textByMessageId.set(messageId, text);
+      this.thinkingByMessageId.set(messageId, thinking);
+    }
+  }
+
+  private upsertMessage(
+    messageId: string,
+    extraBlocks: JsonRecord[] = [],
+  ): JsonRecord {
+    const text = this.textByMessageId.get(messageId) ?? "";
+    const thinking = this.thinkingByMessageId.get(messageId) ?? "";
+    const content: JsonRecord[] = [];
+    if (text) content.push({ type: "text", text });
+    if (thinking) content.push({ type: "thinking", thinking });
+    for (const block of extraBlocks) content.push(clone(block));
+
+    const next: JsonRecord = {
+      type: "message.updated",
+      messageId,
+      message: {
+        id: messageId,
+        role: "assistant",
+        content,
+      },
+    };
+    this.byMessageId.set(messageId, next);
+    return clone(next);
+  }
+}
+
+function extractClaudeAssistantContent(message: JsonRecord): {
+  text: string;
+  thinking: string;
+  extraBlocks: JsonRecord[];
+} {
+  const content = Array.isArray(message.content) ? message.content : [];
+  let text = "";
+  let thinking = "";
+  const extraBlocks: JsonRecord[] = [];
+  for (const block of content) {
+    if (!isRecord(block)) continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      text += block.text;
+    } else if (
+      block.type === "thinking" &&
+      typeof block.thinking === "string"
+    ) {
+      thinking += block.thinking;
+    } else {
+      extraBlocks.push(clone(block));
+    }
+  }
+  return { text, thinking, extraBlocks };
+}
+
 /**
  * Provider-aware assembler that routes raw events through the right
  * per-provider implementation. Stateful: holds dedup/text maps so it can
@@ -334,6 +497,7 @@ class OpenCodeLogAssembler {
 export class ProviderLogAssembler {
   private readonly codex = new CodexLogAssembler();
   private readonly openCode = new OpenCodeLogAssembler();
+  private readonly claudeCode = new ClaudeCodeLogAssembler();
 
   /**
    * Process a raw provider event and return any newly-produced assembled
@@ -349,6 +513,12 @@ export class ProviderLogAssembler {
     }
     if (provider === AgentProvider.OpenCode || provider === "opencode") {
       return this.openCode.process(event);
+    }
+    if (
+      provider === AgentProvider.ClaudeCode ||
+      provider === "claude-code"
+    ) {
+      return this.claudeCode.process(event);
     }
     if (isRecord(event)) {
       return [clone(event)];
@@ -374,6 +544,13 @@ export class ProviderLogAssembler {
       this.openCode.seed(snapshots);
       return;
     }
+    if (
+      provider === AgentProvider.ClaudeCode ||
+      provider === "claude-code"
+    ) {
+      this.claudeCode.seed(snapshots);
+      return;
+    }
   }
 
   /**
@@ -381,8 +558,7 @@ export class ProviderLogAssembler {
    * for a run), return one entry per item / part with the latest snapshot
    * winning, preserving first-seen order.
    *
-   * For providers that don't have a stateful item model (Claude Code), or
-   * for unrecognized snapshot shapes, entries are returned in original order
+   * For unrecognized snapshot shapes, entries are returned in original order
    * with no dedup.
    */
   static dedupeSnapshots(
@@ -394,6 +570,16 @@ export class ProviderLogAssembler {
         const params = isRecord(snapshot.params) ? snapshot.params : null;
         const item = params && isRecord(params.item) ? params.item : null;
         return item && typeof item.id === "string" ? `item:${item.id}` : null;
+      });
+    }
+    if (
+      provider === AgentProvider.ClaudeCode ||
+      provider === "claude-code"
+    ) {
+      return dedupeByKey(snapshots, (snapshot) => {
+        const messageId =
+          typeof snapshot.messageId === "string" ? snapshot.messageId : null;
+        return messageId ? `message:${messageId}` : null;
       });
     }
     if (provider === AgentProvider.OpenCode || provider === "opencode") {

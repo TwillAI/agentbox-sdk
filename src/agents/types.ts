@@ -52,6 +52,26 @@ export interface AgentRunConfig {
   model?: string;
   systemPrompt?: string;
   resumeSessionId?: string;
+  /**
+   * Source session/thread to fork from. The new run begins in a *new*
+   * session whose history is the prefix of the source up to and including
+   * {@link forkAtMessageId}. Mutually exclusive with {@link resumeSessionId}.
+   * Requires {@link forkAtMessageId}.
+   *
+   * Provider mapping:
+   * - claude-code: `query({ resume, resumeSessionAt, forkSession: true })`
+   * - opencode: `POST /session/:forkSessionId/fork { messageID }`
+   * - codex: emulated via `thread/fork` + `thread/rollback` (no native
+   *   message-level fork in the codex app-server)
+   */
+  forkSessionId?: string;
+  /**
+   * Provider-native message id (claude-code: assistant message UUID;
+   * opencode: message info id; codex: turn id) to fork at — inclusive.
+   * The unified `messageId` field on `message.started` events carries the
+   * value to feed back here. Required when {@link forkSessionId} is set.
+   */
+  forkAtMessageId?: string;
   reasoning?: AgentReasoningEffort;
 }
 
@@ -167,6 +187,8 @@ export interface AgentResult {
   provider: AgentProviderName;
   sessionId: string;
   text: string;
+  isCancelled: boolean;
+  error?: string;
   rawEvents: RawAgentEvent[];
   events: NormalizedAgentEvent[];
   costData?: AgentCostData | null;
@@ -199,6 +221,7 @@ export interface AgentRunSink {
     handler: (content: UserContent) => Promise<{ messageId?: string } | void>,
   ): void;
   complete(result?: { text?: string; costData?: AgentCostData | null }): void;
+  cancel(result?: { text?: string; costData?: AgentCostData | null }): void;
   fail(error: unknown): void;
 }
 

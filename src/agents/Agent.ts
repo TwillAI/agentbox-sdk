@@ -156,19 +156,16 @@ class AgentRunController implements AgentRun, AgentRunSink {
   private readonly resolveSessionIdReady: (value: string) => void;
   private readonly rejectSessionIdReady: (reason?: unknown) => void;
   private readonly resolveFinished: (value: AgentResult) => void;
-  private readonly rejectFinished: (reason?: unknown) => void;
 
   constructor(provider: AgentProviderName, id: string) {
     this.provider = provider;
     this.id = id;
 
     let resolveFinished!: (value: AgentResult) => void;
-    let rejectFinished!: (reason?: unknown) => void;
     let resolveSessionIdReady!: (value: string) => void;
     let rejectSessionIdReady!: (reason?: unknown) => void;
-    this.finished = new Promise<AgentResult>((resolve, reject) => {
+    this.finished = new Promise<AgentResult>((resolve) => {
       resolveFinished = resolve;
-      rejectFinished = reject;
     });
     this.sessionIdReady = new Promise<string>((resolve, reject) => {
       resolveSessionIdReady = resolve;
@@ -176,7 +173,6 @@ class AgentRunController implements AgentRun, AgentRunSink {
     });
     void this.sessionIdReady.catch(() => undefined);
     this.resolveFinished = resolveFinished;
-    this.rejectFinished = rejectFinished;
     this.resolveSessionIdReady = resolveSessionIdReady;
     this.rejectSessionIdReady = rejectSessionIdReady;
   }
@@ -345,11 +341,20 @@ class AgentRunController implements AgentRun, AgentRunSink {
     this.eventQueue.finish();
     this.rawQueue.finish();
     if (!this.sessionId) {
-      const error = new Error(
-        "Agent run completed before a provider session id was set.",
-      );
-      this.rejectSessionIdReady(error);
-      this.rejectFinished(error);
+      const errorMsg =
+        "Agent run completed before a provider session id was set.";
+      this.rejectSessionIdReady(new Error(errorMsg));
+      this.resolveFinished({
+        id: this.id,
+        provider: this.provider,
+        sessionId: "",
+        text: this.text,
+        rawEvents: [...this.rawEventsList],
+        events: [...this.events],
+        costData: this.costData,
+        isCancelled: false,
+        error: errorMsg,
+      });
       return;
     }
     this.resolveFinished({
@@ -360,6 +365,44 @@ class AgentRunController implements AgentRun, AgentRunSink {
       rawEvents: [...this.rawEventsList],
       events: [...this.events],
       costData: this.costData,
+      isCancelled: false,
+    });
+  }
+
+  cancel(result?: { text?: string; costData?: AgentCostData | null }): void {
+    if (this.settled) {
+      return;
+    }
+
+    this.settled = true;
+    this.clearPendingPermissions(
+      new Error("Agent run was cancelled before pending permission requests resolved."),
+    );
+    if (result?.text) {
+      this.text = result.text;
+    }
+    if (result && "costData" in result) {
+      this.costData = result.costData ?? null;
+    }
+
+    this.emitEvent(
+      createNormalizedEvent(
+        "run.cancelled",
+        { provider: this.provider, runId: this.id },
+        { text: this.text || undefined },
+      ),
+    );
+    this.eventQueue.finish();
+    this.rawQueue.finish();
+    this.resolveFinished({
+      id: this.id,
+      provider: this.provider,
+      sessionId: this.sessionId ?? "",
+      text: this.text,
+      rawEvents: [...this.rawEventsList],
+      events: [...this.events],
+      costData: this.costData,
+      isCancelled: true,
     });
   }
 
@@ -388,7 +431,17 @@ class AgentRunController implements AgentRun, AgentRunSink {
     if (!this.sessionId) {
       this.rejectSessionIdReady(normalizedError);
     }
-    this.rejectFinished(normalizedError);
+    this.resolveFinished({
+      id: this.id,
+      provider: this.provider,
+      sessionId: this.sessionId ?? "",
+      text: this.text,
+      rawEvents: [...this.rawEventsList],
+      events: [...this.events],
+      costData: this.costData,
+      isCancelled: false,
+      error: normalizedError.message,
+    });
   }
 
   async abort(): Promise<void> {
@@ -482,6 +535,22 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
   }
 
   stream(runConfig: AgentRunConfig): AgentRun {
+    if (runConfig.resumeSessionId && runConfig.forkSessionId) {
+      throw new Error(
+        "AgentRunConfig.resumeSessionId and forkSessionId are mutually exclusive.",
+      );
+    }
+    if (runConfig.forkSessionId && !runConfig.forkAtMessageId) {
+      throw new Error(
+        "AgentRunConfig.forkSessionId requires forkAtMessageId.",
+      );
+    }
+    if (runConfig.forkAtMessageId && !runConfig.forkSessionId) {
+      throw new Error(
+        "AgentRunConfig.forkAtMessageId requires forkSessionId.",
+      );
+    }
+
     const runId = runConfig.runId ?? randomUUID();
     const streamCalledAt = Date.now();
     debugAgent("stream() provider=%s runId=%s", this.provider, runId);

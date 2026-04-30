@@ -17,6 +17,7 @@ export type NormalizedAgentEventType =
   | "permission.resolved"
   | "message.completed"
   | "run.completed"
+  | "run.cancelled"
   | "run.error";
 
 export interface NormalizedAgentEventBase {
@@ -119,6 +120,11 @@ export interface RunCompletedEvent extends NormalizedAgentEventBase {
   text?: string;
 }
 
+export interface RunCancelledEvent extends NormalizedAgentEventBase {
+  type: "run.cancelled";
+  text?: string;
+}
+
 export interface RunErrorEvent extends NormalizedAgentEventBase {
   type: "run.error";
   error: string;
@@ -137,6 +143,7 @@ export type NormalizedAgentEvent =
   | PermissionResolvedEvent
   | MessageCompletedEvent
   | RunCompletedEvent
+  | RunCancelledEvent
   | RunErrorEvent;
 
 export function createNormalizedEvent<TType extends NormalizedAgentEventType>(
