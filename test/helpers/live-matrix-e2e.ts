@@ -735,7 +735,7 @@ async function buildVercelMatrixSnapshot(): Promise<string> {
     // would fail with `Sandbox (vercel) is not provisioned`.
     await prep.findOrProvision();
     const install = await prep.run(
-      "sudo npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai",
+      "sudo npm install -g @anthropic-ai/claude-code @anthropic-ai/claude-agent-sdk @openai/codex opencode-ai",
       { timeoutMs: 5 * 60_000 },
     );
     if (install.exitCode !== 0) {
