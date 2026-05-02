@@ -88,8 +88,8 @@ export class Sandbox<P extends SandboxProviderName = SandboxProviderName> {
    * idempotent setup that the previous run already performed (e.g.
    * `agent.setup()`). Always `false` before `findOrProvision()` resolves.
    */
-  get wasFound(): boolean {
-    return this.adapter.wasFound;
+  get isWarm(): boolean {
+    return this.adapter.isWarm;
   }
 
   /**

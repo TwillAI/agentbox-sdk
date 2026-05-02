@@ -33,7 +33,12 @@ import {
 import { buildOpenCodeMcpConfig } from "../config/mcp";
 import { createSetupTarget } from "../config/setup";
 import { prepareSkillArtifacts } from "../config/skills";
-import { applyDifferentialSetup } from "../config/setup-manifest";
+import {
+  applyDifferentialSetup,
+  computeSetupId,
+  markSetupComplete,
+  preflightSetup,
+} from "../config/setup-manifest";
 import { buildOpenCodeSubagentConfig } from "../config/subagents";
 import { fetchJson, streamSse } from "../transports/app-server";
 import { spawnCommand, waitForHttpReady } from "../transports/spawn";
@@ -263,14 +268,18 @@ export function openCodeAgentSlug(reasoning?: string): string {
 
 export function buildOpenCodeConfig(
   options: AgentOptions<"open-code">,
-  systemPrompt: string,
   interactiveApproval: boolean,
 ) {
   const mcpConfig = buildOpenCodeMcpConfig(options.mcps);
   const commandsConfig = buildOpenCodeCommandsConfig(options.commands);
+  // System prompt is intentionally NOT baked into the agent here.
+  // `dispatchMessage` passes `system: request.run.systemPrompt` on the
+  // POST /session/:id/message body, so changing the system prompt
+  // doesn't invalidate setupId and doesn't trigger a re-setup. See:
+  // https://opencode.ai/docs/server/ and packages/opencode/src/session/prompt.ts
+  // (createUserMessage assigns `system: input.system`).
   const baseAgent = {
     mode: "primary",
-    prompt: systemPrompt,
     permission: buildOpenCodePermissionConfig(interactiveApproval),
     tools: {
       write: true,
@@ -309,12 +318,14 @@ export function buildOpenCodeConfig(
 /**
  * Sandbox-side preparation for opencode (remote case). Idempotent:
  *
- *   1. Probe `127.0.0.1:SANDBOX_OPENCODE_PORT/global/health` from
- *      inside the sandbox. If the previous setup() left the server
- *      running, return immediately.
- *   2. Cold path: upload artifacts (config, plugins, skills, sub-agent
- *      definitions) via the differential-setup manifest, spawn
- *      `opencode serve` on the static port, poll until ready.
+ *   1. Compute setupId for the artifact set + daemon expectation, then
+ *      run `preflightSetup`: one no-upload sandbox.run that checks the
+ *      `setup.id` marker AND probes loopback `/global/health`. If both
+ *      match, return immediately — no tarball stream, no spawn.
+ *   2. Cold/drifted path: upload artifacts (config, plugins, skills,
+ *      sub-agent definitions) via the differential-setup manifest,
+ *      spawn `opencode serve` on the static port, poll until ready,
+ *      then mark setup complete.
  *
  * No return value: `execute` recomputes baseUrl from
  * `sandbox.getPreviewLink(SANDBOX_OPENCODE_PORT)` independently.
@@ -326,24 +337,6 @@ async function ensureSandboxOpenCodeServer(
     const sandbox = request.options.sandbox!;
     const options = request.options;
     const port = SANDBOX_OPENCODE_PORT;
-
-    // OpenCode server port is expected to be pre-declared at sandbox
-    // creation time (`AGENT_RESERVED_PORTS["open-code"]` -> 4096).
-    const healthCheck = await time(
-      debugOpencode,
-      "health probe (warm path)",
-      () =>
-        sandbox.run(
-          `curl -fsS http://127.0.0.1:${port}/global/health >/dev/null 2>&1`,
-          { cwd: options.cwd, timeoutMs: 5_000 },
-        ),
-    );
-
-    if (healthCheck.exitCode === 0) {
-      debugOpencode("opencode server already running — reusing");
-      return;
-    }
-    debugOpencode("opencode server not running — cold-spawning");
 
     const plugins = assertHooksSupported(request.provider, options);
     assertCommandsSupported(request.provider, options.commands);
@@ -369,27 +362,35 @@ async function ensureSandboxOpenCodeServer(
     const configPath = path.join(target.layout.opencodeDir, "agentbox.json");
     const openCodeConfig = buildOpenCodeConfig(
       options,
-      request.config.systemPrompt ?? "",
       interactiveApproval,
     );
+    const allArtifacts = [
+      ...skillArtifacts,
+      ...pluginArtifacts,
+      {
+        path: configPath,
+        content: JSON.stringify(openCodeConfig, null, 2),
+      },
+    ];
+
+    const daemonInfo = { port, healthPath: "/global/health" };
+    const setupId = computeSetupId({
+      artifacts: allArtifacts,
+      installCommands,
+      daemon: daemonInfo,
+    });
+    if (await preflightSetup(target, setupId, daemonInfo)) {
+      debugOpencode("opencode setup() preflight hit — skipping");
+      return;
+    }
+
     const commonEnv = {
       OPENCODE_CONFIG: configPath,
       OPENCODE_CONFIG_DIR: target.layout.opencodeDir,
       OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
     };
 
-    await applyDifferentialSetup(
-      target,
-      [
-        ...skillArtifacts,
-        ...pluginArtifacts,
-        {
-          path: configPath,
-          content: JSON.stringify(openCodeConfig, null, 2),
-        },
-      ],
-      installCommands,
-    );
+    await applyDifferentialSetup(target, allArtifacts, installCommands);
 
     const binary = options.provider?.binary ?? "opencode";
     const pidFilePath = path.posix.join(
@@ -465,6 +466,8 @@ async function ensureSandboxOpenCodeServer(
         `OpenCode server did not become ready within ${SANDBOX_OPENCODE_READY_TIMEOUT_MS}ms.`,
       );
     });
+
+    await markSetupComplete(target, setupId);
   });
 }
 
@@ -519,29 +522,34 @@ async function ensureLocalOpenCodeServer(
   );
 
   const configPath = path.join(target.layout.opencodeDir, "agentbox.json");
-  const openCodeConfig = buildOpenCodeConfig(
-    options,
-    request.config.systemPrompt ?? "",
-    interactiveApproval,
-  );
+  const openCodeConfig = buildOpenCodeConfig(options, interactiveApproval);
   const commonEnv = {
     OPENCODE_CONFIG: configPath,
     OPENCODE_CONFIG_DIR: target.layout.opencodeDir,
     OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
   };
 
-  await applyDifferentialSetup(
-    target,
-    [
-      ...skillArtifacts,
-      ...pluginArtifacts,
-      {
-        path: configPath,
-        content: JSON.stringify(openCodeConfig, null, 2),
-      },
-    ],
+  const allArtifacts = [
+    ...skillArtifacts,
+    ...pluginArtifacts,
+    {
+      path: configPath,
+      content: JSON.stringify(openCodeConfig, null, 2),
+    },
+  ];
+  // Local mode already short-circuits the spawn when the host server is
+  // up (waitForHttpReady at the top). The setupId check covers the
+  // artifact set, so re-running with new config still triggers a
+  // re-apply (the spawn would still be skipped since the server is up
+  // — that's a known limitation, separate from this change).
+  const setupId = computeSetupId({
+    artifacts: allArtifacts,
     installCommands,
-  );
+  });
+  const preflightHit = await preflightSetup(target, setupId);
+  if (!preflightHit) {
+    await applyDifferentialSetup(target, allArtifacts, installCommands);
+  }
 
   spawnCommand({
     command: options.provider?.binary ?? "opencode",
@@ -565,6 +573,8 @@ async function ensureLocalOpenCodeServer(
     `http://127.0.0.1:${LOCAL_OPENCODE_PORT}/global/health`,
     { timeoutMs: LOCAL_OPENCODE_READY_TIMEOUT_MS },
   );
+
+  await markSetupComplete(target, setupId);
 }
 
 async function setupOpenCode(
@@ -1103,6 +1113,13 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
               body: JSON.stringify({
                 ...(request.run.model
                   ? { model: toOpenCodeModel(request.run.model) }
+                  : {}),
+                // Per-message system prompt — keeps systemPrompt out of
+                // the on-disk agent config so changing it doesn't
+                // invalidate setupId. Sent on every dispatch (the field
+                // is per-message, not session-sticky).
+                ...(request.run.systemPrompt
+                  ? { system: request.run.systemPrompt }
                   : {}),
                 agent: agentSlug,
                 parts,

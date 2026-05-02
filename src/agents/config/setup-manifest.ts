@@ -29,6 +29,12 @@
  * Cold path: ~1 RPC + actual install work (~1-1.5s).
  * Warm path: ~1 RPC; the script reads/diffs the manifest and exits without
  *            running installs (~0.7-1s).
+ *
+ * On top of the diff, providers can short-circuit the entire setup() with
+ * {@link preflightSetup}: a single no-upload `sandbox.run` that checks the
+ * `setup.id` marker (written by {@link markSetupComplete} after a
+ * successful setup) AND, optionally, a daemon liveness probe over loopback.
+ * When both match, setup returns without uploading anything.
  */
 
 import { createHash } from "node:crypto";
@@ -42,12 +48,26 @@ import { debugSetup, time } from "../../shared/debug";
 const MANIFEST_FILENAME = "setup-manifest.json";
 const TARGET_MANIFEST_FILENAME = "setup-target.json";
 const INSTALL_SCRIPT_FILENAME = "install.sh";
+const SETUP_ID_FILENAME = "setup.id";
 const MANIFEST_VERSION = 1;
 
 interface SetupManifest {
   version: number;
   artifacts: Record<string, string>;
   installCommands: Record<string, string>;
+}
+
+/**
+ * Liveness expectation for {@link preflightSetup}. The preflight script
+ * curls `http://127.0.0.1:<port><healthPath>` over loopback inside the
+ * sandbox; when {@link expectedVersionMatch} is set, the response body
+ * must contain that substring (used by claude-code to detect a stale
+ * daemon at the wrong protocol version).
+ */
+export interface PreflightDaemon {
+  port: number;
+  healthPath: string;
+  expectedVersionMatch?: string;
 }
 
 function hashArtifact(artifact: TextArtifact): string {
@@ -70,6 +90,119 @@ function computeTargetArtifacts(
     result[artifact.path] = hashArtifact(artifact);
   }
   return result;
+}
+
+/**
+ * One stable hash that captures every input to a provider's setup. If
+ * the hash matches the `setup.id` marker on disk AND the daemon (if any)
+ * is responsive, setup is up-to-date and can be skipped.
+ *
+ * Providers compute this once at the top of setup() and:
+ *   1. Pass it to {@link preflightSetup}; if it returns true, return early.
+ *   2. Run their normal setup steps.
+ *   3. Pass it to {@link markSetupComplete} once everything succeeded.
+ */
+export function computeSetupId(
+  parts: {
+    artifacts?: TextArtifact[];
+    installCommands?: string[];
+    daemon?: PreflightDaemon;
+    /**
+     * Anything else that, if changed, requires re-running setup —
+     * provider-specific extras like daemon protocol version, login env
+     * key presence, etc. Hashed verbatim.
+     */
+    extras?: string[];
+  },
+): string {
+  const hasher = createHash("sha256");
+  hasher.update(`v${MANIFEST_VERSION}\n`);
+  for (const a of [...(parts.artifacts ?? [])].sort((x, y) =>
+    x.path.localeCompare(y.path),
+  )) {
+    hasher.update(`a:${a.path}:${hashArtifact(a)}\n`);
+  }
+  for (const cmd of parts.installCommands ?? []) {
+    hasher.update(`c:${hashCommand(cmd)}\n`);
+  }
+  if (parts.daemon) {
+    hasher.update(
+      `d:${parts.daemon.port}:${parts.daemon.healthPath}:${parts.daemon.expectedVersionMatch ?? ""}\n`,
+    );
+  }
+  for (const extra of parts.extras ?? []) {
+    hasher.update(`x:${extra}\n`);
+  }
+  return hasher.digest("hex");
+}
+
+/**
+ * Single no-upload check: does `setup.id` match AND (if a daemon is
+ * given) is the daemon serving the expected version on loopback?
+ * Returns true iff setup is fully up-to-date and the caller can return
+ * from setup() immediately, skipping the upload+install path entirely.
+ *
+ * Cost: one `target.probe(...)` (no tarball stream). On warm-warm this
+ * is a few hundred ms of pure RPC overhead; on cold or drifted state
+ * the caller falls through to its normal setup flow.
+ */
+export async function preflightSetup(
+  target: SetupTarget,
+  setupId: string,
+  daemon?: PreflightDaemon,
+): Promise<boolean> {
+  return time(
+    debugSetup,
+    `preflightSetup ${target.provider}`,
+    async () => {
+      const setupIdFile = path.posix.join(
+        target.layout.rootDir,
+        SETUP_ID_FILENAME,
+      );
+      const checks: string[] = [
+        `[ -f ${shellQuote(setupIdFile)} ]`,
+        `[ "$(cat ${shellQuote(setupIdFile)} 2>/dev/null)" = ${shellQuote(setupId)} ]`,
+      ];
+      if (daemon) {
+        const url = `http://127.0.0.1:${daemon.port}${daemon.healthPath}`;
+        if (daemon.expectedVersionMatch) {
+          checks.push(
+            `curl -fsS --max-time 2 ${shellQuote(url)} 2>/dev/null | grep -q ${shellQuote(daemon.expectedVersionMatch)}`,
+          );
+        } else {
+          checks.push(
+            `curl -fsS --max-time 2 ${shellQuote(url)} >/dev/null 2>&1`,
+          );
+        }
+      }
+      return target.probe(checks.join(" && "));
+    },
+    (ok) => ({ ok }),
+  );
+}
+
+/**
+ * Write the `setup.id` warm-path marker. Called by providers at the end
+ * of setup(), after every step (artifact upload, install commands,
+ * daemon spawn, readiness polling) has succeeded. Subsequent
+ * {@link preflightSetup} calls with the same id and a live daemon will
+ * short-circuit the rest of setup.
+ *
+ * If anything before this point fails, the marker is left absent or
+ * stale, so the next setup() falls through to the full path.
+ */
+export async function markSetupComplete(
+  target: SetupTarget,
+  setupId: string,
+): Promise<void> {
+  await time(debugSetup, `markSetupComplete ${target.provider}`, () =>
+    target.runCommand(
+      [
+        `mkdir -p ${shellQuote(target.layout.rootDir)}`,
+        `printf '%s' ${shellQuote(setupId)} > ${shellQuote(path.posix.join(target.layout.rootDir, SETUP_ID_FILENAME))}`,
+      ].join(" && "),
+    ),
+  );
 }
 
 /**

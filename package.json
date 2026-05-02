@@ -1,6 +1,6 @@
 {
   "name": "agentbox-sdk",
-  "version": "0.1.302",
+  "version": "0.1.303",
   "description": "Swappable coding agents and sandbox providers for Bun and TypeScript.",
   "license": "MIT",
   "repository": {
@@ -58,7 +58,7 @@
     "bun": ">=1.1.0"
   },
   "dependencies": {
-    "@daytonaio/sdk": "^0.161.0",
+    "@daytonaio/sdk": "^0.171.0",
     "@types/debug": "^4.1.13",
     "@vercel/sandbox": "2.0.0-beta.13",
     "debug": "^4.4.3",

@@ -75,7 +75,7 @@ export class ModalSandboxAdapter extends SandboxAdapter<
     const existing = await this.findMatchingSandbox();
     if (existing) {
       this.sandbox = existing;
-      this.wasFoundFlag = true;
+      this.isWarmFlag = true;
       return;
     }
 

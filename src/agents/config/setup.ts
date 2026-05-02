@@ -161,6 +161,32 @@ class HostSetupTarget implements SetupTarget {
     );
   }
 
+  async probe(
+    command: string,
+    extraEnv?: Record<string, string>,
+  ): Promise<boolean> {
+    return time(
+      debugRuntime,
+      `host probe ${shortLabel(command)}`,
+      async () => {
+        const handle = spawnCommand({
+          command: process.env.SHELL || "sh",
+          args: ["-c", command],
+          cwd: this.cwd,
+          env: {
+            ...process.env,
+            ...this.baseEnv,
+            ...this.env,
+            ...(extraEnv ?? {}),
+          },
+        });
+        const exitCode = await handle.wait();
+        return exitCode === 0;
+      },
+      (ok) => ({ ok }),
+    );
+  }
+
   async cleanup(): Promise<void> {
     await rm(this.layout.rootDir, { recursive: true, force: true });
   }
@@ -225,11 +251,39 @@ class SandboxSetupTarget implements SetupTarget {
         });
 
         if (result && result.exitCode !== 0) {
+          // Include the command's combined output so providers that fold
+          // stderr into stdout (or omit stderr entirely, e.g. Daytona's
+          // `executeCommand`) still surface the underlying error rather
+          // than a bare "exit N".
+          const output = result.combinedOutput?.trim();
+          const detail = output ? `\n${output}` : "";
           throw new Error(
-            `Sandbox setup command failed (${result.exitCode}): ${command}`,
+            `Sandbox setup command failed (${result.exitCode}): ${command}${detail}`,
           );
         }
       },
+    );
+  }
+
+  async probe(
+    command: string,
+    extraEnv?: Record<string, string>,
+  ): Promise<boolean> {
+    return time(
+      debugRuntime,
+      `sandbox probe ${shortLabel(command)}`,
+      async () => {
+        const result = await this.options.sandbox?.run(command, {
+          cwd: this.options.cwd,
+          env: {
+            ...(this.options.env ?? {}),
+            ...this.env,
+            ...(extraEnv ?? {}),
+          },
+        });
+        return Boolean(result && result.exitCode === 0);
+      },
+      (ok) => ({ ok }),
     );
   }
 

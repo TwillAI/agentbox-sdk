@@ -257,5 +257,12 @@ export interface SetupTarget {
    * setup path.
    */
   runCommand(command: string, extraEnv?: Record<string, string>): Promise<void>;
+  /**
+   * Run a one-off shell command and return whether it exited 0. Used by
+   * preflight checks where exit-code IS the answer (setupId match,
+   * daemon liveness probe). Unlike `runCommand`, never throws on a
+   * non-zero exit — that's a normal "stale" outcome.
+   */
+  probe(command: string, extraEnv?: Record<string, string>): Promise<boolean>;
   cleanup(): Promise<void>;
 }

@@ -75,18 +75,6 @@ export interface AgentRunConfig {
   reasoning?: AgentReasoningEffort;
 }
 
-/**
- * Subset of {@link AgentRunConfig} that needs to be committed at
- * `agent.setup()` time so the runtime can pre-bake artifacts that
- * reference it (codex `model_instructions_file`, opencode agent config,
- * etc.). Unlike `AgentRunConfig`, this never carries per-turn input or
- * a resumed session id.
- */
-export type AgentSetupConfig = Pick<
-  AgentRunConfig,
-  "systemPrompt" | "model" | "reasoning"
->;
-
 export type AgentApprovalMode = "auto" | "interactive";
 
 export type AgentPermissionKind =
@@ -230,7 +218,6 @@ export interface AgentSetupRequest<
 > {
   provider: P;
   options: AgentOptions<P>;
-  config: AgentSetupConfig;
 }
 
 export interface AgentExecutionRequest<

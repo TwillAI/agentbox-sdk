@@ -103,7 +103,6 @@ describe("reasoning param", () => {
     it("emits one agent variant per reasoning level", () => {
       const config = buildOpenCodeConfig(
         makeOpenCodeRequest().options,
-        "",
         false,
       ) as {
         agent: Record<string, { reasoningEffort?: string } | undefined>;

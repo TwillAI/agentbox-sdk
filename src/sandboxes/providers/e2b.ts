@@ -65,7 +65,7 @@ export class E2bSandboxAdapter extends SandboxAdapter<
     const existing = await this.findMatchingSandbox();
     if (existing) {
       this.sandbox = existing;
-      this.wasFoundFlag = true;
+      this.isWarmFlag = true;
       return;
     }
 

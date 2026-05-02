@@ -61,8 +61,9 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
     const existing = await this.findMatchingSandbox();
     if (existing) {
       this.sandbox = existing;
+      const isWarm = existing.state === "started";
       await existing.start();
-      this.wasFoundFlag = true;
+      this.isWarmFlag = isWarm;
       return;
     }
 

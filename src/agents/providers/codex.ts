@@ -29,7 +29,12 @@ import { assertCommandsSupported } from "../config/commands";
 import { assertHooksSupported, buildCodexHooksFile } from "../config/hooks";
 import { buildCodexConfigToml } from "../config/mcp";
 import { agentboxRoot, createSetupTarget } from "../config/setup";
-import { applyDifferentialSetup } from "../config/setup-manifest";
+import {
+  applyDifferentialSetup,
+  computeSetupId,
+  markSetupComplete,
+  preflightSetup,
+} from "../config/setup-manifest";
 import { prepareSkillArtifacts } from "../config/skills";
 import { buildCodexSubagentArtifacts } from "../config/subagents";
 import type { SetupTarget } from "../config/types";
@@ -644,7 +649,12 @@ async function ensureCodexLoginViaConfig(
     [
       'if [ -z "${OPENAI_API_KEY:-}" ]; then exit 0; fi',
       'mkdir -p "${CODEX_HOME:-$HOME/.codex}"',
-      "printenv OPENAI_API_KEY | env -u XDG_CONFIG_HOME codex login --with-api-key",
+      // Merge stderr into stdout so providers that don't surface stderr
+      // (e.g. Daytona's `executeCommand`, which collapses to a single
+      // `result` field) still propagate the underlying error message
+      // back to the caller — otherwise a failed login leaves us with a
+      // bare "exit 1" and no diagnostic.
+      "printenv OPENAI_API_KEY | env -u XDG_CONFIG_HOME codex login --with-api-key 2>&1",
     ].join("; "),
     Object.keys(extraEnv).length > 0 ? extraEnv : undefined,
   );
@@ -811,11 +821,28 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
       ...(options.provider?.env ?? {}),
     });
 
+    const { artifacts: serverArtifacts } = buildArtifactsFor(sharedTarget);
+    const { artifacts: skillArtifacts, installCommands } =
+      await prepareSkillArtifacts(provider, options.skills, target.layout);
+
+    const daemonInfo = {
+      port: REMOTE_CODEX_APP_SERVER_PORT,
+      healthPath: "/readyz",
+    };
+    const setupId = computeSetupId({
+      artifacts: [...serverArtifacts, ...skillArtifacts],
+      installCommands,
+      daemon: daemonInfo,
+    });
+    if (await preflightSetup(sharedTarget, setupId, daemonInfo)) {
+      debugCodex("codex remote setup() preflight hit — skipping");
+      return;
+    }
+
     await time(debugCodex, "ensureCodexLogin", () =>
       ensureCodexLoginViaConfig(request, sharedTarget),
     );
 
-    const { artifacts: serverArtifacts } = buildArtifactsFor(sharedTarget);
     await applyDifferentialSetup(sharedTarget, serverArtifacts, []);
 
     const binary = options.provider?.binary ?? "codex";
@@ -872,19 +899,35 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
     // sandboxed paths. The skill files end up at
     // `<codexDir>/skills/<name>/SKILL.md` which codex auto-discovers.
     try {
-      const { artifacts: skillArtifacts, installCommands } =
-        await prepareSkillArtifacts(provider, options.skills, target.layout);
       await applyDifferentialSetup(target, skillArtifacts, installCommands);
     } catch (error) {
       await target.cleanup().catch(() => undefined);
       throw error;
     }
 
+    await markSetupComplete(sharedTarget, setupId);
     return;
   }
 
   // Local mode: everything goes on the same target.
   const target = await createSetupTarget(provider, "shared-setup", options);
+
+  const { artifacts: skillArtifacts, installCommands } =
+    await prepareSkillArtifacts(provider, options.skills, target.layout);
+  const { artifacts: configArtifacts } = buildArtifactsFor(target);
+  const allArtifacts = [...skillArtifacts, ...configArtifacts];
+
+  // Local mode has no in-process daemon to probe — only the artifact set
+  // matters. setupId match short-circuits the upload + login.
+  const setupId = computeSetupId({
+    artifacts: allArtifacts,
+    installCommands,
+  });
+  if (await preflightSetup(target, setupId)) {
+    debugCodex("codex local setup() preflight hit — skipping");
+    return;
+  }
+
   try {
     await ensureCodexLoginViaConfig(request, target);
   } catch (error) {
@@ -892,15 +935,9 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
     throw error;
   }
 
-  const { artifacts: skillArtifacts, installCommands } =
-    await prepareSkillArtifacts(provider, options.skills, target.layout);
-  const { artifacts: configArtifacts } = buildArtifactsFor(target);
+  await applyDifferentialSetup(target, allArtifacts, installCommands);
 
-  await applyDifferentialSetup(
-    target,
-    [...skillArtifacts, ...configArtifacts],
-    installCommands,
-  );
+  await markSetupComplete(target, setupId);
 }
 
 async function createRuntime(
@@ -1182,7 +1219,6 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       threadId?: string;
       interrupted?: boolean;
     }>((resolve, reject) => {
-
       void (async () => {
         let firstClientMessageLogged = false;
         for await (const message of client.messages()) {
@@ -1360,7 +1396,12 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       );
 
       let completionResult:
-        | { text?: string; turnId?: string; threadId?: string; interrupted?: boolean }
+        | {
+            text?: string;
+            turnId?: string;
+            threadId?: string;
+            interrupted?: boolean;
+          }
         | undefined;
       let completionError: unknown;
       try {

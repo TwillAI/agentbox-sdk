@@ -34,7 +34,12 @@ import {
 import { buildClaudeHookSettings, assertHooksSupported } from "../config/hooks";
 import { buildClaudeMcpConfig } from "../config/mcp";
 import { agentboxRoot, createSetupTarget } from "../config/setup";
-import { applyDifferentialSetup } from "../config/setup-manifest";
+import {
+  applyDifferentialSetup,
+  computeSetupId,
+  markSetupComplete,
+  preflightSetup,
+} from "../config/setup-manifest";
 import { prepareSkillArtifacts } from "../config/skills";
 import { buildClaudeSubagentArtifacts } from "../config/subagents";
 import { extractClaudeCostData } from "../cost";
@@ -628,6 +633,11 @@ export class ClaudeCodeAgentAdapter
   /**
    * Sandbox-side preparation. Uploads `.claude/` artifacts and ensures
    * the daemon is running. `execute()` then dials the daemon directly.
+   *
+   * Warm-path short-circuit: a single no-upload `preflightSetup` probes
+   * the `setup.id` marker + daemon `/__version` on loopback. If both
+   * match what we'd produce, we skip the artifact upload AND the daemon
+   * boot entirely.
    */
   async setup(request: AgentSetupRequest<"claude-code">): Promise<void> {
     await time(debugClaude, "claude-code setup()", async () => {
@@ -669,6 +679,21 @@ export class ClaudeCodeAgentAdapter
         { path: mcpConfigPath, content: mcpConfigJson },
       ];
 
+      const daemonInfo = {
+        port: DAEMON_PORT,
+        healthPath: "/__version",
+        expectedVersionMatch: DAEMON_PROTOCOL_VERSION,
+      };
+      const setupId = computeSetupId({
+        artifacts,
+        installCommands,
+        daemon: daemonInfo,
+      });
+      if (await preflightSetup(target, setupId, daemonInfo)) {
+        debugClaude("claude-code setup() preflight hit — skipping");
+        return;
+      }
+
       const env = { ...(options.env ?? {}), ...target.env };
       await Promise.all([
         time(debugClaude, "applyDifferentialSetup", () =>
@@ -676,6 +701,8 @@ export class ClaudeCodeAgentAdapter
         ),
         ensureClaudeCodeDaemon(options, env),
       ]);
+
+      await markSetupComplete(target, setupId);
     });
   }
 

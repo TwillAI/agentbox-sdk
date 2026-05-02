@@ -25,7 +25,6 @@ import {
   type AgentOptions,
   type AgentRunSink,
   type AgentPermissionResponse,
-  type AgentSetupConfig,
   type AttachedRun,
   type UserContent,
   type AgentCostData,
@@ -376,7 +375,9 @@ class AgentRunController implements AgentRun, AgentRunSink {
 
     this.settled = true;
     this.clearPendingPermissions(
-      new Error("Agent run was cancelled before pending permission requests resolved."),
+      new Error(
+        "Agent run was cancelled before pending permission requests resolved.",
+      ),
     );
     if (result?.text) {
       this.text = result.text;
@@ -504,7 +505,7 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
    * second `setup()` against the same sandbox does ~one round-trip of
    * work.
    */
-  async setup(config: AgentSetupConfig = {}): Promise<void> {
+  async setup(): Promise<void> {
     if (this.setupPromise) {
       await this.setupPromise;
       return;
@@ -516,7 +517,6 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
       await this.adapter.setup({
         provider: this.provider,
         options: this.options,
-        config,
       });
       debugAgent(
         "setup() returned provider=%s after %dms",
@@ -541,14 +541,10 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
       );
     }
     if (runConfig.forkSessionId && !runConfig.forkAtMessageId) {
-      throw new Error(
-        "AgentRunConfig.forkSessionId requires forkAtMessageId.",
-      );
+      throw new Error("AgentRunConfig.forkSessionId requires forkAtMessageId.");
     }
     if (runConfig.forkAtMessageId && !runConfig.forkSessionId) {
-      throw new Error(
-        "AgentRunConfig.forkAtMessageId requires forkSessionId.",
-      );
+      throw new Error("AgentRunConfig.forkAtMessageId requires forkSessionId.");
     }
 
     const runId = runConfig.runId ?? randomUUID();

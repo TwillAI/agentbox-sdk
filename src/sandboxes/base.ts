@@ -29,7 +29,7 @@ export abstract class SandboxAdapter<
    * `provision()` implementations. Stays `false` until `findOrProvision()`
    * has resolved.
    */
-  protected wasFoundFlag = false;
+  protected isWarmFlag = false;
 
   constructor(options: TOptions) {
     this.options = options;
@@ -174,8 +174,8 @@ export abstract class SandboxAdapter<
    * idempotent setup that the previous run already performed (e.g.
    * `agent.setup()`). Always `false` before `findOrProvision()` resolves.
    */
-  get wasFound(): boolean {
-    return this.wasFoundFlag;
+  get isWarm(): boolean {
+    return this.isWarmFlag;
   }
 
   /**
