@@ -142,6 +142,29 @@ export interface CodexAgentOptions extends AgentOptionsBase {
 
 export interface OpenCodeAgentOptions extends AgentOptionsBase {
   provider?: OpenCodeProviderOptions;
+  /**
+   * Setup-time system prompt baked into the opencode agent's `prompt` field.
+   *
+   * When set, this REPLACES opencode's built-in provider prompt
+   * (`anthropic.txt` / `codex.txt` / `gemini.txt` / etc.) and is the most
+   * prominent system message the model sees. Use this when you need the
+   * prompt to actually steer Anthropic models — opencode appends
+   * {@link AgentRunConfig.systemPrompt} *after* its long provider prompt,
+   * which Sonnet/Opus tend to ignore in favor of the leading content.
+   *
+   * Trade-off: replacing the provider prompt drops opencode's hand-tuned
+   * Anthropic tool-usage hints. Models still receive tool definitions and
+   * the runtime appendix (MCPs/skills/sub-agents/commands) via the
+   * per-message `system` field, so tools remain functional — just less
+   * prominently announced.
+   *
+   * Setup-time field: changing it between runs invalidates the
+   * setup-manifest cache and triggers a re-upload of the agent config on
+   * the next `setup()` call. {@link AgentRunConfig.systemPrompt} continues
+   * to work as a per-message override (appended after `agent.prompt`),
+   * which is fine for codex/GPT models but weak for Anthropic.
+   */
+  systemPrompt?: string;
 }
 
 export interface ClaudeCodeAgentOptions extends AgentOptionsBase {

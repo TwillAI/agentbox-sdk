@@ -174,28 +174,53 @@ export function openCodeAgentSlug(reasoning?: string): string {
   return reasoning ? `agentbox-${reasoning}` : "agentbox";
 }
 
+const FALLBACK_OPEN_CODE_AGENT_PROMPT =
+  "You are an AI coding assistant. Follow the user's instructions.";
+
 export function buildOpenCodeConfig(
   options: AgentOptions<"open-code">,
   interactiveApproval: boolean,
 ) {
   const mcpConfig = buildOpenCodeMcpConfig(options.mcps);
   const commandsConfig = buildOpenCodeCommandsConfig(options.commands);
-  // System prompt is intentionally NOT baked into the agent here.
-  // `dispatchPrompt` passes `system: request.run.systemPrompt` on the
-  // POST /session/:id/prompt_async body, so changing the system prompt
-  // doesn't invalidate setupId and doesn't trigger a re-setup. See:
-  // https://opencode.ai/docs/server/ and packages/opencode/src/session/prompt.ts
-  // (createUserMessage assigns `system: input.system`).
+  // The agent's `prompt` field is the FIRST and most prominent system
+  // message the model sees — opencode's session/llm.ts composes the
+  // system stack like:
+  //
+  //   ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
+  //   ...input.system,                       // env + AGENTS.md + skills
+  //   ...(input.user.system ? [input.user.system] : []),  // per-message system override
+  //
+  // ...all joined with `\n` into a single string. When `agent.prompt`
+  // is set, opencode skips the built-in provider prompt
+  // (`anthropic.txt` / `gpt.txt` / `gemini.txt` / etc.) entirely.
+  //
+  // We always set `agent.prompt` to suppress opencode's default
+  // provider prompt (e.g. PROMPT_ANTHROPIC's "You are OpenCode..."),
+  // which would otherwise bury anything the caller passes in. When
+  // {@link OpenCodeAgentOptions.systemPrompt} is provided, we use that
+  // verbatim as the agent prompt — that's the only reliable way to
+  // make the system prompt actually steer Anthropic models, since
+  // Sonnet/Opus are highly prompt-adherent and ignore content
+  // appended *after* the leading agent prompt (which is exactly where
+  // the per-message `system` field passed via `dispatchPrompt` lands).
+  // When `options.systemPrompt` is unset, we fall back to a short
+  // generic prompt so the per-message `system` field at least
+  // dominates the runtime appendix that follows.
+  //
+  // Setup-time field: changing `options.systemPrompt` between runs
+  // changes `agentbox.json`'s content hash, which invalidates the
+  // setup-manifest cache and re-uploads the config on the next
+  // `setup()` call. The opencode server reads agent definitions at
+  // startup, so a config change does NOT take effect on a server
+  // already running — `setup()` will spawn a fresh server (cold path)
+  // when no opencode instance is up; on warm paths it short-circuits
+  // and the running server keeps the old prompt. Callers that need to
+  // change the system prompt mid-process should bring up a new
+  // sandbox/Agent instance.
   const baseAgent = {
     mode: "primary",
-    // Suppress opencode's default provider system prompt (e.g.
-    // PROMPT_ANTHROPIC's "You are OpenCode...") so request.run.systemPrompt
-    // is the dominant identity statement the model sees. opencode's
-    // session/llm.ts uses agent.prompt instead of SystemPrompt.provider(model)
-    // when this field is truthy — codex already takes that branch via a
-    // separate options.instructions channel, so this brings anthropic et al.
-    // in line. Constant value, so setupId stays stable.
-    prompt: "You are an AI coding assistant. Follow the user's instructions.",
+    prompt: options.systemPrompt || FALLBACK_OPEN_CODE_AGENT_PROMPT,
     permission: buildOpenCodePermissionConfig(interactiveApproval),
     tools: {
       write: true,
@@ -1080,10 +1105,17 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
           ...(request.run.model
             ? { model: toOpenCodeModel(request.run.model) }
             : {}),
-          // Per-message system prompt — keeps systemPrompt out of
-          // the on-disk agent config so changing it doesn't
-          // invalidate setupId. Sent on every dispatch (the field
-          // is per-message, not session-sticky).
+          // Per-message system prompt override. opencode appends this
+          // *after* `agent.prompt` and the runtime appendix
+          // (env/AGENTS.md/skills) when composing the final system
+          // string — see `buildOpenCodeConfig` for the full ordering.
+          // For Anthropic models specifically, this trailing-position
+          // content tends to be ignored; callers that need the prompt
+          // to actually steer Sonnet/Opus should pass it via
+          // `OpenCodeAgentOptions.systemPrompt` so it's baked into
+          // `agent.prompt` (the leading position) at setup time
+          // instead. This per-message field stays as a per-run
+          // override path that's effective for codex/GPT/Gemini.
           ...(request.run.systemPrompt
             ? { system: request.run.systemPrompt }
             : {}),

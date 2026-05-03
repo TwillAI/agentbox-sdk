@@ -434,8 +434,10 @@ class ClaudeCodeLogAssembler {
     const text = this.textByMessageId.get(messageId) ?? "";
     const thinking = this.thinkingByMessageId.get(messageId) ?? "";
     const content: JsonRecord[] = [];
-    if (text) content.push({ type: "text", text });
+    // Thinking precedes text in the model's actual output order; keep that
+    // order in the snapshot so consumers render reasoning before the answer.
     if (thinking) content.push({ type: "thinking", thinking });
+    if (text) content.push({ type: "text", text });
     for (const block of extraBlocks) content.push(clone(block));
 
     const next: JsonRecord = {

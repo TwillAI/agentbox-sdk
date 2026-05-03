@@ -135,8 +135,8 @@ describe("ProviderLogAssembler — claude-code", () => {
       messageId: MSG_ID,
       message: {
         content: [
-          { type: "text", text: "Hi" },
           { type: "thinking", thinking: "pondering" },
+          { type: "text", text: "Hi" },
         ],
       },
     });
@@ -221,8 +221,8 @@ describe("ProviderLogAssembler — claude-code", () => {
       messageId: MSG_ID,
       message: {
         content: [
-          { type: "text", text: "Hello world" },
           { type: "thinking", thinking: "step 1, step 2" },
+          { type: "text", text: "Hello world" },
           { type: "tool_use", id: "tool_1", name: "Bash" },
         ],
       },
