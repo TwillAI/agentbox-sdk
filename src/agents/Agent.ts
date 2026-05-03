@@ -149,6 +149,7 @@ class AgentRunController implements AgentRun, AgentRunSink {
     content: UserContent,
   ) => Promise<{ messageId?: string } | void>;
   private text = "";
+  private observedMessageCompleted = false;
   private costData: AgentCostData | null = null;
   private settled = false;
   readonly finished: Promise<AgentResult>;
@@ -210,6 +211,9 @@ class AgentRunController implements AgentRun, AgentRunSink {
       event.text
     ) {
       this.text = event.text;
+      if (event.type === "message.completed") {
+        this.observedMessageCompleted = true;
+      }
     }
 
     this.eventQueue.push(event);
@@ -330,7 +334,7 @@ class AgentRunController implements AgentRun, AgentRunSink {
         "Agent run completed before pending permission requests resolved.",
       ),
     );
-    if (result?.text) {
+    if (result?.text && !this.observedMessageCompleted) {
       this.text = result.text;
     }
     if (result && "costData" in result) {
@@ -379,7 +383,7 @@ class AgentRunController implements AgentRun, AgentRunSink {
         "Agent run was cancelled before pending permission requests resolved.",
       ),
     );
-    if (result?.text) {
+    if (result?.text && !this.observedMessageCompleted) {
       this.text = result.text;
     }
     if (result && "costData" in result) {

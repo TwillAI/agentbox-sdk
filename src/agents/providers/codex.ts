@@ -323,13 +323,10 @@ function toNormalizedCodexEvents(
     }
 
     if (item.type === "agentMessage" && typeof item.text === "string") {
-      // Codex streams agentMessage text via `item/agentMessage/delta`
-      // which we already turn into `text.delta` events above. Re-emitting
-      // the full text here as another `text.delta` would double the
-      // accumulated stream (the host sums every `text.delta` into the
-      // final `result.text`) — so the completion only carries
-      // `message.completed`, mirroring the claude-code adapter's
-      // post-streaming behavior.
+      // Each agentMessage item produces one `message.completed`. The host
+      // tracks the LAST message text as the final `result.text`, so a
+      // narration message emitted before tool calls is superseded by the
+      // final answer message — only the last one wins.
       return [
         createNormalizedEvent("message.completed", base, { text: item.text }),
       ];
@@ -1438,7 +1435,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
             Date.now() - executeStartedAt,
             text?.length ?? 0,
           );
-          sink.complete({ text, costData: extractCodexCostData(rawPayloads) });
+          sink.complete({ costData: extractCodexCostData(rawPayloads) });
         }
       }
     } finally {

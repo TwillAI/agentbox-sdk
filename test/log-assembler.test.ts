@@ -180,6 +180,55 @@ describe("ProviderLogAssembler — claude-code", () => {
     expect(out[0]?.type).toBe("message.updated");
   });
 
+  it("preserves streamed thinking when the final assistant message has no thinking block", () => {
+    // Repro for `thinking: { display: "summarized" }`: the SDK ships thinking
+    // via `thinking_delta` stream events but the final `assistant` SDKMessage
+    // contains no `thinking` block. The assembler must not erase the streamed
+    // thinking when it sees the final message.
+    const assembler = new ProviderLogAssembler();
+    assembler.process("claude-code", streamStart(MSG_ID));
+    assembler.process("claude-code", streamThinkingDelta("step 1, "));
+    assembler.process("claude-code", streamThinkingDelta("step 2"));
+    assembler.process("claude-code", streamTextDelta("Hello "));
+    assembler.process("claude-code", streamTextDelta("world"));
+
+    // Final assistant: text + tool_use only, no thinking block (summarized).
+    const finalNoThinking = {
+      type: "assistant",
+      uuid: "asst-uuid",
+      session_id: "sess",
+      parent_tool_use_id: null,
+      message: {
+        id: MSG_ID,
+        role: "assistant",
+        type: "message",
+        model: "claude-sonnet",
+        content: [
+          { type: "text", text: "Hello world" },
+          {
+            type: "tool_use",
+            id: "tool_1",
+            name: "Bash",
+            input: { command: "ls" },
+          },
+        ],
+      },
+    };
+    const [snap] = assembler.process("claude-code", finalNoThinking);
+
+    expect(snap).toMatchObject({
+      type: "message.updated",
+      messageId: MSG_ID,
+      message: {
+        content: [
+          { type: "text", text: "Hello world" },
+          { type: "thinking", thinking: "step 1, step 2" },
+          { type: "tool_use", id: "tool_1", name: "Bash" },
+        ],
+      },
+    });
+  });
+
   it("passes through system/user/result events untouched", () => {
     const assembler = new ProviderLogAssembler();
     const sys = { type: "system", subtype: "init", session_id: "sess" };

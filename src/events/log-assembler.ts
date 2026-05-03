@@ -324,7 +324,8 @@ class ClaudeCodeLogAssembler {
 
       if (streamType === "message_start") {
         const message = isRecord(stream.message) ? stream.message : null;
-        const id = message && typeof message.id === "string" ? message.id : null;
+        const id =
+          message && typeof message.id === "string" ? message.id : null;
         if (!id) return [];
         this.currentMessageId = id;
         if (!this.textByMessageId.has(id)) this.textByMessageId.set(id, "");
@@ -368,15 +369,22 @@ class ClaudeCodeLogAssembler {
 
     if (type === "assistant") {
       const message = isRecord(event.message) ? event.message : null;
-      const id =
-        message && typeof message.id === "string" ? message.id : null;
+      const id = message && typeof message.id === "string" ? message.id : null;
       if (!id || !message) {
         return [clone(event)];
       }
 
       const final = extractClaudeAssistantContent(message);
       this.textByMessageId.set(id, final.text);
-      this.thinkingByMessageId.set(id, final.thinking);
+      // Don't clobber streamed thinking with an empty final.thinking. With
+      // `thinking: { display: "summarized" }` (what claude-code currently
+      // configures), the SDK ships thinking only via `thinking_delta` stream
+      // events — the final assistant SDKMessage has no thinking block, so
+      // overwriting would erase the accumulated stream and the persisted
+      // snapshot would lose all reasoning.
+      if (final.thinking) {
+        this.thinkingByMessageId.set(id, final.thinking);
+      }
       const snapshot = this.upsertMessage(id, final.extraBlocks);
       this.currentMessageId = null;
       return [snapshot];
@@ -514,10 +522,7 @@ export class ProviderLogAssembler {
     if (provider === AgentProvider.OpenCode || provider === "opencode") {
       return this.openCode.process(event);
     }
-    if (
-      provider === AgentProvider.ClaudeCode ||
-      provider === "claude-code"
-    ) {
+    if (provider === AgentProvider.ClaudeCode || provider === "claude-code") {
       return this.claudeCode.process(event);
     }
     if (isRecord(event)) {
@@ -544,10 +549,7 @@ export class ProviderLogAssembler {
       this.openCode.seed(snapshots);
       return;
     }
-    if (
-      provider === AgentProvider.ClaudeCode ||
-      provider === "claude-code"
-    ) {
+    if (provider === AgentProvider.ClaudeCode || provider === "claude-code") {
       this.claudeCode.seed(snapshots);
       return;
     }
@@ -572,10 +574,7 @@ export class ProviderLogAssembler {
         return item && typeof item.id === "string" ? `item:${item.id}` : null;
       });
     }
-    if (
-      provider === AgentProvider.ClaudeCode ||
-      provider === "claude-code"
-    ) {
+    if (provider === AgentProvider.ClaudeCode || provider === "claude-code") {
       return dedupeByKey(snapshots, (snapshot) => {
         const messageId =
           typeof snapshot.messageId === "string" ? snapshot.messageId : null;

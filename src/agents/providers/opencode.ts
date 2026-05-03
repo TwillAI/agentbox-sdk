@@ -40,7 +40,7 @@ import {
   preflightSetup,
 } from "../config/setup-manifest";
 import { buildOpenCodeSubagentConfig } from "../config/subagents";
-import { fetchJson, streamSse } from "../transports/app-server";
+import { fetchJson, streamSseResilient } from "../transports/app-server";
 import { spawnCommand, waitForHttpReady } from "../transports/spawn";
 import { sleep } from "../../shared/network";
 import { shellQuote } from "../../shared/shell";
@@ -81,98 +81,6 @@ function toRawEvent(
     timestamp: new Date().toISOString(),
     payload,
   };
-}
-
-function extractText(value: unknown): string {
-  if (!value) {
-    return "";
-  }
-
-  if (typeof value === "string") {
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    return value.map(extractText).filter(Boolean).join("");
-  }
-
-  if (typeof value === "object") {
-    const record = value as Record<string, unknown>;
-
-    if (record.type === "text" && typeof record.text === "string") {
-      return record.text;
-    }
-
-    if (record.type === "reasoning") {
-      return "";
-    }
-
-    if (record.message) {
-      return extractText(record.message);
-    }
-
-    if (record.content) {
-      return extractText(record.content);
-    }
-
-    if (record.parts) {
-      return extractText(record.parts);
-    }
-
-    if (record.text) {
-      return extractText(record.text);
-    }
-  }
-
-  return "";
-}
-
-function extractAssistantMessageId(response: unknown): string | undefined {
-  if (!response || typeof response !== "object") {
-    return undefined;
-  }
-  const record = response as Record<string, unknown>;
-  const info =
-    record.info && typeof record.info === "object"
-      ? (record.info as Record<string, unknown>)
-      : record.message && typeof record.message === "object"
-        ? (record.message as Record<string, unknown>)
-        : undefined;
-  const id = info?.id ?? record.id;
-  return typeof id === "string" ? id : undefined;
-}
-
-function extractReasoning(value: unknown): string {
-  if (!value) {
-    return "";
-  }
-
-  if (Array.isArray(value)) {
-    return value.map(extractReasoning).filter(Boolean).join("");
-  }
-
-  if (typeof value === "object") {
-    const record = value as Record<string, unknown>;
-
-    if (record.type === "reasoning") {
-      if (typeof record.text === "string") {
-        return record.text;
-      }
-      if (typeof record.reasoning === "string") {
-        return record.reasoning;
-      }
-    }
-
-    return [
-      extractReasoning(record.message),
-      extractReasoning(record.content),
-      extractReasoning(record.parts),
-    ]
-      .filter(Boolean)
-      .join("");
-  }
-
-  return "";
 }
 
 function toOpenCodeModel(
@@ -273,13 +181,21 @@ export function buildOpenCodeConfig(
   const mcpConfig = buildOpenCodeMcpConfig(options.mcps);
   const commandsConfig = buildOpenCodeCommandsConfig(options.commands);
   // System prompt is intentionally NOT baked into the agent here.
-  // `dispatchMessage` passes `system: request.run.systemPrompt` on the
-  // POST /session/:id/message body, so changing the system prompt
+  // `dispatchPrompt` passes `system: request.run.systemPrompt` on the
+  // POST /session/:id/prompt_async body, so changing the system prompt
   // doesn't invalidate setupId and doesn't trigger a re-setup. See:
   // https://opencode.ai/docs/server/ and packages/opencode/src/session/prompt.ts
   // (createUserMessage assigns `system: input.system`).
   const baseAgent = {
     mode: "primary",
+    // Suppress opencode's default provider system prompt (e.g.
+    // PROMPT_ANTHROPIC's "You are OpenCode...") so request.run.systemPrompt
+    // is the dominant identity statement the model sees. opencode's
+    // session/llm.ts uses agent.prompt instead of SystemPrompt.provider(model)
+    // when this field is truthy — codex already takes that branch via a
+    // separate options.instructions channel, so this brings anthropic et al.
+    // in line. Constant value, so setupId stays stable.
+    prompt: "You are an AI coding assistant. Follow the user's instructions.",
     permission: buildOpenCodePermissionConfig(interactiveApproval),
     tools: {
       write: true,
@@ -633,31 +549,26 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
       () => validateProviderUserInput(request.provider, request.run.input),
     );
 
-    let pendingMessages = 0;
-    let finalText = "";
     // Tracks how much text was streamed via SSE `message.part.delta`
-    // events in this run. Used downstream to decide what portion of the
-    // dispatch-response final text still needs to be emitted as a
-    // `text.delta` (everything SSE missed) without double-emitting what
-    // SSE already delivered.
+    // events in this run. Retained as a fallback for the cancel path
+    // (a cancel may pre-empt the terminal `message.updated`); the
+    // success path emits `message.completed` per assistant message
+    // instead, so the host's REPLACE-on-`message.completed` logic
+    // surfaces only the LAST message as `result.text`.
     let streamedTextFromSse = "";
-    // Once a dispatch has settled and emitted the final text, suppress
-    // subsequent SSE text deltas for that same assistant message —
-    // OpenCode sometimes flushes the trailing deltas after the POST
-    // resolves, which would re-add text already covered by the
-    // dispatch-side emission.
-    const settledMessageIds = new Set<string>();
+    // Per-assistant-message text buffers, keyed by `properties.messageID`
+    // from `message.part.delta`. Flushed as `message.completed` events
+    // when the matching `message.updated` arrives with `info.time.completed`,
+    // and again on `session.idle` for any unflushed assistant messages.
+    const assistantTextByMessageId = new Map<string, string>();
+    const announcedAssistantCompletions = new Set<string>();
+    // Cost/tokens for the run. Captured on each `message.updated`
+    // SSE event for our session's assistant messages (see SSE handler
+    // below) and surfaced via `sink.complete` at run end. The
+    // `extractOpenCodeCostData` fallback over `rawPayloads` covers the
+    // step-finish part shape if it's the only carrier.
     let dispatchError: unknown;
     let firstSseEventLogged = false;
-    let resolveAllDone!: () => void;
-    const allDone = new Promise<void>((resolve) => {
-      resolveAllDone = resolve;
-    });
-    const checkDone = () => {
-      if (pendingMessages === 0) {
-        resolveAllDone();
-      }
-    };
 
     // The session POST endpoint is only known once the remote OpenCode server
     // is up and we've created (or resumed) a session. We install `onMessage`
@@ -669,7 +580,6 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
     const queuedParts: OpenCodePromptPart[][] = [];
 
     sink.onMessage(async (content: UserContent) => {
-      pendingMessages++;
       try {
         const parts = await validateProviderUserInput(
           request.provider,
@@ -682,11 +592,11 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
           queuedParts.push(mapped);
         }
       } catch (error) {
-        pendingMessages--;
         if (!dispatchError) {
           dispatchError = error;
         }
-        checkDone();
+        // Bail the wait loop so the run unwinds with the dispatch error.
+        resolveSessionTerminal();
         throw error;
       }
     });
@@ -709,26 +619,35 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
 
     const sseAbort = new AbortController();
     let sseTask: Promise<void> | undefined;
-    // AbortController wired into every POST /session/:id/message fetch so a
-    // Stop from the caller actually tears down the long-polling message
-    // request. Without this, the HTTP POST silently keeps streaming even
-    // after `run.abort()` because opencode's message endpoint doesn't
-    // return until the turn finishes on the server side.
-    const dispatchAbort = new AbortController();
     // Populated once the opencode session exists (either freshly created
     // or resumed). The abort handler closes over this ref and reads the
     // current value at call time.
     let capturedSessionId: string | undefined;
     let sessionErrorFromSse: Error | undefined;
     let sessionAbortedFromSse = false;
+    // Set when SSE delivers `session.idle` for our session — opencode's
+    // authoritative signal that the turn finished cleanly. Resolves
+    // `sessionTerminal` and drives `sink.complete()` directly.
+    let sessionIdleFromSse = false;
+    let resolveSessionTerminal!: () => void;
+    const sessionTerminal = new Promise<void>((resolve) => {
+      resolveSessionTerminal = resolve;
+    });
+    // Updated on every SSE event we receive (any session, including
+    // server-wide heartbeats). Used by the wait loop to detect whether
+    // SSE is still alive — if events keep arriving we keep waiting for
+    // a terminal signal regardless of wall-clock; if the channel goes
+    // silent we eventually give up and fail the run.
+    let lastSseActivityAt = Date.now();
 
     // Abort handler: prefer opencode's `POST /session/:id/abort` so the
-    // server terminates the turn cleanly and stops billing tokens. Then
-    // abort any in-flight POST /message so the adapter unwinds instead
-    // of hanging on the long-polling fetch. We deliberately avoid
-    // `runtime.cleanup()` here because the opencode server is shared
-    // across runs (see `ensureSandboxOpenCodeServer`); tearing it down
-    // would break subsequent chats.
+    // server terminates the turn cleanly and stops billing tokens. We
+    // deliberately avoid `runtime.cleanup()` here because the opencode
+    // server is shared across runs (see `ensureSandboxOpenCodeServer`);
+    // tearing it down would break subsequent chats. With prompt_async
+    // there is no long-polling fetch to cancel — the abort propagates
+    // server-side and we observe it via `session.error{MessageAborted}`
+    // on the SSE stream.
     let userAbortRequested = false;
     sink.setAbort(async () => {
       userAbortRequested = true;
@@ -755,11 +674,11 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
             ),
           ]);
         } catch {
-          // Best-effort; still abort the pending fetch below so the
-          // run doesn't hang even if the abort RPC failed.
+          // Best-effort.
         }
       }
-      dispatchAbort.abort();
+      // Bail the wait loop in case the SSE-side cancel signal is slow.
+      resolveSessionTerminal();
     });
 
     try {
@@ -825,10 +744,14 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
       const foreignMessageIds = new Set<string>();
       sseTask = (async () => {
         try {
-          for await (const event of streamSse(`${runtime.baseUrl}/event`, {
-            headers: runtime.previewHeaders,
-            signal: sseAbort.signal,
-          })) {
+          for await (const event of streamSseResilient(
+            `${runtime.baseUrl}/event`,
+            {
+              headers: runtime.previewHeaders,
+              signal: sseAbort.signal,
+            },
+          )) {
+            lastSseActivityAt = Date.now();
             if (!firstSseEventLogged) {
               firstSseEventLogged = true;
               debugOpencode(
@@ -894,6 +817,27 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                       { messageId: info.id },
                     ),
                   );
+                } else if (
+                  info.role === "assistant" &&
+                  !announcedAssistantCompletions.has(info.id)
+                ) {
+                  const time = info.time as
+                    | Record<string, unknown>
+                    | undefined;
+                  if (typeof time?.completed === "number") {
+                    announcedAssistantCompletions.add(info.id);
+                    sink.emitEvent(
+                      createNormalizedEvent(
+                        "message.completed",
+                        {
+                          provider: request.provider,
+                          runId: request.runId,
+                          raw,
+                        },
+                        { text: assistantTextByMessageId.get(info.id) ?? "" },
+                      ),
+                    );
+                  }
                 }
               }
             }
@@ -946,16 +890,15 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
 
             // OpenCode signals end-of-turn via `session.idle` on the SSE
             // bus. We abort the in-flight `POST /session/:id/message`
-            // here so the originating instance unwinds promptly when an
-            // external `Agent.attach({...}).abort()` -> server `/abort`
-            // happens — the server is sometimes slow to close the POST
-            // connection on its own (see opencode issue #20095). For
-            // natural completion this is a no-op: the POST has already
-            // resolved by the time `session.idle` arrives.
+            // OpenCode signals end-of-turn via `session.idle` (and the
+            // modern `session.status{type:"idle"}`) on the SSE bus.
+            // This is the authoritative completion signal — the SDK
+            // dispatches via `POST /prompt_async` (fire-and-forget,
+            // 204), so SSE is the only channel telling us a turn is
+            // done.
             if (
-              (payloadRecord?.type === "session.idle" ||
-                payloadRecord?.type === "session.error") &&
-              !dispatchAbort.signal.aborted
+              payloadRecord?.type === "session.idle" ||
+              payloadRecord?.type === "session.error"
             ) {
               const properties = payloadRecord.properties as
                 | Record<string, unknown>
@@ -984,13 +927,41 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                           : "OpenCode session error";
                     sessionErrorFromSse = new Error(errMsg);
                   }
+                } else {
+                  sessionIdleFromSse = true;
                 }
                 debugOpencode(
-                  "★ %s for session=%s — aborting in-flight dispatch",
+                  "★ %s for session=%s",
                   payloadRecord.type,
                   sessionId,
                 );
-                dispatchAbort.abort();
+                resolveSessionTerminal();
+              }
+            }
+            // Modern terminal signal: `session.status` with type idle.
+            // Fires alongside the deprecated `session.idle`; we accept
+            // either.
+            if (payloadRecord?.type === "session.status") {
+              const properties = payloadRecord.properties as
+                | Record<string, unknown>
+                | undefined;
+              const status = properties?.status as
+                | Record<string, unknown>
+                | undefined;
+              const eventSessionId =
+                typeof properties?.sessionID === "string"
+                  ? properties.sessionID
+                  : undefined;
+              if (
+                (!eventSessionId || eventSessionId === sessionId) &&
+                status?.type === "idle"
+              ) {
+                sessionIdleFromSse = true;
+                debugOpencode(
+                  "★ session.status{idle} for session=%s",
+                  sessionId,
+                );
+                resolveSessionTerminal();
               }
             }
 
@@ -1020,16 +991,17 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
               if (isForeignSession) {
                 continue;
               }
-              if (
-                eventMessageId !== undefined &&
-                settledMessageIds.has(eventMessageId)
-              ) {
-                continue;
-              }
               const delta =
                 typeof properties?.delta === "string" ? properties.delta : "";
               if (delta && properties?.field === "text") {
                 streamedTextFromSse += delta;
+                if (eventMessageId) {
+                  assistantTextByMessageId.set(
+                    eventMessageId,
+                    (assistantTextByMessageId.get(eventMessageId) ?? "") +
+                      delta,
+                  );
+                }
                 sink.emitEvent(
                   createNormalizedEvent(
                     "text.delta",
@@ -1090,181 +1062,185 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
 
       const agentSlug = openCodeAgentSlug(request.run.reasoning);
 
-      const dispatchMessage = async (
+      // Fire-and-forget dispatch via opencode's async prompt endpoint.
+      // The server enqueues the turn and returns 204 immediately —
+      // results flow exclusively through the SSE event stream we're
+      // already consuming. One retry on transport failure; if both
+      // attempts fail we surface the error and the run unwinds.
+      //
+      // This replaces the old `POST /session/:id/message` long-polling
+      // call, which held the HTTP connection open for the entire
+      // turn. That design was the unique source of `fetch failed`
+      // errors when sandbox networks dropped multi-minute connections;
+      // prompt_async eliminates that whole class of failure.
+      const dispatchPrompt = async (
         parts: OpenCodePromptPart[],
       ): Promise<void> => {
-        // Snapshot the SSE-accumulated text length before the POST so
-        // we can tell whether THIS dispatch produced any streaming
-        // deltas — independently of earlier turns in the same run. If
-        // the length didn't grow by the time the POST resolves, SSE
-        // was silent for this turn and we still need to surface the
-        // response's full text via a `text.delta`.
-        const sseTextLengthBeforeDispatch = streamedTextFromSse.length;
-        try {
-          const response = await fetchJson<unknown>(
-            `${runtime.baseUrl}/session/${sessionId}/message`,
-            {
-              method: "POST",
-              signal: dispatchAbort.signal,
-              headers: {
-                "content-type": "application/json",
-                ...runtime.previewHeaders,
-              },
-              body: JSON.stringify({
-                ...(request.run.model
-                  ? { model: toOpenCodeModel(request.run.model) }
-                  : {}),
-                // Per-message system prompt — keeps systemPrompt out of
-                // the on-disk agent config so changing it doesn't
-                // invalidate setupId. Sent on every dispatch (the field
-                // is per-message, not session-sticky).
-                ...(request.run.systemPrompt
-                  ? { system: request.run.systemPrompt }
-                  : {}),
-                agent: agentSlug,
-                parts,
-              }),
+        const body = JSON.stringify({
+          ...(request.run.model
+            ? { model: toOpenCodeModel(request.run.model) }
+            : {}),
+          // Per-message system prompt — keeps systemPrompt out of
+          // the on-disk agent config so changing it doesn't
+          // invalidate setupId. Sent on every dispatch (the field
+          // is per-message, not session-sticky).
+          ...(request.run.systemPrompt
+            ? { system: request.run.systemPrompt }
+            : {}),
+          agent: agentSlug,
+          parts,
+        });
+        const url = `${runtime.baseUrl}/session/${sessionId}/prompt_async`;
+
+        const attempt = async (): Promise<Response> => {
+          return fetch(url, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              ...runtime.previewHeaders,
             },
-          );
+            body,
+          });
+        };
 
-          const rawResponse = toRawEvent(
-            request.runId,
-            response,
-            "message.response",
-          );
-          if (
-            response &&
-            typeof response === "object" &&
-            !Array.isArray(response)
-          ) {
-            rawPayloads.push(response as Record<string, unknown>);
-          }
-          sink.emitRaw(rawResponse);
-          for (const event of normalizeRawAgentEvent(rawResponse)) {
-            sink.emitEvent(event);
-          }
-
-          const reasoning = extractReasoning(response);
-          if (reasoning) {
-            sink.emitEvent(
-              createNormalizedEvent(
-                "reasoning.delta",
-                {
-                  provider: request.provider,
-                  runId: request.runId,
-                  raw: rawResponse,
-                },
-                { delta: reasoning },
-              ),
+        let lastError: unknown;
+        for (let i = 0; i < 2; i++) {
+          try {
+            const response = await attempt();
+            if (response.ok || response.status === 204) {
+              return;
+            }
+            lastError = new Error(
+              `POST ${url} returned ${response.status}`,
             );
+          } catch (error) {
+            lastError = error;
           }
-
-          const text = extractText(response);
-          if (text) {
-            finalText = text;
-            // SSE may have streamed any prefix of this turn's text
-            // before the POST resolved (or none at all when the server
-            // flushed the response synchronously). Compute what's
-            // missing and emit just that suffix as a `text.delta`,
-            // avoiding both duplication and dropped trailing text.
-            const sseTextForThisDispatch = streamedTextFromSse.slice(
-              sseTextLengthBeforeDispatch,
+          if (i === 0) {
+            debugOpencode(
+              "prompt_async dispatch attempt %d failed (%s); retrying once",
+              i + 1,
+              (lastError as Error)?.message ?? String(lastError),
             );
-            let missing: string;
-            if (text.startsWith(sseTextForThisDispatch)) {
-              missing = text.slice(sseTextForThisDispatch.length);
-            } else if (sseTextForThisDispatch.length === 0) {
-              missing = text;
-            } else {
-              missing = "";
-            }
-            if (missing.length > 0) {
-              streamedTextFromSse += missing;
-              sink.emitEvent(
-                createNormalizedEvent(
-                  "text.delta",
-                  {
-                    provider: request.provider,
-                    runId: request.runId,
-                  },
-                  { delta: missing },
-                ),
-              );
-            }
-            // Block any post-dispatch SSE flush for this assistant
-            // message from re-emitting text we just covered.
-            const assistantMessageId = extractAssistantMessageId(response);
-            if (assistantMessageId) {
-              settledMessageIds.add(assistantMessageId);
-            }
+            await sleep(500);
           }
-        } catch (error) {
-          if (!dispatchError) {
-            dispatchError = error;
-          }
-        } finally {
-          pendingMessages--;
-          checkDone();
         }
+        throw lastError instanceof Error
+          ? lastError
+          : new Error(String(lastError));
       };
 
-      // OpenCode queues concurrent POSTs to `/session/:id/message` (see
-      // https://github.com/sst/opencode/issues/931), so mid-run injections can
-      // reuse the same endpoint as the initial turn. Each POST resolves with
-      // its own turn's assistant response.
+      // OpenCode queues concurrent prompts on the same session, so
+      // mid-run injections via `run.sendMessage(...)` reuse the same
+      // endpoint as the initial turn.
       sendToSession = (parts) => {
-        void dispatchMessage(parts);
+        void (async () => {
+          try {
+            await dispatchPrompt(parts);
+          } catch (error) {
+            if (!dispatchError) {
+              dispatchError = error;
+            }
+            // Bail the wait loop so the run fails promptly.
+            resolveSessionTerminal();
+          }
+        })();
       };
 
       // Flush any messages that arrived via `run.sendMessage(...)` before the
-      // session was ready. They now become additional queued turns alongside
-      // the initial input.
+      // session was ready. They become additional queued turns alongside the
+      // initial input.
       for (const queued of queuedParts.splice(0)) {
         sendToSession(queued);
       }
 
-      pendingMessages++;
-      void dispatchMessage(mapToOpenCodeParts(inputParts));
+      // Initial dispatch. We await this one because if it fails we
+      // want to surface the error before entering the wait loop.
+      try {
+        await dispatchPrompt(mapToOpenCodeParts(inputParts));
+      } catch (error) {
+        if (!dispatchError) {
+          dispatchError = error;
+        }
+        resolveSessionTerminal();
+      }
 
-      await allDone;
+      // Wait for the SSE-driven terminal signal. As long as SSE keeps
+      // producing events (deltas, heartbeats, anything) we keep
+      // waiting; if the channel goes silent for the threshold window
+      // we give up and fail the run. The consumer (e.g. Twill) is
+      // responsible for resuming via `resumeSessionId` if needed —
+      // the SDK does not attempt to recover lost state on its own.
+      const SSE_SILENCE_THRESHOLD_MS = 180_000; // 3 min of no events = dead
+      const SSE_POLL_INTERVAL_MS = 5_000;
+      lastSseActivityAt = Date.now();
+      let sseSilent = false;
+      while (
+        !sessionIdleFromSse &&
+        !sessionErrorFromSse &&
+        !sessionAbortedFromSse &&
+        !userAbortRequested &&
+        !dispatchError
+      ) {
+        const silence = Date.now() - lastSseActivityAt;
+        if (silence > SSE_SILENCE_THRESHOLD_MS) {
+          sseSilent = true;
+          debugOpencode("SSE went silent (%dms) — giving up", silence);
+          break;
+        }
+        await Promise.race([
+          sessionTerminal,
+          new Promise<void>((resolve) =>
+            setTimeout(resolve, SSE_POLL_INTERVAL_MS),
+          ),
+        ]);
+      }
+
+      sseAbort.abort();
+      await sseTask;
 
       if (userAbortRequested || sessionAbortedFromSse) {
         debugOpencode(
           "★ run.cancelled (%dms since execute start)",
           Date.now() - executeStartedAt,
         );
-        sseAbort.abort();
-        await sseTask;
         sink.cancel({
           text: streamedTextFromSse || undefined,
           costData: extractOpenCodeCostData(rawPayloads),
         });
       } else if (sessionErrorFromSse) {
-        sseAbort.abort();
-        await sseTask;
         sink.fail(sessionErrorFromSse);
-      } else if (
-        dispatchError &&
-        !(
-          dispatchAbort.signal.aborted &&
-          (dispatchError as Error)?.name === "AbortError"
-        )
-      ) {
-        // Only surface real dispatch errors. When dispatchAbort is
-        // signalled (by session.idle or session.error), the in-flight
-        // POST gets an AbortError as a side-effect of our own abort;
-        // that is not a real error — the SSE terminal event is
-        // authoritative. session.error is already handled above via
-        // sessionErrorFromSse; session.idle means clean completion.
-        sseAbort.abort();
-        await sseTask;
+      } else if (dispatchError) {
         sink.fail(dispatchError);
-      } else {
+      } else if (sessionIdleFromSse) {
         debugOpencode(
           "★ run.completed (%dms since execute start) chars=%d",
           Date.now() - executeStartedAt,
-          finalText.length,
+          streamedTextFromSse.length,
         );
+        // Flush any assistant message buffers that didn't receive a
+        // terminal `message.updated{info.time.completed}` before
+        // `session.idle`. Map iteration order is insertion order, so
+        // the LAST emitted `message.completed` is the most recent
+        // assistant message — exactly the REPLACE target the host
+        // uses to settle `result.text`.
+        let lastAssistantText = "";
+        for (const [messageId, text] of assistantTextByMessageId) {
+          lastAssistantText = text;
+          if (!announcedAssistantCompletions.has(messageId)) {
+            announcedAssistantCompletions.add(messageId);
+            sink.emitEvent(
+              createNormalizedEvent(
+                "message.completed",
+                {
+                  provider: request.provider,
+                  runId: request.runId,
+                },
+                { text },
+              ),
+            );
+          }
+        }
         sink.emitEvent(
           createNormalizedEvent(
             "run.completed",
@@ -1272,15 +1248,23 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
               provider: request.provider,
               runId: request.runId,
             },
-            { text: finalText },
+            { text: lastAssistantText },
           ),
         );
-        sseAbort.abort();
-        await sseTask;
         sink.complete({
-          text: finalText,
+          text: lastAssistantText,
           costData: extractOpenCodeCostData(rawPayloads),
         });
+      } else if (sseSilent) {
+        sink.fail(
+          new Error(
+            "opencode SSE went silent before the session reached idle",
+          ),
+        );
+      } else {
+        sink.fail(
+          new Error("opencode run ended without a terminal signal"),
+        );
       }
     } finally {
       sseAbort.abort();
@@ -1288,8 +1272,8 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
         await sseTask.catch(() => undefined);
       }
       // No runtime cleanup: the opencode server is shared across runs
-      // (started by setup() once). Per-run state (HTTP fetches, SSE
-      // task) is torn down via the abort controllers above.
+      // (started by setup() once). Per-run state (SSE task) is torn
+      // down via the abort controller above.
     }
 
     return async () => undefined;
@@ -1334,10 +1318,10 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
   }
 
   /**
-   * Stateless message injection. POST a fresh user message to
-   * `/session/:id/message` with `agent` defaulting to the build agent
-   * — opencode appends it to the running session and the originating
-   * instance picks up the new turn through its existing SSE stream.
+   * Stateless message injection. Fire-and-forget POST to
+   * `/session/:id/prompt_async` (returns 204) — opencode appends the
+   * message to the running session and the originating instance picks
+   * up the new turn through its existing SSE stream.
    */
   async attachSendMessage(
     request: AgentAttachRequest<"open-code">,
@@ -1356,19 +1340,20 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
       content,
     );
     const parts = mapToOpenCodeParts(inputParts);
-    await fetchJson<unknown>(
-      `${baseUrl}/session/${request.sessionId}/message`,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...request.sandbox.previewHeaders,
-        },
-        body: JSON.stringify({
-          agent: openCodeAgentSlug(undefined),
-          parts,
-        }),
+    const url = `${baseUrl}/session/${request.sessionId}/prompt_async`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...request.sandbox.previewHeaders,
       },
-    );
+      body: JSON.stringify({
+        agent: openCodeAgentSlug(undefined),
+        parts,
+      }),
+    });
+    if (!response.ok && response.status !== 204) {
+      throw new Error(`POST ${url} returned ${response.status}`);
+    }
   }
 }

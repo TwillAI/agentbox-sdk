@@ -85,6 +85,45 @@ export async function* streamSse(
   yield* queue;
 }
 
+/**
+ * Reconnecting wrapper around `streamSse`. Retries on transient transport
+ * errors with exponential backoff (0.5s → 5s), tracks the last event id,
+ * and replays it via `Last-Event-ID` so servers that support SSE replay
+ * can backfill events lost during the gap. If the consumer's `signal` is
+ * aborted, the loop exits cleanly. Designed for long-running SSE channels
+ * (opencode `/event`) where Bun's fetch occasionally drops the underlying
+ * connection mid-stream.
+ */
+export async function* streamSseResilient(
+  url: string,
+  init?: RequestInit,
+): AsyncIterable<SseEvent> {
+  let lastEventId: string | undefined;
+  let attempt = 0;
+  const signal = init?.signal as AbortSignal | undefined;
+
+  while (true) {
+    try {
+      const headers = {
+        ...(init?.headers ?? {}),
+        ...(lastEventId ? { "Last-Event-ID": lastEventId } : {}),
+      };
+      for await (const ev of streamSse(url, { ...init, headers })) {
+        attempt = 0;
+        if (ev.id) lastEventId = ev.id;
+        yield ev;
+      }
+      return;
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      const delay = Math.min(500 * Math.pow(2, attempt), 5_000);
+      attempt++;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      if (signal?.aborted) throw err;
+    }
+  }
+}
+
 type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (reason?: unknown) => void;
