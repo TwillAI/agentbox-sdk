@@ -51,7 +51,7 @@ import type { Sandbox } from "../../sandboxes";
  * surface changes; the host probes `GET /__version` and respawns the
  * daemon on mismatch so warm sandboxes pick up the new code.
  */
-const DAEMON_PROTOCOL_VERSION = "1";
+const DAEMON_PROTOCOL_VERSION = "2";
 const DAEMON_PORT = 43180;
 const DAEMON_PATH = "/tmp/agentbox/claude-code/daemon.mjs";
 const DAEMON_LOG_PATH = "/tmp/agentbox/claude-code/daemon.log";
@@ -311,6 +311,16 @@ async function handleStart(req, res, runId) {
     "x-daemon-version": VERSION,
   });
 
+  // Heartbeat: write a blank NDJSON line every 15s so HTTPS proxies
+  // (Modal/Daytona tunnels, intermediate LBs) don't idle-kill the
+  // stream during long blocking tool calls (e.g. TaskOutput block:true).
+  // The host's parseNdjsonStream skips empty lines, so this is a no-op
+  // for consumers but keeps the underlying TCP stream warm.
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) res.write("\\n");
+  }, 15000);
+  if (typeof heartbeat.unref === "function") heartbeat.unref();
+
   const opts = { ...(options || {}) };
   const autoApprove = !!opts.autoApproveTools;
   delete opts.autoApproveTools;
@@ -328,6 +338,7 @@ async function handleStart(req, res, runId) {
       },
     });
   } catch (e) {
+    clearInterval(heartbeat);
     res.write(JSON.stringify({ _error: String(e?.message ?? e) }) + "\\n");
     res.end();
     return;
@@ -337,6 +348,7 @@ async function handleStart(req, res, runId) {
 
   // Client disconnected (e.g. host process killed) → tear down.
   req.on("close", () => {
+    clearInterval(heartbeat);
     if (!liveRuns.has(runId)) return;
     liveRuns.delete(runId);
     promptStream.end();
@@ -351,6 +363,7 @@ async function handleStart(req, res, runId) {
   } catch (e) {
     res.write(JSON.stringify({ _error: String(e?.message ?? e) }) + "\\n");
   } finally {
+    clearInterval(heartbeat);
     liveRuns.delete(runId);
     promptStream.end();
     res.end();
