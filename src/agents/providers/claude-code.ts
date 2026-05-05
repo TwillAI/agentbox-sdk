@@ -164,7 +164,8 @@ function extractAssistantThinking(message: SDKAssistantMessage): string {
   if (!Array.isArray(content)) return "";
   return content
     .filter(
-      (block) => block.type === "thinking" || block.type === "redacted_thinking",
+      (block) =>
+        block.type === "thinking" || block.type === "redacted_thinking",
     )
     .map((block) => String((block as { thinking?: string }).thinking ?? ""))
     .filter(Boolean)
@@ -212,7 +213,7 @@ function createClaudeCodeDaemonScript(): string {
   return `import http from "node:http";
 import { execSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query, getSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 
 const VERSION = ${version};
 const port = Number(process.argv[2] ?? "${DAEMON_PORT}");
@@ -327,6 +328,36 @@ async function handleStart(req, res, runId) {
   opts.pathToClaudeCodeExecutable = resolveClaudeBinary(
     opts.pathToClaudeCodeExecutable,
   );
+
+  // Resume-if-exists gate. \`claude --resume <id>\` errors hard with "No
+  // conversation found with session ID" when the local session jsonl is
+  // missing — most often because a prior post-task snapshot failed and the
+  // sandbox state we resumed from doesn't have it. Probe the session
+  // store; if the id isn't there, drop \`resume\` (and its companions) and
+  // reuse the same UUID via \`sessionId\` so the host's pre-minted session
+  // id stays consistent with what claude-agent-sdk actually emits.
+  if (opts.resume) {
+    let sessionExists = false;
+    try {
+      const info = await getSessionInfo(opts.resume, opts.cwd ? { dir: opts.cwd } : undefined);
+      sessionExists = info !== undefined;
+    } catch {
+      sessionExists = false;
+    }
+    if (!sessionExists) {
+      const orphanedId = opts.resume;
+      delete opts.resume;
+      delete opts.resumeSessionAt;
+      delete opts.forkSession;
+      opts.sessionId = orphanedId;
+      res.write(
+        JSON.stringify({
+          _notice: "resume_session_missing",
+          sessionId: orphanedId,
+        }) + "\\n",
+      );
+    }
+  }
 
   let queryHandle;
   try {
@@ -640,9 +671,7 @@ async function daemonBaseUrl(sandbox: Sandbox): Promise<string> {
   return url.replace(/\/$/, "");
 }
 
-export class ClaudeCodeAgentAdapter
-  implements AgentProviderAdapter<"claude-code">
-{
+export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code"> {
   /**
    * Sandbox-side preparation. Uploads `.claude/` artifacts and ensures
    * the daemon is running. `execute()` then dials the daemon directly.
@@ -788,9 +817,7 @@ export class ClaudeCodeAgentAdapter
         // `sessionId` and `resume` are mutually exclusive — buildClaudeQueryOptions
         // already set `resume` for the resume path, so only stamp `sessionId` for
         // fresh runs.
-        ...(request.run.resumeSessionId
-          ? {}
-          : { sessionId: presetSessionId }),
+        ...(request.run.resumeSessionId ? {} : { sessionId: presetSessionId }),
         autoApproveTools,
       },
     };
@@ -874,14 +901,29 @@ export class ClaudeCodeAgentAdapter
 
     try {
       for await (const item of parseNdjsonStream(response.body)) {
-        if (
-          item &&
-          typeof item === "object" &&
-          "_error" in (item as Record<string, unknown>)
-        ) {
-          throw new Error(
-            String((item as { _error: unknown })._error ?? "daemon error"),
-          );
+        if (item && typeof item === "object") {
+          const ctrl = item as Record<string, unknown>;
+          if ("_error" in ctrl) {
+            throw new Error(
+              String((item as { _error: unknown })._error ?? "daemon error"),
+            );
+          }
+          if ("_notice" in ctrl) {
+            // Daemon-side advisories that aren't SDKMessages. Currently:
+            //   { _notice: "resume_session_missing", sessionId: "<uuid>" }
+            //     → daemon dropped a stale `resume` because the session
+            //       file wasn't on disk; a fresh session was started under
+            //       the same id. The host can clear its resume hint.
+            debugClaude("daemon notice: %o", ctrl);
+            sink.emitRaw(
+              toRawEvent(
+                request.runId,
+                ctrl,
+                `daemon.${String(ctrl._notice ?? "notice")}`,
+              ),
+            );
+            continue;
+          }
         }
         const message = item as SDKMessage;
         rawPayloads.push(message as unknown as Record<string, unknown>);
@@ -1008,7 +1050,12 @@ export class ClaudeCodeAgentAdapter
           Date.now() - executeStartedAt,
           lastTerminalReason,
         );
-        sink.fail(new Error(finalText || `claude-code run failed (terminal_reason: ${lastTerminalReason})`));
+        sink.fail(
+          new Error(
+            finalText ||
+              `claude-code run failed (terminal_reason: ${lastTerminalReason})`,
+          ),
+        );
       } else {
         debugClaude(
           "★ run.completed (%dms since execute start) chars=%d",
