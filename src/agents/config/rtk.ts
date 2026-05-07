@@ -46,9 +46,8 @@ function rtkRedirectEnv(target: SetupTarget): Record<string, string> {
 }
 
 /**
- * Activate RTK for `target.provider`. Throws on non-zero exit (binary
- * missing, init failure). Idempotent: `rtk init -g` skips work when its
- * hook is already present.
+ * Activate RTK for `target.provider`. Idempotent: `rtk init -g` skips
+ * work when its hook is already present.
  *
  * Pre-creates the per-provider config dirs RTK writes into. RTK's
  * atomic-write doesn't `mkdir -p` for `~/.claude/RTK.md` or
@@ -60,6 +59,10 @@ function rtkRedirectEnv(target: SetupTarget): Record<string, string> {
  * defaults to N in non-TTY contexts and silently declines to install
  * the hook. Codex and OpenCode modes don't prompt and reject
  * `--auto-patch`, so it is omitted for those providers.
+ *
+ * Failures (binary missing, non-zero exit) are logged and swallowed —
+ * RTK is a token-saving optimization, not a correctness requirement, so
+ * a setup-time failure should not block the agent from running.
  */
 export async function activateRtk(target: SetupTarget): Promise<void> {
   const args = RTK_INIT_ARGS_BY_PROVIDER[target.provider];
@@ -68,5 +71,12 @@ export async function activateRtk(target: SetupTarget): Promise<void> {
     .map((d) => `'${d}'`)
     .join(" ");
   const cmd = `mkdir -p ${dirsToEnsure} && rtk init -g ${args}`.trim();
-  await target.runCommand(cmd, env);
+  try {
+    await target.runCommand(cmd, env);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(
+      `[rtk] activation failed for ${target.provider}; agent will run without the token-saving proxy: ${message}`,
+    );
+  }
 }
