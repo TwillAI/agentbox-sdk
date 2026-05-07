@@ -27,6 +27,7 @@ import {
 } from "../input";
 import { assertCommandsSupported } from "../config/commands";
 import { assertHooksSupported, buildCodexHooksFile } from "../config/hooks";
+import { activateRtk } from "../config/rtk";
 import { buildCodexConfigToml } from "../config/mcp";
 import { agentboxRoot, createSetupTarget } from "../config/setup";
 import {
@@ -822,6 +823,7 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
     const { artifacts: skillArtifacts, installCommands } =
       await prepareSkillArtifacts(provider, options.skills, target.layout);
 
+    const enableRtk = options.enableRtk === true;
     const daemonInfo = {
       port: REMOTE_CODEX_APP_SERVER_PORT,
       healthPath: "/readyz",
@@ -830,6 +832,7 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
       artifacts: [...serverArtifacts, ...skillArtifacts],
       installCommands,
       daemon: daemonInfo,
+      extras: [`enableRtk:${enableRtk}`],
     });
     if (await preflightSetup(sharedTarget, setupId, daemonInfo)) {
       debugCodex("codex remote setup() preflight hit — skipping");
@@ -902,6 +905,10 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
       throw error;
     }
 
+    if (enableRtk) {
+      await time(debugCodex, "activateRtk", () => activateRtk(sharedTarget));
+    }
+
     await markSetupComplete(sharedTarget, setupId);
     return;
   }
@@ -914,11 +921,13 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
   const { artifacts: configArtifacts } = buildArtifactsFor(target);
   const allArtifacts = [...skillArtifacts, ...configArtifacts];
 
+  const enableRtk = options.enableRtk === true;
   // Local mode has no in-process daemon to probe — only the artifact set
   // matters. setupId match short-circuits the upload + login.
   const setupId = computeSetupId({
     artifacts: allArtifacts,
     installCommands,
+    extras: [`enableRtk:${enableRtk}`],
   });
   if (await preflightSetup(target, setupId)) {
     debugCodex("codex local setup() preflight hit — skipping");
@@ -933,6 +942,10 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
   }
 
   await applyDifferentialSetup(target, allArtifacts, installCommands);
+
+  if (enableRtk) {
+    await time(debugCodex, "activateRtk", () => activateRtk(target));
+  }
 
   await markSetupComplete(target, setupId);
 }

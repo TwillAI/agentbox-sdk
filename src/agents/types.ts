@@ -97,6 +97,19 @@ export interface AgentOptionsBase {
   sandbox?: Sandbox;
   cwd?: string;
   env?: Record<string, string>;
+  /**
+   * When `true`, wire RTK (rust-token-killer, https://github.com/rtk-ai/rtk)
+   * into the agent so its bash commands flow through `rtk rewrite` to trim
+   * output and save tokens. The `rtk` binary must be installed on PATH
+   * inside the sandbox (or on the host, for non-sandbox runs).
+   *
+   * Activation happens during {@link Agent.setup}: agentbox shells out to
+   * `rtk init -g [...]` with environment variables that redirect RTK's
+   * writes into the agentbox-managed config layout (so the hook persists
+   * past the agent CLI's own settings rewrites). Idempotent — `rtk init`
+   * is a no-op when already active. Toggle invalidates the setup cache.
+   */
+  enableRtk?: boolean;
   approvalMode?: AgentApprovalMode;
   mcps?: AgentMcpConfig[];
   skills?: AgentSkillConfig[];

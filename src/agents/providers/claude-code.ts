@@ -34,6 +34,7 @@ import {
 import { buildClaudeHookSettings, assertHooksSupported } from "../config/hooks";
 import { buildClaudeMcpConfig } from "../config/mcp";
 import { agentboxRoot, createSetupTarget } from "../config/setup";
+import { activateRtk } from "../config/rtk";
 import {
   applyDifferentialSetup,
   computeSetupId,
@@ -721,6 +722,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         { path: mcpConfigPath, content: mcpConfigJson },
       ];
 
+      const enableRtk = options.enableRtk === true;
       const daemonInfo = {
         port: DAEMON_PORT,
         healthPath: "/__version",
@@ -730,6 +732,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         artifacts,
         installCommands,
         daemon: daemonInfo,
+        extras: [`enableRtk:${enableRtk}`],
       });
       if (await preflightSetup(target, setupId, daemonInfo)) {
         debugClaude("claude-code setup() preflight hit — skipping");
@@ -743,6 +746,12 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         ),
         ensureClaudeCodeDaemon(options, env),
       ]);
+
+      // Run after applyDifferentialSetup so the agentbox-managed
+      // settings.json exists; rtk merges its hook into it.
+      if (enableRtk) {
+        await time(debugClaude, "activateRtk", () => activateRtk(target));
+      }
 
       await markSetupComplete(target, setupId);
     });

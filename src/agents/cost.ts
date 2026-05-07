@@ -40,10 +40,16 @@ function mergeUsage(
   );
   addIfNumber(target, "cache_read_input_tokens", source.cached_input_tokens);
   addIfNumber(target, "cache_read_input_tokens", source.cachedInputTokens);
+  addIfNumber(target, "cache_read_input_tokens", source.cacheReadInputTokens);
   addIfNumber(
     target,
     "cache_creation_input_tokens",
     source.cache_creation_input_tokens,
+  );
+  addIfNumber(
+    target,
+    "cache_creation_input_tokens",
+    source.cacheCreationInputTokens,
   );
   addIfNumber(target, "cache_creation_input_tokens", source.cacheWrite);
 
@@ -102,6 +108,8 @@ export function extractClaudeCostData(
       for (const value of Object.values(modelUsage)) {
         mergeUsage(usage, asRecord(value));
       }
+    } else {
+      mergeUsage(usage, asRecord(event.usage));
     }
 
     return compactCostData({

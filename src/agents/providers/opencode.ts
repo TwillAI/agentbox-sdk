@@ -32,6 +32,7 @@ import {
 } from "../config/hooks";
 import { buildOpenCodeMcpConfig } from "../config/mcp";
 import { createSetupTarget } from "../config/setup";
+import { activateRtk } from "../config/rtk";
 import { prepareSkillArtifacts } from "../config/skills";
 import {
   applyDifferentialSetup,
@@ -301,10 +302,7 @@ async function ensureSandboxOpenCodeServer(
     );
 
     const configPath = path.join(target.layout.opencodeDir, "agentbox.json");
-    const openCodeConfig = buildOpenCodeConfig(
-      options,
-      interactiveApproval,
-    );
+    const openCodeConfig = buildOpenCodeConfig(options, interactiveApproval);
     const allArtifacts = [
       ...skillArtifacts,
       ...pluginArtifacts,
@@ -314,11 +312,13 @@ async function ensureSandboxOpenCodeServer(
       },
     ];
 
+    const enableRtk = options.enableRtk === true;
     const daemonInfo = { port, healthPath: "/global/health" };
     const setupId = computeSetupId({
       artifacts: allArtifacts,
       installCommands,
       daemon: daemonInfo,
+      extras: [`enableRtk:${enableRtk}`],
     });
     if (await preflightSetup(target, setupId, daemonInfo)) {
       debugOpencode("opencode setup() preflight hit — skipping");
@@ -332,6 +332,12 @@ async function ensureSandboxOpenCodeServer(
     };
 
     await applyDifferentialSetup(target, allArtifacts, installCommands);
+
+    // Activate RTK before launching `opencode serve` so the plugin file is
+    // present when the server scans its plugins dir at boot.
+    if (enableRtk) {
+      await time(debugOpencode, "activateRtk", () => activateRtk(target));
+    }
 
     const binary = options.provider?.binary ?? "opencode";
     const pidFilePath = path.posix.join(
@@ -846,9 +852,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                   info.role === "assistant" &&
                   !announcedAssistantCompletions.has(info.id)
                 ) {
-                  const time = info.time as
-                    | Record<string, unknown>
-                    | undefined;
+                  const time = info.time as Record<string, unknown> | undefined;
                   if (typeof time?.completed === "number") {
                     announcedAssistantCompletions.add(info.id);
                     sink.emitEvent(
@@ -1142,9 +1146,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
             if (response.ok || response.status === 204) {
               return;
             }
-            lastError = new Error(
-              `POST ${url} returned ${response.status}`,
-            );
+            lastError = new Error(`POST ${url} returned ${response.status}`);
           } catch (error) {
             lastError = error;
           }
@@ -1289,14 +1291,10 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
         });
       } else if (sseSilent) {
         sink.fail(
-          new Error(
-            "opencode SSE went silent before the session reached idle",
-          ),
+          new Error("opencode SSE went silent before the session reached idle"),
         );
       } else {
-        sink.fail(
-          new Error("opencode run ended without a terminal signal"),
-        );
+        sink.fail(new Error("opencode run ended without a terminal signal"));
       }
     } finally {
       sseAbort.abort();
