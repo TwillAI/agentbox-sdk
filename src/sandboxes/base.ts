@@ -146,6 +146,48 @@ export abstract class SandboxAdapter<
   }
 
   /**
+   * Attach to an already-existing sandbox by id. Skips the
+   * `findMatchingSandbox` lookup that `findOrProvision` does — useful when
+   * the caller just created the sandbox (e.g. via a fork API) and knows
+   * its id directly. Idempotent: a second call is a no-op once attached.
+   *
+   * Default implementation throws — providers opt in by overriding
+   * `attachExisting`. Currently implemented by the Daytona adapter.
+   */
+  async attachById(id: string): Promise<void> {
+    if (this.provisioned) {
+      return;
+    }
+
+    if (!this.provisioning) {
+      this.provisioning = time(
+        debugSandbox,
+        `attachById [${this.provider}] ${id}`,
+        async () => {
+          await this.attachExisting(id);
+          this.provisioned = true;
+        },
+      ).finally(() => {
+        this.provisioning = undefined;
+      });
+    }
+
+    await this.provisioning;
+  }
+
+  /**
+   * Provider hook for `attachById`. Adopt the sandbox with the given id
+   * (e.g. fetch via the provider client, mark `isWarmFlag`, start if
+   * paused). Throw if the provider doesn't support direct attach.
+   */
+  protected async attachExisting(id: string): Promise<void> {
+    void id;
+    throw new Error(
+      `attachById is not supported by the ${this.provider} provider.`,
+    );
+  }
+
+  /**
    * Throw a consistent error when a method that needs a provisioned
    * sandbox is called before `findOrProvision()`. Provider adapters call
    * this at the top of `run`, `runAsync`, `uploadFile`, etc.

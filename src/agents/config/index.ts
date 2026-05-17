@@ -19,4 +19,7 @@ export type {
   OpenCodePluginEvent,
   OpenCodePluginHookConfig,
   RepoSkillConfig,
+  SetupLayout,
 } from "./types";
+
+export { agentboxRoot, getAgentLayout } from "./setup";

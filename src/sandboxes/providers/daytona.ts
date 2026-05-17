@@ -57,6 +57,20 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
     return this.sandbox?.id;
   }
 
+  protected async attachExisting(id: string): Promise<void> {
+    const existing = await this.client.get(id);
+    if (!existing) {
+      throw new Error(`Daytona sandbox ${id} not found`);
+    }
+    this.sandbox = existing;
+    const state = (existing.state as string | undefined) ?? "unknown";
+    const isWarm = state === "started";
+    if (!isWarm) {
+      await existing.start();
+    }
+    this.isWarmFlag = isWarm;
+  }
+
   protected async provision(): Promise<void> {
     const existing = await this.findMatchingSandbox();
     if (existing) {
@@ -115,10 +129,16 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
   ): Promise<CommandResult> {
     this.requireProvisioned();
     const sandbox = this.requireSandbox();
+    // Daytona's `executeCommand(cmd, cwd, envVars, timeout)` silently
+    // drops `envVars` — observed empirically (variables are missing from
+    // both the immediate process env and any nohup'd subshell). We
+    // inline `export NAME='value'` statements ahead of the command so
+    // env vars actually reach the process. Matches `buildSessionCommand`
+    // for `runAsync`.
     const result = await sandbox.process.executeCommand(
-      toShellCommand(command),
+      this.buildSessionCommand(command, options),
       options?.cwd ?? this.workingDir,
-      this.getMergedEnv(options?.env),
+      undefined,
       options?.timeoutMs ? Math.ceil(options.timeoutMs / 1000) : undefined,
     );
 

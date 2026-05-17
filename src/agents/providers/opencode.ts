@@ -238,13 +238,18 @@ export function buildOpenCodeConfig(
     ]),
   );
   const googleBaseUrl = options.env?.GOOGLE_BASE_URL;
+  const openRouterBaseUrl = options.env?.OPENROUTER_BASE_URL;
 
   return {
     $schema: "https://opencode.ai/config.json",
     ...(mcpConfig ? { mcp: mcpConfig } : {}),
     ...(commandsConfig ? { command: commandsConfig } : {}),
     provider: {
-      openrouter: { options: { baseURL: "https://openrouter.ai/api/v1" } },
+      openrouter: {
+        options: {
+          baseURL: openRouterBaseUrl || "https://openrouter.ai/api/v1",
+        },
+      },
       ...(googleBaseUrl
         ? { google: { options: { baseURL: googleBaseUrl } } }
         : {}),

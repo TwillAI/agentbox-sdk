@@ -27,14 +27,24 @@ function shortLabel(command: string): string {
  */
 export function agentboxRoot(
   provider: AgentProviderName,
-  hasSandbox: boolean,
+  hasSandbox: boolean = true,
 ): string {
   return hasSandbox
     ? `/tmp/agentbox/${provider}`
     : path.join(os.tmpdir(), `agentbox-${provider}`);
 }
 
-function buildLayout(rootDir: string): SetupLayout {
+/**
+ * Resolve the on-disk layout (config dirs per provider) for the given
+ * agentbox root. Public so external consumers (e.g. agentbox-driven
+ * orchestrators) can locate where each CLI writes its files without
+ * having to hardcode the layout shape.
+ *
+ * Pair with {@link agentboxRoot} to get the root for `(provider,
+ * hasSandbox)` first, then call this to expand it into the per-provider
+ * dirs (`claudeDir`, `codexDir`, `opencodeDir`, …).
+ */
+export function getAgentLayout(rootDir: string): SetupLayout {
   const xdgConfigHome = path.join(rootDir, ".config");
   return {
     rootDir,
@@ -304,9 +314,9 @@ class SandboxSetupTarget implements SetupTarget {
  * Build an upload+run-capable target for a setup phase.
  *
  * Setup-only API. Execute should NOT call this; it needs paths/env
- * (use {@link getSetupLayout} + {@link buildLayoutEnv}) or direct
- * sandbox access, not a heavyweight target wrapper that mkdirs the
- * host layout as a side effect.
+ * (use {@link getAgentLayout} + `buildLayoutEnv`) or direct sandbox
+ * access, not a heavyweight target wrapper that mkdirs the host layout
+ * as a side effect.
  *
  * Idempotent for both transports: sandbox mode just constructs a thin
  * wrapper, and host mode `mkdir -p`s the layout dirs which is safe to
@@ -325,7 +335,7 @@ export async function createSetupTarget<P extends AgentProviderName>(
     // skill staging).
     void setupId;
 
-    const layout = buildLayout(
+    const layout = getAgentLayout(
       agentboxRoot(provider, Boolean(options.sandbox)),
     );
 

@@ -105,6 +105,18 @@ export class Sandbox<P extends SandboxProviderName = SandboxProviderName> {
     return this;
   }
 
+  /**
+   * Attach to an existing sandbox by id, skipping the
+   * `findMatchingSandbox` lookup. Useful when the caller just created the
+   * sandbox (e.g. via a provider-native fork API) and knows its id.
+   * Repeated calls are cheap. Currently only the Daytona adapter
+   * implements this; other providers throw.
+   */
+  async attachById(id: string): Promise<this> {
+    await this.adapter.attachById(id);
+    return this;
+  }
+
   async openPort(port: number): Promise<this> {
     await time(debugSandbox, `openPort [${this.provider}] :${port}`, () =>
       this.adapter.openPort(port),
