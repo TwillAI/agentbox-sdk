@@ -188,6 +188,21 @@ class OpenCodeLogAssembler {
   private readonly userMessageIds = new Set<string>();
   private readonly textByPartId = new Map<string, string>();
   private readonly byPartId = new Map<string, JsonRecord>();
+  // Sub-agent (`task` tool) linkage. opencode multiplexes the parent task
+  // tool's `state.metadata.sessionId` update and the child session's first
+  // stream events onto the same SSE bus with no ordering guarantee, so
+  // child events frequently arrive before the parent has published its
+  // child sessionID. We bind FIFO instead: every task tool we see goes
+  // onto a queue; the first non-main sessionID that lacks an explicit
+  // binding gets paired with the queue head. Once a binding is established
+  // we stamp every emitted snapshot for that child session with
+  // `parentTaskCallId` on the part so consumers don't have to re-derive
+  // the linkage from snapshots.
+  private mainSessionID: string | null = null;
+  private pendingTaskCallIds: string[] = [];
+  private readonly childSessionToTaskCallId = new Map<string, string>();
+  private readonly childMessageIdToTaskCallId = new Map<string, string>();
+  private readonly messageIdToSessionId = new Map<string, string>();
 
   process(event: unknown): JsonRecord[] {
     if (!isRecord(event)) {
@@ -197,6 +212,86 @@ class OpenCodeLogAssembler {
     const type = typeof event.type === "string" ? event.type : "";
     const properties = isRecord(event.properties) ? event.properties : {};
     const info = isRecord(properties.info) ? properties.info : null;
+    const eventPart = isRecord(properties.part)
+      ? properties.part
+      : isRecord(event.part)
+        ? event.part
+        : null;
+
+    // 1. Capture the main sessionID from the first event that carries one.
+    if (this.mainSessionID === null) {
+      const candidate =
+        (typeof info?.sessionID === "string" ? info.sessionID : null) ??
+        (eventPart && typeof eventPart.sessionID === "string"
+          ? eventPart.sessionID
+          : null) ??
+        (typeof properties.sessionID === "string"
+          ? properties.sessionID
+          : null);
+      if (candidate) this.mainSessionID = candidate;
+    }
+
+    // 2. Index messageID -> sessionID for any event that exposes both.
+    if (
+      info &&
+      typeof info.id === "string" &&
+      typeof info.sessionID === "string"
+    ) {
+      this.messageIdToSessionId.set(info.id, info.sessionID);
+    }
+    if (
+      eventPart &&
+      typeof eventPart.id === "string" &&
+      typeof eventPart.messageID === "string" &&
+      typeof eventPart.sessionID === "string"
+    ) {
+      this.messageIdToSessionId.set(eventPart.messageID, eventPart.sessionID);
+    }
+
+    // 3. Handle task tool emissions — either bind explicitly via
+    //    `state.metadata.sessionId` or enqueue for FIFO binding.
+    if (eventPart && this.isTaskToolPart(eventPart)) {
+      const callId =
+        typeof eventPart.callID === "string"
+          ? eventPart.callID
+          : typeof eventPart.id === "string"
+            ? eventPart.id
+            : null;
+      if (callId) {
+        const metaSid = this.extractTaskMetadataSessionId(eventPart);
+        if (metaSid && !this.childSessionToTaskCallId.has(metaSid)) {
+          this.childSessionToTaskCallId.set(metaSid, callId);
+          // Drop the callId from the pending queue if it was enqueued first.
+          this.pendingTaskCallIds = this.pendingTaskCallIds.filter(
+            (id) => id !== callId,
+          );
+        } else if (!metaSid) {
+          // Enqueue if not already bound and not already queued. Without
+          // the dedup we'd push the same callId on every subsequent
+          // update (most task parts emit multiple times as the run
+          // progresses).
+          const alreadyBound = this.taskCallIdAlreadyBound(callId);
+          if (!alreadyBound && !this.pendingTaskCallIds.includes(callId)) {
+            this.pendingTaskCallIds.push(callId);
+          }
+        }
+      }
+    }
+
+    // 4. Bind orphan child sessionID FIFO.
+    const effectiveSid = this.extractSessionID(properties, eventPart, info);
+    if (
+      effectiveSid &&
+      effectiveSid !== this.mainSessionID &&
+      !this.childSessionToTaskCallId.has(effectiveSid) &&
+      this.pendingTaskCallIds.length > 0
+    ) {
+      const taskCallId = this.pendingTaskCallIds.shift() as string;
+      this.childSessionToTaskCallId.set(effectiveSid, taskCallId);
+    }
+
+    // 5. User message tracking (existing behavior). User messages don't get
+    //    `parentTaskCallId` — they're the root of the conversation.
     if (
       type === "message.updated" &&
       typeof info?.id === "string" &&
@@ -205,6 +300,13 @@ class OpenCodeLogAssembler {
       this.userMessageIds.add(info.id);
       return [clone(event)];
     }
+
+    // 6. Derive `parentTaskCallId` for the snapshot we're about to emit.
+    const parentTaskCallId = this.resolveParentTaskCallId(
+      effectiveSid,
+      eventPart,
+      info,
+    );
 
     if (type === "message.part.delta") {
       const partId =
@@ -221,31 +323,39 @@ class OpenCodeLogAssembler {
       ) {
         return [];
       }
+      // Carry the messageID -> sessionID mapping through so we can resolve
+      // parents for later events that only know the messageID.
+      if (messageId && effectiveSid) {
+        this.messageIdToSessionId.set(messageId, effectiveSid);
+      }
 
       const text = (this.textByPartId.get(partId) ?? "") + delta;
       this.textByPartId.set(partId, text);
-      return [
-        this.upsertPart(partId, {
-          id: partId,
-          messageID: messageId ?? undefined,
-          type: "text",
-          text,
-        }),
-      ];
+      const part: JsonRecord = {
+        id: partId,
+        messageID: messageId ?? undefined,
+        type: "text",
+        text,
+      };
+      if (parentTaskCallId) {
+        part.parentTaskCallId = parentTaskCallId;
+        if (messageId) {
+          this.childMessageIdToTaskCallId.set(messageId, parentTaskCallId);
+        }
+      }
+      return [this.upsertPart(partId, part)];
     }
 
-    const part = isRecord(properties.part)
-      ? properties.part
-      : isRecord(event.part)
-        ? event.part
-        : null;
-    if (part && typeof part.id === "string") {
-      if (part.messageID && this.userMessageIds.has(String(part.messageID))) {
+    if (eventPart && typeof eventPart.id === "string") {
+      if (
+        eventPart.messageID &&
+        this.userMessageIds.has(String(eventPart.messageID))
+      ) {
         return [];
       }
-      const previous = this.byPartId.get(part.id);
+      const previous = this.byPartId.get(eventPart.id);
       if (
-        part.type === "text" &&
+        eventPart.type === "text" &&
         previous &&
         isRecord((previous.properties as JsonRecord | undefined)?.part)
       ) {
@@ -253,12 +363,24 @@ class OpenCodeLogAssembler {
           .part as JsonRecord;
         const previousText =
           typeof previousPart.text === "string" ? previousPart.text : "";
-        const nextText = typeof part.text === "string" ? part.text : "";
+        const nextText =
+          typeof eventPart.text === "string" ? eventPart.text : "";
         if (nextText.length < previousText.length) {
           return [clone(previous)];
         }
       }
-      this.byPartId.set(part.id, clone(event));
+      const enriched = clone(event);
+      if (parentTaskCallId) {
+        this.stampParentTaskCallId(enriched, parentTaskCallId);
+        if (typeof eventPart.messageID === "string") {
+          this.childMessageIdToTaskCallId.set(
+            eventPart.messageID,
+            parentTaskCallId,
+          );
+        }
+      }
+      this.byPartId.set(eventPart.id, enriched);
+      return [clone(enriched)];
     }
 
     return [clone(event)];
@@ -268,6 +390,11 @@ class OpenCodeLogAssembler {
     this.userMessageIds.clear();
     this.textByPartId.clear();
     this.byPartId.clear();
+    this.mainSessionID = null;
+    this.pendingTaskCallIds = [];
+    this.childSessionToTaskCallId.clear();
+    this.childMessageIdToTaskCallId.clear();
+    this.messageIdToSessionId.clear();
     for (const snapshot of snapshots) {
       if (!isRecord(snapshot)) continue;
       const type = typeof snapshot.type === "string" ? snapshot.type : "";
@@ -275,6 +402,22 @@ class OpenCodeLogAssembler {
         ? snapshot.properties
         : {};
       const info = isRecord(properties.info) ? properties.info : null;
+      // Restore mainSessionID from the first session-bearing snapshot.
+      if (this.mainSessionID === null) {
+        const candidate =
+          (typeof info?.sessionID === "string" ? info.sessionID : null) ??
+          (typeof properties.sessionID === "string"
+            ? properties.sessionID
+            : null);
+        if (candidate) this.mainSessionID = candidate;
+      }
+      if (
+        info &&
+        typeof info.id === "string" &&
+        typeof info.sessionID === "string"
+      ) {
+        this.messageIdToSessionId.set(info.id, info.sessionID);
+      }
       if (
         type === "message.updated" &&
         typeof info?.id === "string" &&
@@ -293,7 +436,129 @@ class OpenCodeLogAssembler {
         if (typeof part.text === "string") {
           this.textByPartId.set(part.id, part.text);
         }
+        if (
+          typeof part.messageID === "string" &&
+          typeof part.sessionID === "string"
+        ) {
+          this.messageIdToSessionId.set(part.messageID, part.sessionID);
+        }
+        // Restore linkage from already-stamped snapshots (forward
+        // compatibility when reseeding from persisted history).
+        if (typeof part.parentTaskCallId === "string") {
+          if (
+            typeof part.sessionID === "string" &&
+            !this.childSessionToTaskCallId.has(part.sessionID)
+          ) {
+            this.childSessionToTaskCallId.set(
+              part.sessionID,
+              part.parentTaskCallId,
+            );
+          }
+          if (typeof part.messageID === "string") {
+            this.childMessageIdToTaskCallId.set(
+              part.messageID,
+              part.parentTaskCallId,
+            );
+          }
+        }
+        // Restore explicit task-tool metadata bindings.
+        if (this.isTaskToolPart(part)) {
+          const callId =
+            typeof part.callID === "string"
+              ? part.callID
+              : typeof part.id === "string"
+                ? part.id
+                : null;
+          const metaSid = this.extractTaskMetadataSessionId(part);
+          if (
+            callId &&
+            metaSid &&
+            !this.childSessionToTaskCallId.has(metaSid)
+          ) {
+            this.childSessionToTaskCallId.set(metaSid, callId);
+          }
+        }
       }
+    }
+  }
+
+  private isTaskToolPart(part: JsonRecord): boolean {
+    if (part.type !== "tool") return false;
+    const tool = typeof part.tool === "string" ? part.tool.toLowerCase() : "";
+    return tool === "task";
+  }
+
+  private taskCallIdAlreadyBound(callId: string): boolean {
+    for (const v of this.childSessionToTaskCallId.values()) {
+      if (v === callId) return true;
+    }
+    return false;
+  }
+
+  private extractTaskMetadataSessionId(part: JsonRecord): string | null {
+    const state = isRecord(part.state) ? part.state : null;
+    const metadata =
+      state && isRecord(state.metadata) ? (state.metadata as JsonRecord) : null;
+    if (!metadata) return null;
+    if (typeof metadata.sessionId === "string") return metadata.sessionId;
+    if (typeof metadata.sessionID === "string") return metadata.sessionID;
+    return null;
+  }
+
+  private extractSessionID(
+    properties: JsonRecord,
+    part: JsonRecord | null,
+    info: JsonRecord | null,
+  ): string | null {
+    if (typeof properties.sessionID === "string") return properties.sessionID;
+    if (part && typeof part.sessionID === "string") return part.sessionID;
+    if (info && typeof info.sessionID === "string") return info.sessionID;
+    return null;
+  }
+
+  private resolveParentTaskCallId(
+    sessionID: string | null,
+    part: JsonRecord | null,
+    info: JsonRecord | null,
+  ): string | null {
+    if (sessionID && this.childSessionToTaskCallId.has(sessionID)) {
+      return this.childSessionToTaskCallId.get(sessionID) ?? null;
+    }
+    const candidateMessageIds: string[] = [];
+    if (part && typeof part.messageID === "string") {
+      candidateMessageIds.push(part.messageID);
+    }
+    if (info && typeof info.id === "string") {
+      candidateMessageIds.push(info.id);
+    }
+    for (const messageId of candidateMessageIds) {
+      const cached = this.childMessageIdToTaskCallId.get(messageId);
+      if (cached) return cached;
+      const mappedSid = this.messageIdToSessionId.get(messageId);
+      if (mappedSid && this.childSessionToTaskCallId.has(mappedSid)) {
+        const tcid = this.childSessionToTaskCallId.get(mappedSid) as string;
+        this.childMessageIdToTaskCallId.set(messageId, tcid);
+        return tcid;
+      }
+    }
+    return null;
+  }
+
+  private stampParentTaskCallId(
+    snapshot: JsonRecord,
+    parentTaskCallId: string,
+  ): void {
+    const properties = isRecord(snapshot.properties)
+      ? (snapshot.properties as JsonRecord)
+      : null;
+    const part =
+      properties && isRecord(properties.part)
+        ? (properties.part as JsonRecord)
+        : isRecord(snapshot.part)
+          ? (snapshot.part as JsonRecord)
+          : null;
+    if (part) {
+      part.parentTaskCallId = parentTaskCallId;
     }
   }
 

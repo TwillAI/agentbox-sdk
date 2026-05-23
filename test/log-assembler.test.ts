@@ -540,3 +540,258 @@ describe("ProviderLogAssembler — claude-code", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// OpenCode sub-agent linkage helpers
+// ---------------------------------------------------------------------------
+
+const MAIN_SID = "session_main";
+const SUB_SID_A = "session_subA";
+const SUB_SID_B = "session_subB";
+
+function ocUserMessage(sessionID: string, id: string) {
+  return {
+    type: "message.updated",
+    properties: {
+      info: { id, role: "user", sessionID },
+    },
+  };
+}
+
+function ocAssistantMessage(sessionID: string, id: string) {
+  return {
+    type: "message.updated",
+    properties: {
+      info: { id, role: "assistant", sessionID },
+    },
+  };
+}
+
+function ocTaskPart(
+  sessionID: string,
+  messageID: string,
+  callID: string,
+  partId: string,
+  metadataSessionId?: string,
+) {
+  return {
+    type: "message.part.updated",
+    properties: {
+      part: {
+        id: partId,
+        callID,
+        messageID,
+        sessionID,
+        type: "tool",
+        tool: "task",
+        state: metadataSessionId
+          ? { metadata: { sessionId: metadataSessionId } }
+          : {},
+      },
+    },
+  };
+}
+
+function ocTextPartUpdate(
+  sessionID: string,
+  messageID: string,
+  partId: string,
+  text: string,
+) {
+  return {
+    type: "message.part.updated",
+    properties: {
+      part: {
+        id: partId,
+        messageID,
+        sessionID,
+        type: "text",
+        text,
+      },
+    },
+  };
+}
+
+function ocTextDelta(
+  sessionID: string,
+  messageID: string,
+  partId: string,
+  delta: string,
+) {
+  return {
+    type: "message.part.delta",
+    properties: {
+      partID: partId,
+      messageID,
+      sessionID,
+      field: "text",
+      delta,
+    },
+  };
+}
+
+function partOf(snapshot: unknown): Record<string, unknown> | undefined {
+  if (!snapshot || typeof snapshot !== "object") return undefined;
+  const props = (snapshot as Record<string, unknown>).properties;
+  if (props && typeof props === "object") {
+    const part = (props as Record<string, unknown>).part;
+    if (part && typeof part === "object") {
+      return part as Record<string, unknown>;
+    }
+  }
+  const ep = (snapshot as Record<string, unknown>).part;
+  if (ep && typeof ep === "object") return ep as Record<string, unknown>;
+  return undefined;
+}
+
+describe("ProviderLogAssembler — opencode sub-agent linkage", () => {
+  it("stamps parentTaskCallId via explicit task metadata sessionId", () => {
+    const a = new ProviderLogAssembler();
+    // Main session opens with a user message.
+    a.process("opencode", ocUserMessage(MAIN_SID, "u1"));
+    // Parent emits a task tool whose metadata already carries the child sid.
+    a.process(
+      "opencode",
+      ocTaskPart(MAIN_SID, "m_parent", "call_task_A", "part_task_A", SUB_SID_A),
+    );
+    // Child session announces its assistant message envelope first — the
+    // assembler tracks it for messageID -> sessionID indexing but doesn't
+    // stamp the envelope itself (envelopes carry no part to stamp; the
+    // UI nests via parts only).
+    a.process("opencode", ocAssistantMessage(SUB_SID_A, "m_child_A"));
+    const [childText] = a.process(
+      "opencode",
+      ocTextPartUpdate(SUB_SID_A, "m_child_A", "part_child_text", "Hello"),
+    );
+
+    expect(partOf(childText)).toMatchObject({
+      parentTaskCallId: "call_task_A",
+    });
+  });
+
+  it("FIFO-binds an orphan child sessionID when metadata arrives late", () => {
+    const a = new ProviderLogAssembler();
+    a.process("opencode", ocUserMessage(MAIN_SID, "u1"));
+    // Task tool emits WITHOUT metadata.sessionId — opencode hasn't
+    // published the child session yet.
+    a.process(
+      "opencode",
+      ocTaskPart(MAIN_SID, "m_parent", "call_task_A", "part_task_A"),
+    );
+    // Child session's first event arrives on the bus before the parent
+    // task's metadata update.
+    const [childText] = a.process(
+      "opencode",
+      ocTextPartUpdate(SUB_SID_A, "m_child_A", "part_child_text", "Hello"),
+    );
+
+    expect(partOf(childText)).toMatchObject({
+      parentTaskCallId: "call_task_A",
+    });
+  });
+
+  it("FIFO-binds two parallel sub-agents to their respective task tools", () => {
+    const a = new ProviderLogAssembler();
+    a.process("opencode", ocUserMessage(MAIN_SID, "u1"));
+    // Two task tools emitted back-to-back in the same parent turn, neither
+    // carrying metadata.sessionId yet.
+    a.process(
+      "opencode",
+      ocTaskPart(MAIN_SID, "m_parent", "call_task_A", "part_task_A"),
+    );
+    a.process(
+      "opencode",
+      ocTaskPart(MAIN_SID, "m_parent", "call_task_B", "part_task_B"),
+    );
+    // Children stream in interleaved.
+    const [aText] = a.process(
+      "opencode",
+      ocTextPartUpdate(SUB_SID_A, "m_child_A", "part_a_text", "from A"),
+    );
+    const [bText] = a.process(
+      "opencode",
+      ocTextPartUpdate(SUB_SID_B, "m_child_B", "part_b_text", "from B"),
+    );
+    const [aText2] = a.process(
+      "opencode",
+      ocTextPartUpdate(SUB_SID_A, "m_child_A", "part_a_text2", "from A again"),
+    );
+
+    expect(partOf(aText)).toMatchObject({ parentTaskCallId: "call_task_A" });
+    expect(partOf(bText)).toMatchObject({ parentTaskCallId: "call_task_B" });
+    expect(partOf(aText2)).toMatchObject({ parentTaskCallId: "call_task_A" });
+  });
+
+  it("does not stamp parentTaskCallId on the main session's own events", () => {
+    const a = new ProviderLogAssembler();
+    a.process("opencode", ocUserMessage(MAIN_SID, "u1"));
+    a.process(
+      "opencode",
+      ocTaskPart(MAIN_SID, "m_parent", "call_task_A", "part_task_A", SUB_SID_A),
+    );
+    // Main agent emits a text part on the MAIN session — must not be
+    // mis-bound to the task tool.
+    const [mainText] = a.process(
+      "opencode",
+      ocTextPartUpdate(MAIN_SID, "m_parent", "part_main_text", "Working..."),
+    );
+
+    const part = partOf(mainText);
+    expect(part).toBeTruthy();
+    expect(part?.parentTaskCallId).toBeUndefined();
+  });
+
+  it("propagates parentTaskCallId through message.part.delta text streaming", () => {
+    const a = new ProviderLogAssembler();
+    a.process("opencode", ocUserMessage(MAIN_SID, "u1"));
+    a.process(
+      "opencode",
+      ocTaskPart(MAIN_SID, "m_parent", "call_task_A", "part_task_A"),
+    );
+    // First child event is a delta (no part snapshot yet). The assembler
+    // must still FIFO-bind from the delta's sessionID.
+    const [first] = a.process(
+      "opencode",
+      ocTextDelta(SUB_SID_A, "m_child_A", "part_child_text", "Hel"),
+    );
+    const [second] = a.process(
+      "opencode",
+      ocTextDelta(SUB_SID_A, "m_child_A", "part_child_text", "lo"),
+    );
+
+    expect(partOf(first)).toMatchObject({
+      parentTaskCallId: "call_task_A",
+      text: "Hel",
+    });
+    expect(partOf(second)).toMatchObject({
+      parentTaskCallId: "call_task_A",
+      text: "Hello",
+    });
+  });
+
+  it("seedFromSnapshots restores parentTaskCallId so later child deltas keep nesting", () => {
+    const a = new ProviderLogAssembler();
+    a.process("opencode", ocUserMessage(MAIN_SID, "u1"));
+    a.process(
+      "opencode",
+      ocTaskPart(MAIN_SID, "m_parent", "call_task_A", "part_task_A", SUB_SID_A),
+    );
+    a.process(
+      "opencode",
+      ocTextPartUpdate(SUB_SID_A, "m_child_A", "part_child_text", "Hello"),
+    );
+    const seed = a.getSnapshots("opencode");
+
+    const b = new ProviderLogAssembler();
+    b.seedFromSnapshots("opencode", seed);
+    // A late delta on the child session should still nest after reseed.
+    const [more] = b.process(
+      "opencode",
+      ocTextDelta(SUB_SID_A, "m_child_A", "part_child_text2", " world"),
+    );
+
+    expect(partOf(more)).toMatchObject({
+      parentTaskCallId: "call_task_A",
+    });
+  });
+});
