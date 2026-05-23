@@ -113,6 +113,7 @@ export function buildClaudeQueryOptions(params: {
     settings: params.settingsPath,
     extraArgs,
     includePartialMessages: true,
+    forwardSubagentText: true,
     includeHookEvents,
     thinking: { type: "adaptive", display: "summarized" },
     ...(provider?.additionalDirectories?.length

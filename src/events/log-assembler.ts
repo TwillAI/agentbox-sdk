@@ -583,6 +583,10 @@ class ClaudeCodeLogAssembler {
   private currentMessageId: string | null = null;
   private readonly textByMessageId = new Map<string, string>();
   private readonly thinkingByMessageId = new Map<string, string>();
+  private readonly parentToolUseIdByMessageId = new Map<
+    string,
+    string | null
+  >();
   private readonly byMessageId = new Map<string, JsonRecord>();
   // Per-message tool_use / image / other non-text-non-thinking content blocks.
   // Tracked persistently so any `upsertMessage` call (including those from a
@@ -611,6 +615,7 @@ class ClaudeCodeLogAssembler {
           message && typeof message.id === "string" ? message.id : null;
         if (!id) return [];
         this.currentMessageId = id;
+        this.setParentToolUseId(id, event);
         if (!this.textByMessageId.has(id)) this.textByMessageId.set(id, "");
         if (!this.thinkingByMessageId.has(id))
           this.thinkingByMessageId.set(id, "");
@@ -657,6 +662,7 @@ class ClaudeCodeLogAssembler {
         return [clone(event)];
       }
 
+      this.setParentToolUseId(id, event);
       const final = extractClaudeAssistantContent(message);
       this.textByMessageId.set(id, final.text);
       // Don't clobber streamed thinking with an empty final.thinking. With
@@ -681,6 +687,7 @@ class ClaudeCodeLogAssembler {
     this.currentMessageId = null;
     this.textByMessageId.clear();
     this.thinkingByMessageId.clear();
+    this.parentToolUseIdByMessageId.clear();
     this.byMessageId.clear();
     this.extraBlocksByMessageId.clear();
 
@@ -691,6 +698,11 @@ class ClaudeCodeLogAssembler {
         typeof snapshot.messageId === "string" ? snapshot.messageId : null;
       if (!messageId) continue;
       this.byMessageId.set(messageId, clone(snapshot));
+      const parentToolUseId =
+        typeof snapshot.parent_tool_use_id === "string"
+          ? snapshot.parent_tool_use_id
+          : null;
+      this.parentToolUseIdByMessageId.set(messageId, parentToolUseId);
       const message = isRecord(snapshot.message) ? snapshot.message : null;
       const content =
         message && Array.isArray(message.content) ? message.content : [];
@@ -738,6 +750,16 @@ class ClaudeCodeLogAssembler {
     }
   }
 
+  private setParentToolUseId(messageId: string, event: JsonRecord): void {
+    if (event.parent_tool_use_id === null) {
+      this.parentToolUseIdByMessageId.set(messageId, null);
+      return;
+    }
+    if (typeof event.parent_tool_use_id === "string") {
+      this.parentToolUseIdByMessageId.set(messageId, event.parent_tool_use_id);
+    }
+  }
+
   private upsertMessage(messageId: string): JsonRecord {
     const text = this.textByMessageId.get(messageId) ?? "";
     const thinking = this.thinkingByMessageId.get(messageId) ?? "";
@@ -754,6 +776,8 @@ class ClaudeCodeLogAssembler {
     const next: JsonRecord = {
       type: "message.updated",
       messageId,
+      parent_tool_use_id:
+        this.parentToolUseIdByMessageId.get(messageId) ?? null,
       message: {
         id: messageId,
         role: "assistant",

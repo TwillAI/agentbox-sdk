@@ -23,6 +23,23 @@ function streamStart(messageId: string) {
   };
 }
 
+function childStreamStart(messageId: string, parentToolUseId: string) {
+  return {
+    ...streamStart(messageId),
+    parent_tool_use_id: parentToolUseId,
+    event: {
+      type: "message_start",
+      message: {
+        id: messageId,
+        role: "assistant",
+        type: "message",
+        model: "claude-sonnet",
+        content: [],
+      },
+    },
+  };
+}
+
 function streamTextDelta(text: string) {
   return {
     type: "stream_event",
@@ -82,6 +99,27 @@ function finalAssistant(messageId: string) {
         },
       ],
       stop_reason: "tool_use",
+    },
+  };
+}
+
+function childFinalAssistant(messageId: string, parentToolUseId: string) {
+  return {
+    ...finalAssistant(messageId),
+    parent_tool_use_id: parentToolUseId,
+    message: {
+      id: messageId,
+      role: "assistant",
+      type: "message",
+      model: "claude-sonnet",
+      content: [
+        {
+          type: "tool_use",
+          id: "child_tool_1",
+          name: "Bash",
+          input: { command: "pwd" },
+        },
+      ],
     },
   };
 }
@@ -258,6 +296,33 @@ describe("ProviderLogAssembler — claude-code", () => {
       messageId: MSG_ID,
       message: {
         content: [{ type: "text", text: "Hello world!" }],
+      },
+    });
+  });
+
+  it("preserves parent_tool_use_id on child sub-agent message snapshots", () => {
+    const assembler = new ProviderLogAssembler();
+    const parentToolUseId = "toolu_task_parent";
+    const childMessageId = "msg_child";
+
+    const out = [
+      ...assembler.process(
+        "claude-code",
+        childStreamStart(childMessageId, parentToolUseId),
+      ),
+      ...assembler.process("claude-code", streamTextDelta("child text")),
+      ...assembler.process(
+        "claude-code",
+        childFinalAssistant(childMessageId, parentToolUseId),
+      ),
+    ];
+
+    expect(out.at(-1)).toMatchObject({
+      type: "message.updated",
+      messageId: childMessageId,
+      parent_tool_use_id: parentToolUseId,
+      message: {
+        content: [{ type: "tool_use", id: "child_tool_1" }],
       },
     });
   });
