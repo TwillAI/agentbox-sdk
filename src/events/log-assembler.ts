@@ -178,6 +178,10 @@ class CodexLogAssembler {
     this.byItemId.set(itemId, next);
     return clone(next);
   }
+
+  getSnapshots(): JsonRecord[] {
+    return Array.from(this.byItemId.values()).map(clone);
+  }
 }
 
 class OpenCodeLogAssembler {
@@ -304,6 +308,10 @@ class OpenCodeLogAssembler {
     this.byPartId.set(partId, next);
     return clone(next);
   }
+
+  getSnapshots(): JsonRecord[] {
+    return Array.from(this.byPartId.values()).map(clone);
+  }
 }
 
 class ClaudeCodeLogAssembler {
@@ -311,6 +319,16 @@ class ClaudeCodeLogAssembler {
   private readonly textByMessageId = new Map<string, string>();
   private readonly thinkingByMessageId = new Map<string, string>();
   private readonly byMessageId = new Map<string, JsonRecord>();
+  // Per-message tool_use / image / other non-text-non-thinking content blocks.
+  // Tracked persistently so any `upsertMessage` call (including those from a
+  // post-assistant `message_start` re-anchor) still renders them — otherwise
+  // a later stream_event for the same messageId would emit a snapshot without
+  // tool_use blocks, and the UI's dedup-by-messageId would wipe the running
+  // command from the trace.
+  private readonly extraBlocksByMessageId = new Map<
+    string,
+    Map<string, JsonRecord>
+  >();
 
   process(event: unknown): JsonRecord[] {
     if (!isRecord(event)) return [];
@@ -385,7 +403,8 @@ class ClaudeCodeLogAssembler {
       if (final.thinking) {
         this.thinkingByMessageId.set(id, final.thinking);
       }
-      const snapshot = this.upsertMessage(id, final.extraBlocks);
+      this.mergeExtraBlocks(id, final.extraBlocks);
+      const snapshot = this.upsertMessage(id);
       this.currentMessageId = null;
       return [snapshot];
     }
@@ -398,6 +417,7 @@ class ClaudeCodeLogAssembler {
     this.textByMessageId.clear();
     this.thinkingByMessageId.clear();
     this.byMessageId.clear();
+    this.extraBlocksByMessageId.clear();
 
     for (const snapshot of snapshots) {
       if (!isRecord(snapshot)) continue;
@@ -411,6 +431,7 @@ class ClaudeCodeLogAssembler {
         message && Array.isArray(message.content) ? message.content : [];
       let text = "";
       let thinking = "";
+      const extraBlocks: JsonRecord[] = [];
       for (const block of content) {
         if (!isRecord(block)) continue;
         if (block.type === "text" && typeof block.text === "string") {
@@ -420,17 +441,39 @@ class ClaudeCodeLogAssembler {
           typeof block.thinking === "string"
         ) {
           thinking += block.thinking;
+        } else {
+          extraBlocks.push(block);
         }
       }
       this.textByMessageId.set(messageId, text);
       this.thinkingByMessageId.set(messageId, thinking);
+      if (extraBlocks.length > 0) {
+        this.mergeExtraBlocks(messageId, extraBlocks);
+      }
     }
   }
 
-  private upsertMessage(
-    messageId: string,
-    extraBlocks: JsonRecord[] = [],
-  ): JsonRecord {
+  private mergeExtraBlocks(messageId: string, blocks: JsonRecord[]): void {
+    if (blocks.length === 0) return;
+    let map = this.extraBlocksByMessageId.get(messageId);
+    if (!map) {
+      map = new Map<string, JsonRecord>();
+      this.extraBlocksByMessageId.set(messageId, map);
+    }
+    for (const block of blocks) {
+      // Prefer block.id (tool_use, server_tool_use, etc. all carry one) so
+      // repeated emissions of the same logical block update in-place. Fall
+      // back to a synthetic key based on insertion order so blocks without
+      // ids still de-duplicate across repeated assistant emissions.
+      const key =
+        typeof block.id === "string" && block.id
+          ? `id:${block.id}`
+          : `idx:${map.size}`;
+      map.set(key, clone(block));
+    }
+  }
+
+  private upsertMessage(messageId: string): JsonRecord {
     const text = this.textByMessageId.get(messageId) ?? "";
     const thinking = this.thinkingByMessageId.get(messageId) ?? "";
     const content: JsonRecord[] = [];
@@ -438,7 +481,10 @@ class ClaudeCodeLogAssembler {
     // order in the snapshot so consumers render reasoning before the answer.
     if (thinking) content.push({ type: "thinking", thinking });
     if (text) content.push({ type: "text", text });
-    for (const block of extraBlocks) content.push(clone(block));
+    const extras = this.extraBlocksByMessageId.get(messageId);
+    if (extras) {
+      for (const block of extras.values()) content.push(clone(block));
+    }
 
     const next: JsonRecord = {
       type: "message.updated",
@@ -451,6 +497,10 @@ class ClaudeCodeLogAssembler {
     };
     this.byMessageId.set(messageId, next);
     return clone(next);
+  }
+
+  getSnapshots(): JsonRecord[] {
+    return Array.from(this.byMessageId.values()).map(clone);
   }
 }
 
@@ -529,6 +579,32 @@ export class ProviderLogAssembler {
     }
     if (isRecord(event)) {
       return [clone(event)];
+    }
+    return [];
+  }
+
+  /**
+   * Return the current deduped snapshot set held by the active per-provider
+   * assembler. Equivalent to running `dedupeSnapshots` over the full sequence
+   * of snapshots emitted by `process()` since construction (or last seed), but
+   * read directly from in-memory state — no transport or persistence layer
+   * involved. Used end-of-run to persist the full trace without paying a
+   * Redis LRANGE + parse roundtrip.
+   *
+   * Snapshots are returned in first-seen order (Map insertion order). Entries
+   * are cloned, so the caller can serialize them freely.
+   */
+  getSnapshots(
+    provider: AgentProvider | string | null | undefined,
+  ): JsonRecord[] {
+    if (provider === AgentProvider.Codex || provider === "codex") {
+      return this.codex.getSnapshots();
+    }
+    if (provider === AgentProvider.OpenCode || provider === "opencode") {
+      return this.openCode.getSnapshots();
+    }
+    if (provider === AgentProvider.ClaudeCode || provider === "claude-code") {
+      return this.claudeCode.getSnapshots();
     }
     return [];
   }

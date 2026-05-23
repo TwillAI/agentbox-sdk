@@ -147,6 +147,23 @@ export interface ClaudeCodeProviderOptions {
   allowedTools?: string[];
   autoApproveTools?: boolean;
   verbose?: boolean;
+  /**
+   * Extra directories Claude Code is allowed to read/write outside `cwd`.
+   * Passed through to `--add-dir` (one flag per entry). Use absolute paths.
+   *
+   * Common case: cwd points at a parent directory and tasks need access
+   * to sibling repos cloned under it. Listing each repo here surfaces it
+   * to the agent without changing the working directory.
+   */
+  additionalDirectories?: string[];
+  /**
+   * When `true` (the default), the in-sandbox CLI emits `hook_started` and
+   * `hook_response` system messages so the host can observe every hook
+   * fire — useful to confirm a project-defined hook actually ran and to
+   * surface its stdout/stderr/exit_code on failures. Set `false` to
+   * silence them when hook noise drowns out the rest of the event stream.
+   */
+  includeHookEvents?: boolean;
 }
 
 export interface CodexAgentOptions extends AgentOptionsBase {

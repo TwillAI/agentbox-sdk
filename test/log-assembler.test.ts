@@ -327,4 +327,216 @@ describe("ProviderLogAssembler — claude-code", () => {
       message: { content: [{ type: "text", text: "second" }] },
     });
   });
+
+  it("preserves tool_use blocks when a same-messageId stream_event re-anchors after the assistant message", () => {
+    // Regression: with the previous implementation, any upsertMessage call
+    // (e.g. a second message_start for the same messageId, which fires on
+    // session resume / daemon reconnect / SDK retry paths) emitted a snapshot
+    // without extraBlocks, dropping the tool_use from the UI trace.
+    const assembler = new ProviderLogAssembler();
+    assembler.process("claude-code", streamStart(MSG_ID));
+    assembler.process("claude-code", streamTextDelta("Hello world"));
+    assembler.process("claude-code", finalAssistant(MSG_ID));
+
+    const [reAnchored] = assembler.process("claude-code", streamStart(MSG_ID));
+
+    expect(reAnchored).toMatchObject({
+      type: "message.updated",
+      messageId: MSG_ID,
+      message: {
+        content: [
+          { type: "text", text: "Hello world" },
+          { type: "tool_use", id: "tool_1", name: "Bash" },
+        ],
+      },
+    });
+  });
+
+  it("accumulates tool_use blocks across multiple assistant emissions with the same messageId", () => {
+    const assembler = new ProviderLogAssembler();
+    assembler.process("claude-code", streamStart(MSG_ID));
+    assembler.process("claude-code", {
+      type: "assistant",
+      uuid: "u1",
+      session_id: "sess",
+      parent_tool_use_id: null,
+      message: {
+        id: MSG_ID,
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool_a",
+            name: "Bash",
+            input: { command: "ls" },
+          },
+        ],
+      },
+    });
+    const [snap] = assembler.process("claude-code", {
+      type: "assistant",
+      uuid: "u2",
+      session_id: "sess",
+      parent_tool_use_id: null,
+      message: {
+        id: MSG_ID,
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool_b",
+            name: "Read",
+            input: { file_path: "/tmp/x" },
+          },
+        ],
+      },
+    });
+
+    expect(snap).toMatchObject({
+      type: "message.updated",
+      messageId: MSG_ID,
+      message: {
+        content: [
+          { type: "tool_use", id: "tool_a", name: "Bash" },
+          { type: "tool_use", id: "tool_b", name: "Read" },
+        ],
+      },
+    });
+  });
+
+  it("replaces a tool_use in place when a later assistant emission carries the same block id", () => {
+    const assembler = new ProviderLogAssembler();
+    assembler.process("claude-code", streamStart(MSG_ID));
+    assembler.process("claude-code", {
+      type: "assistant",
+      uuid: "u1",
+      session_id: "sess",
+      parent_tool_use_id: null,
+      message: {
+        id: MSG_ID,
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool_1",
+            name: "Bash",
+            input: { command: "ls" },
+          },
+        ],
+      },
+    });
+    const [snap] = assembler.process("claude-code", {
+      type: "assistant",
+      uuid: "u2",
+      session_id: "sess",
+      parent_tool_use_id: null,
+      message: {
+        id: MSG_ID,
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool_1",
+            name: "Bash",
+            input: { command: "ls -la" },
+          },
+        ],
+      },
+    });
+
+    const blocks = (snap?.message as { content?: unknown[] })?.content ?? [];
+    const toolBlocks = blocks.filter(
+      (b): b is Record<string, unknown> =>
+        typeof b === "object" &&
+        b !== null &&
+        (b as Record<string, unknown>).type === "tool_use",
+    );
+    expect(toolBlocks).toHaveLength(1);
+    expect(toolBlocks[0]).toMatchObject({
+      id: "tool_1",
+      input: { command: "ls -la" },
+    });
+  });
+
+  it("getSnapshots returns one entry per messageId in first-seen order with the latest content", () => {
+    // Parity check vs. dedupeSnapshots over the full emission stream — these
+    // two should agree on the in-class shape ("message.updated") for any
+    // sequence of events. Used end-of-run to persist the full deduped trace
+    // without going through Redis.
+    const assembler = new ProviderLogAssembler();
+    const emitted: Record<string, unknown>[] = [];
+
+    // First message: two text deltas, then a final assistant carrying tool_use.
+    emitted.push(...assembler.process("claude-code", streamStart("msg_1")));
+    emitted.push(
+      ...assembler.process("claude-code", streamTextDelta("Hello ")),
+    );
+    emitted.push(...assembler.process("claude-code", streamTextDelta("world")));
+    emitted.push(...assembler.process("claude-code", finalAssistant("msg_1")));
+
+    // Second message: one text delta, no final assistant.
+    emitted.push(...assembler.process("claude-code", streamStart("msg_2")));
+    emitted.push(...assembler.process("claude-code", streamTextDelta("next")));
+
+    const snapshots = assembler.getSnapshots("claude-code");
+    const deduped = ProviderLogAssembler.dedupeSnapshots(
+      "claude-code",
+      emitted,
+    );
+
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots[0]).toMatchObject({
+      type: "message.updated",
+      messageId: "msg_1",
+      message: {
+        content: [
+          { type: "text", text: "Hello world" },
+          { type: "tool_use", id: "tool_1", name: "Bash" },
+        ],
+      },
+    });
+    expect(snapshots[1]).toMatchObject({
+      type: "message.updated",
+      messageId: "msg_2",
+      message: { content: [{ type: "text", text: "next" }] },
+    });
+    // Equivalence with dedupeSnapshots over the emitted stream: same shape per
+    // in-class entry. (dedupeSnapshots additionally keeps passthrough entries
+    // for non-message events; getSnapshots intentionally drops those — they're
+    // transient and already excluded from persistence today.)
+    const dedupedInClass = deduped.filter(
+      (s) => (s as { type?: string }).type === "message.updated",
+    );
+    expect(snapshots).toEqual(dedupedInClass);
+  });
+
+  it("getSnapshots on a fresh provider returns an empty array", () => {
+    const assembler = new ProviderLogAssembler();
+    expect(assembler.getSnapshots("claude-code")).toEqual([]);
+    expect(assembler.getSnapshots("codex")).toEqual([]);
+    expect(assembler.getSnapshots("opencode")).toEqual([]);
+    expect(assembler.getSnapshots("unknown")).toEqual([]);
+  });
+
+  it("seedFromSnapshots preserves tool_use blocks so a later stream_event keeps them in the snapshot", () => {
+    const a = new ProviderLogAssembler();
+    a.process("claude-code", streamStart(MSG_ID));
+    a.process("claude-code", streamTextDelta("Hello world"));
+    const seed = [...a.process("claude-code", finalAssistant(MSG_ID))];
+
+    const b = new ProviderLogAssembler();
+    b.seedFromSnapshots("claude-code", seed);
+    const [reAnchored] = b.process("claude-code", streamStart(MSG_ID));
+
+    expect(reAnchored).toMatchObject({
+      type: "message.updated",
+      messageId: MSG_ID,
+      message: {
+        content: [
+          { type: "text", text: "Hello world" },
+          { type: "tool_use", id: "tool_1", name: "Bash" },
+        ],
+      },
+    });
+  });
 });

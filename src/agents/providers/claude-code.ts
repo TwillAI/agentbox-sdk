@@ -5,6 +5,8 @@ import type {
   Options as SdkQueryOptions,
   PermissionMode,
   SDKAssistantMessage,
+  SDKHookResponseMessage,
+  SDKHookStartedMessage,
   SDKMessage,
   SDKPartialAssistantMessage,
   SDKResultMessage,
@@ -102,6 +104,8 @@ export function buildClaudeQueryOptions(params: {
     extraArgs["append-system-prompt"] = run.systemPrompt;
   }
 
+  const includeHookEvents = provider?.includeHookEvents ?? false;
+
   return {
     cwd: params.cwd ?? params.request.options.cwd,
     env: params.env,
@@ -109,7 +113,11 @@ export function buildClaudeQueryOptions(params: {
     settings: params.settingsPath,
     extraArgs,
     includePartialMessages: true,
+    includeHookEvents,
     thinking: { type: "adaptive", display: "summarized" },
+    ...(provider?.additionalDirectories?.length
+      ? { additionalDirectories: provider.additionalDirectories }
+      : {}),
     ...(run.model ? { model: run.model } : {}),
     ...(run.reasoning ? { effort: run.reasoning } : {}),
     ...(provider?.permissionMode
@@ -939,15 +947,48 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         sink.emitRaw(toRawEvent(request.runId, message, message.type));
 
         if (message.type === "system") {
-          const sys = message as SDKSystemMessage;
-          // Session id is already set on the sink (pre-minted before
-          // POSTing /start). The init message arrives confirming what
-          // claude assigned — should match `presetSessionId`.
-          if (sys.subtype === "init" && sys.session_id) {
+          // The CLI surfaces several message variants under `type: "system"`:
+          // `init` (SDKSystemMessage), `hook_started`/`hook_response`
+          // (SDKHookStartedMessage / SDKHookResponseMessage), and others.
+          // Discriminate on `subtype` against the union so each branch
+          // narrows correctly.
+          const sub = (message as { subtype?: string }).subtype;
+          if (sub === "init") {
+            const sys = message as SDKSystemMessage;
+            // Session id is already set on the sink (pre-minted before
+            // POSTing /start). The init message arrives confirming what
+            // claude assigned — should match `presetSessionId`.
+            if (sys.session_id) {
+              debugClaude(
+                "★ session.init session_id=%s (%dms)",
+                sys.session_id.slice(0, 8),
+                Date.now() - executeStartedAt,
+              );
+            }
+          } else if (sub === "hook_started") {
+            const h = message as SDKHookStartedMessage;
             debugClaude(
-              "★ session.init session_id=%s (%dms)",
-              sys.session_id.slice(0, 8),
-              Date.now() - executeStartedAt,
+              "hook.started name=%s event=%s hook_id=%s",
+              h.hook_name,
+              h.hook_event,
+              h.hook_id,
+            );
+          } else if (sub === "hook_response") {
+            const h = message as SDKHookResponseMessage;
+            // `stderr` is where users typically `echo` from their hook
+            // commands (per Claude Code's hook protocol). Surface it
+            // verbatim so a misconfigured hook (e.g. `yarn` not on PATH)
+            // shows its real error message in agentbox DEBUG logs.
+            const stderr =
+              h.stderr && h.stderr.length > 0
+                ? h.stderr.replace(/\s+$/, "")
+                : undefined;
+            debugClaude(
+              "hook.response name=%s exit=%s outcome=%s%s",
+              h.hook_name,
+              h.exit_code,
+              h.outcome,
+              stderr ? ` stderr=${JSON.stringify(stderr).slice(0, 200)}` : "",
             );
           }
           continue;
