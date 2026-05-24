@@ -566,13 +566,98 @@ describe("ProviderLogAssembler — claude-code", () => {
       message: { content: [{ type: "text", text: "next" }] },
     });
     // Equivalence with dedupeSnapshots over the emitted stream: same shape per
-    // in-class entry. (dedupeSnapshots additionally keeps passthrough entries
-    // for non-message events; getSnapshots intentionally drops those — they're
-    // transient and already excluded from persistence today.)
+    // in-class entry. This stream has no passthrough events, so the deduped
+    // sequence is just the in-class entries.
     const dedupedInClass = deduped.filter(
       (s) => (s as { type?: string }).type === "message.updated",
     );
     expect(snapshots).toEqual(dedupedInClass);
+  });
+
+  it("getSnapshots retains user/result passthrough events so tool_result blocks survive end-of-run persistence", () => {
+    const assembler = new ProviderLogAssembler();
+    const toolUseId = "toolu_bash_1";
+
+    assembler.process("claude-code", {
+      type: "assistant",
+      message: {
+        id: "msg_1",
+        content: [
+          { type: "text", text: "Running ls" },
+          { type: "tool_use", id: toolUseId, name: "Bash", input: {} },
+        ],
+      },
+    });
+
+    assembler.process("claude-code", {
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: toolUseId,
+            content: "file1.txt\nfile2.txt",
+          },
+        ],
+      },
+    });
+
+    assembler.process("claude-code", {
+      type: "result",
+      subtype: "success",
+      total_cost_usd: 0.01,
+    });
+
+    const snapshots = assembler.getSnapshots("claude-code");
+
+    expect(snapshots).toHaveLength(3);
+    expect(snapshots[0]).toMatchObject({
+      type: "message.updated",
+      messageId: "msg_1",
+    });
+    expect(snapshots[1]).toMatchObject({
+      type: "user",
+      message: {
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: toolUseId,
+            content: "file1.txt\nfile2.txt",
+          },
+        ],
+      },
+    });
+    expect(snapshots[2]).toMatchObject({
+      type: "result",
+      subtype: "success",
+    });
+  });
+
+  it("seedFromSnapshots restores passthrough events so subsequent getSnapshots returns them", () => {
+    const a = new ProviderLogAssembler();
+    a.process("claude-code", {
+      type: "assistant",
+      message: {
+        id: "msg_1",
+        content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: {} }],
+      },
+    });
+    a.process("claude-code", {
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "toolu_1", content: "ok" },
+        ],
+      },
+    });
+
+    const seed = a.getSnapshots("claude-code");
+    const b = new ProviderLogAssembler();
+    b.seedFromSnapshots("claude-code", seed);
+
+    expect(b.getSnapshots("claude-code")).toEqual(seed);
   });
 
   it("getSnapshots on a fresh provider returns an empty array", () => {

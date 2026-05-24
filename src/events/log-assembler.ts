@@ -598,6 +598,13 @@ class ClaudeCodeLogAssembler {
     string,
     Map<string, JsonRecord>
   >();
+  // Non-message events emitted by `process()` (e.g. `type: "user"` tool_result
+  // blocks, `type: "result"`, `type: "system"`). These carry data downstream
+  // consumers need to render the full trace — most importantly the Bash /
+  // tool_use output captured by `tool_result` user messages. Tracked in
+  // insertion order so `getSnapshots()` returns the full trace, not just the
+  // deduped assistant messages.
+  private readonly passThroughSnapshots: JsonRecord[] = [];
 
   process(event: unknown): JsonRecord[] {
     if (!isRecord(event)) return [];
@@ -659,7 +666,9 @@ class ClaudeCodeLogAssembler {
       const message = isRecord(event.message) ? event.message : null;
       const id = message && typeof message.id === "string" ? message.id : null;
       if (!id || !message) {
-        return [clone(event)];
+        const passthrough = clone(event);
+        this.passThroughSnapshots.push(passthrough);
+        return [clone(passthrough)];
       }
 
       this.setParentToolUseId(id, event);
@@ -680,7 +689,9 @@ class ClaudeCodeLogAssembler {
       return [snapshot];
     }
 
-    return [clone(event)];
+    const passthrough = clone(event);
+    this.passThroughSnapshots.push(passthrough);
+    return [clone(passthrough)];
   }
 
   seed(snapshots: JsonRecord[]): void {
@@ -690,10 +701,14 @@ class ClaudeCodeLogAssembler {
     this.parentToolUseIdByMessageId.clear();
     this.byMessageId.clear();
     this.extraBlocksByMessageId.clear();
+    this.passThroughSnapshots.length = 0;
 
     for (const snapshot of snapshots) {
       if (!isRecord(snapshot)) continue;
-      if (snapshot.type !== "message.updated") continue;
+      if (snapshot.type !== "message.updated") {
+        this.passThroughSnapshots.push(clone(snapshot));
+        continue;
+      }
       const messageId =
         typeof snapshot.messageId === "string" ? snapshot.messageId : null;
       if (!messageId) continue;
@@ -789,7 +804,10 @@ class ClaudeCodeLogAssembler {
   }
 
   getSnapshots(): JsonRecord[] {
-    return Array.from(this.byMessageId.values()).map(clone);
+    const out: JsonRecord[] = [];
+    for (const snapshot of this.byMessageId.values()) out.push(clone(snapshot));
+    for (const snapshot of this.passThroughSnapshots) out.push(clone(snapshot));
+    return out;
   }
 }
 
