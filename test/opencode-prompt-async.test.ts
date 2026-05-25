@@ -378,6 +378,108 @@ describe("opencode prompt_async + SSE", () => {
     ]);
   });
 
+  it("routes reasoning deltas to reasoning.delta and excludes them from result text", async () => {
+    fake = await startFakeOpenCodeServer();
+    const adapter = new OpenCodeAgentAdapter();
+    const { sink, events, finished } = makeCapturingSink();
+
+    const request = makeRequest({
+      options: {
+        cwd: "/tmp",
+        approvalMode: "auto",
+        sandbox: makeFakeSandbox(fake.baseUrl),
+      },
+    });
+
+    const executePromise = adapter.execute(request, sink);
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Opencode publishes a `message.part.updated` for each part before
+    // streaming deltas — that's where the SDK learns the part type. Both
+    // TextPart and ReasoningPart stream content via `field: "text"`, so
+    // partID is the only discriminator.
+    fake.pushEvent({
+      event: "message.part.updated",
+      data: {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: "prt_reasoning",
+            messageID: "msg_a",
+            sessionID: "ses_test",
+            type: "reasoning",
+            text: "",
+          },
+        },
+      },
+    });
+    fake.pushEvent({
+      event: "message.part.delta",
+      data: {
+        type: "message.part.delta",
+        properties: {
+          sessionID: "ses_test",
+          messageID: "msg_a",
+          partID: "prt_reasoning",
+          field: "text",
+          delta: "Thinking about the request.",
+        },
+      },
+    });
+
+    fake.pushEvent({
+      event: "message.part.updated",
+      data: {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: "prt_text",
+            messageID: "msg_a",
+            sessionID: "ses_test",
+            type: "text",
+            text: "",
+          },
+        },
+      },
+    });
+    fake.pushEvent({
+      event: "message.part.delta",
+      data: {
+        type: "message.part.delta",
+        properties: {
+          sessionID: "ses_test",
+          messageID: "msg_a",
+          partID: "prt_text",
+          field: "text",
+          delta: "Hello!",
+        },
+      },
+    });
+
+    fake.pushEvent({
+      event: "session.idle",
+      data: {
+        type: "session.idle",
+        properties: { sessionID: "ses_test" },
+      },
+    });
+
+    const result = await finished;
+    await executePromise;
+
+    expect(result.kind).toBe("complete");
+    expect((result.payload as { text?: string }).text).toBe("Hello!");
+
+    const textDeltas = events
+      .filter((e) => e.type === "text.delta")
+      .map((e) => (e as { delta?: string }).delta);
+    const reasoningDeltas = events
+      .filter((e) => e.type === "reasoning.delta")
+      .map((e) => (e as { delta?: string }).delta);
+    expect(textDeltas).toEqual(["Hello!"]);
+    expect(reasoningDeltas).toEqual(["Thinking about the request."]);
+  });
+
   it("retries prompt_async once on transport failure", async () => {
     fake = await startFakeOpenCodeServer();
     fake.promptAsyncStatusOverride = 502;

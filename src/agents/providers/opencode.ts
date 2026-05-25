@@ -598,6 +598,14 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
     // and again on `session.idle` for any unflushed assistant messages.
     const assistantTextByMessageId = new Map<string, string>();
     const announcedAssistantCompletions = new Set<string>();
+    // partID -> part.type, populated from `message.part.updated` events.
+    // Used to discriminate text vs. reasoning deltas: opencode streams
+    // both via `message.part.delta { field: "text" }` (because both
+    // TextPart and ReasoningPart store content in a `text` field on the
+    // part schema), and only the part's `type` distinguishes them.
+    // Without this lookup, reasoning deltas would be accumulated into
+    // `assistantTextByMessageId` and surface as part of `result.text`.
+    const partTypeById = new Map<string, string>();
     // Cost/tokens for the run. Captured on each `message.updated`
     // SSE event for our session's assistant messages (see SSE handler
     // below) and surfaced via `sink.complete` at run end. The
@@ -999,6 +1007,32 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
               }
             }
 
+            if (payloadRecord?.type === "message.part.updated") {
+              // Capture partID -> part.type so the delta branch can
+              // discriminate text vs. reasoning. Opencode streams both
+              // via `message.part.delta { field: "text" }` (because
+              // TextPart and ReasoningPart both store content in a
+              // `text` field on the part schema), and the part type is
+              // the only discriminator. `message.part.updated` is
+              // emitted alongside the first `message.part.delta` for a
+              // given part (Session.updatePart writes the snapshot and
+              // then publishes deltas), so the type is known by the
+              // time deltas arrive.
+              const properties = payloadRecord.properties as
+                | Record<string, unknown>
+                | undefined;
+              const part = properties?.part as
+                | Record<string, unknown>
+                | undefined;
+              if (
+                part &&
+                typeof part.id === "string" &&
+                typeof part.type === "string"
+              ) {
+                partTypeById.set(part.id, part.type);
+              }
+            }
+
             if (payloadRecord?.type === "message.part.delta") {
               const properties = payloadRecord.properties as
                 | Record<string, unknown>
@@ -1016,6 +1050,10 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                 typeof properties?.messageID === "string"
                   ? properties.messageID
                   : undefined;
+              const eventPartId =
+                typeof properties?.partID === "string"
+                  ? properties.partID
+                  : undefined;
               const isForeignSession =
                 (eventSessionId !== undefined &&
                   eventSessionId !== sessionId) ||
@@ -1027,7 +1065,26 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
               }
               const delta =
                 typeof properties?.delta === "string" ? properties.delta : "";
-              if (delta && properties?.field === "text") {
+              const field =
+                typeof properties?.field === "string"
+                  ? properties.field
+                  : undefined;
+              // Opencode emits `field: "text"` deltas for both TextPart
+              // (the model's answer) and ReasoningPart (the model's
+              // chain-of-thought). The part type — looked up by
+              // `partID` — is what distinguishes them; treating all
+              // `field: "text"` deltas as answer text concatenates
+              // reasoning into `assistantTextByMessageId`, which then
+              // surfaces as part of `result.text` / `finalAnswer`.
+              const partType = eventPartId
+                ? partTypeById.get(eventPartId)
+                : undefined;
+              const isTextDelta = field === "text" && partType !== "reasoning";
+              const isReasoningDelta =
+                (field === "text" && partType === "reasoning") ||
+                field === "reasoning_content" ||
+                field === "reasoning_details";
+              if (delta && isTextDelta) {
                 streamedTextFromSse += delta;
                 if (eventMessageId) {
                   assistantTextByMessageId.set(
@@ -1047,11 +1104,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                     { delta },
                   ),
                 );
-              } else if (
-                delta &&
-                (properties?.field === "reasoning" ||
-                  properties?.field === "thinking")
-              ) {
+              } else if (delta && isReasoningDelta) {
                 sink.emitEvent(
                   createNormalizedEvent(
                     "reasoning.delta",
