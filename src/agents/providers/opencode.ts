@@ -354,10 +354,22 @@ async function ensureSandboxOpenCodeServer(
       "opencode-serve.log",
     );
     const serveEnv = { ...(options.env ?? {}), ...commonEnv };
+    // Detach the daemon fully from the spawning shell:
+    //   - `setsid` puts opencode in its own session + process group so the
+    //     sandbox doesn't kill it when our wrapper shell exits.
+    //   - `< /dev/null` releases stdin.
+    //   - `> log 2>&1` redirects stdout/stderr to the log file so the
+    //     daemon doesn't keep the parent's pipes open.
+    //   - `&` backgrounds, the trailing `disown` (where supported) removes
+    //     the job from the shell's job table.
+    // Without this, daytona's `runAsync` session keeps polling for the
+    // command's exit and never sees one — the backgrounded opencode
+    // daemon, despite being nohup'd, was enough to keep the session
+    // marked as "running" for the entire ready timeout.
     const launchCommand = [
       `mkdir -p ${shellQuote(target.layout.rootDir)}`,
       `(${[
-        `nohup ${[
+        `setsid nohup ${[
           binary,
           "serve",
           "--hostname",
@@ -367,21 +379,28 @@ async function ensureSandboxOpenCodeServer(
           ...(options.provider?.args ?? []),
         ]
           .map(shellQuote)
-          .join(" ")} > ${shellQuote(logFilePath)} 2>&1 &`,
+          .join(" ")} </dev/null > ${shellQuote(logFilePath)} 2>&1 &`,
         `echo $! > ${shellQuote(pidFilePath)}`,
+        `disown 2>/dev/null || true`,
       ].join(" ")})`,
     ].join(" && ");
 
+    // Use `sandbox.run` instead of `runAsync().wait()`. The launch shell is
+    // a fire-and-forget detacher that exits in milliseconds; we don't need
+    // a streaming handle, and `runAsync` on daytona ties exit detection to
+    // the session's process tree, which the daemon (intentionally) keeps
+    // alive forever. We only care that the shell *attempted* to spawn —
+    // actual readiness is verified by the curl probe loop below, which is
+    // the only authoritative signal anyway.
     const launchResult = await time(
       debugOpencode,
       "spawn opencode serve",
-      async () => {
-        const launchHandle = await sandbox.runAsync(launchCommand, {
+      () =>
+        sandbox.run(launchCommand, {
           cwd: options.cwd,
           env: serveEnv,
-        });
-        return launchHandle.wait();
-      },
+          timeoutMs: 10_000,
+        }),
     );
     if (launchResult.exitCode !== 0) {
       await target.cleanup().catch(() => undefined);
