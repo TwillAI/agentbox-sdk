@@ -252,9 +252,6 @@ export function buildOpenCodeConfig(
       openrouter: {
         options: {
           baseURL: openRouterBaseUrl || "https://openrouter.ai/api/v1",
-          // The OpenRouter AI SDK spreads `providerOptions.openrouter`
-          // keys into the chat-completion request body verbatim, so
-          // `plugins` here ends up on every outbound request.
           ...(openRouterPlugins ? { plugins: openRouterPlugins } : {}),
         },
       },
