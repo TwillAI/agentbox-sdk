@@ -170,8 +170,41 @@ export interface CodexAgentOptions extends AgentOptionsBase {
   provider?: CodexProviderOptions;
 }
 
+/**
+ * Shape of a single OpenRouter plugin entry. The OpenRouter AI SDK spreads
+ * `providerOptions.openrouter` keys into the chat-completion request body
+ * verbatim, so anything in this array is forwarded as-is to OpenRouter.
+ *
+ * The canonical example is the context-compression plugin:
+ *
+ *     { id: "context-compression" }
+ *
+ * which enables OpenRouter's middle-out message compression — useful when
+ * runs routinely overflow a model's context window. Disable an
+ * account-wide default with `{ id: "context-compression", enabled: false }`.
+ *
+ * See https://openrouter.ai/docs/guides/features/message-transforms.
+ */
+export interface OpenRouterPlugin {
+  id: string;
+  enabled?: boolean;
+  [key: string]: unknown;
+}
+
 export interface OpenCodeAgentOptions extends AgentOptionsBase {
   provider?: OpenCodeProviderOptions;
+  /**
+   * OpenRouter plugins to attach to every chat-completion request made by
+   * the opencode server. Forwarded into the `openrouter` provider options
+   * block of `agentbox.json`; the OpenRouter AI SDK spreads them into the
+   * request body. Most common use: enable context-compression on
+   * 200K-context models to avoid overflow when input + opencode's hardcoded
+   * 32K output reserve exceeds the model's window.
+   *
+   * Setup-time field: changes invalidate the setup-manifest cache and
+   * re-upload `agentbox.json` on the next `setup()` call.
+   */
+  openRouterPlugins?: OpenRouterPlugin[];
   /**
    * Setup-time system prompt baked into the opencode agent's `prompt` field.
    *
