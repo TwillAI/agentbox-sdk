@@ -70,6 +70,17 @@ const SANDBOX_OPENCODE_READY_TIMEOUT_MS = 90_000;
 const LOCAL_OPENCODE_READY_TIMEOUT_MS = 20_000;
 const SHARED_OPENCODE_TARGET_ID = "shared-opencode-server";
 
+// opencode hardcodes `OUTPUT_TOKEN_MAX = 32_000` in
+// `packages/opencode/src/provider/transform.ts` and reserves it as
+// `max_tokens` on every chat-completion request. On a 200K-context model
+// (e.g. Claude Sonnet 4.5 via OpenRouter) that 32K reserve eats into the
+// usable input budget hard — runs with ~180K of input would overflow
+// (`input + 32000 > 204800`). The only override opencode exposes is the
+// `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX` env var, applied at the
+// `opencode serve` process level. 16000 keeps responses comfortably long
+// while giving back ~16K of input headroom.
+const OPENCODE_OUTPUT_TOKEN_MAX = "16000";
+
 function toRawEvent(
   runId: string,
   payload: unknown,
@@ -334,6 +345,7 @@ async function ensureSandboxOpenCodeServer(
       OPENCODE_CONFIG: configPath,
       OPENCODE_CONFIG_DIR: target.layout.opencodeDir,
       OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
+      OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX: OPENCODE_OUTPUT_TOKEN_MAX,
     };
 
     await applyDifferentialSetup(target, allArtifacts, installCommands);
@@ -498,6 +510,7 @@ async function ensureLocalOpenCodeServer(
     OPENCODE_CONFIG: configPath,
     OPENCODE_CONFIG_DIR: target.layout.opencodeDir,
     OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
+    OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX: OPENCODE_OUTPUT_TOKEN_MAX,
   };
 
   const allArtifacts = [
