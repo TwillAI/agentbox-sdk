@@ -170,8 +170,15 @@ export interface CodexAgentOptions extends AgentOptionsBase {
   provider?: CodexProviderOptions;
 }
 
+export interface OpenRouterPlugin {
+  id: string;
+  enabled?: boolean;
+  [key: string]: unknown;
+}
+
 export interface OpenCodeAgentOptions extends AgentOptionsBase {
   provider?: OpenCodeProviderOptions;
+  openRouterPlugins?: OpenRouterPlugin[];
   /**
    * Setup-time system prompt baked into the opencode agent's `prompt` field.
    *

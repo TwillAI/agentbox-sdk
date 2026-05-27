@@ -239,6 +239,10 @@ export function buildOpenCodeConfig(
   );
   const googleBaseUrl = options.env?.GOOGLE_BASE_URL;
   const openRouterBaseUrl = options.env?.OPENROUTER_BASE_URL;
+  const openRouterPlugins =
+    options.openRouterPlugins && options.openRouterPlugins.length > 0
+      ? options.openRouterPlugins
+      : undefined;
 
   return {
     $schema: "https://opencode.ai/config.json",
@@ -248,6 +252,7 @@ export function buildOpenCodeConfig(
       openrouter: {
         options: {
           baseURL: openRouterBaseUrl || "https://openrouter.ai/api/v1",
+          ...(openRouterPlugins ? { plugins: openRouterPlugins } : {}),
         },
       },
       ...(googleBaseUrl

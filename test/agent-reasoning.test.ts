@@ -125,3 +125,43 @@ describe("reasoning param", () => {
     });
   });
 });
+
+describe("buildOpenCodeConfig openRouterPlugins", () => {
+  it("omits plugins when openRouterPlugins is unset", () => {
+    const config = buildOpenCodeConfig(
+      makeOpenCodeRequest().options,
+      false,
+    ) as {
+      provider: {
+        openrouter: { options: { baseURL: string; plugins?: unknown } };
+      };
+    };
+    expect(config.provider.openrouter.options.plugins).toBeUndefined();
+  });
+
+  it("forwards openRouterPlugins into the openrouter options block", () => {
+    const request = makeOpenCodeRequest();
+    request.options.openRouterPlugins = [{ id: "context-compression" }];
+    const config = buildOpenCodeConfig(request.options, false) as {
+      provider: {
+        openrouter: {
+          options: { plugins: Array<{ id: string }> };
+        };
+      };
+    };
+    expect(config.provider.openrouter.options.plugins).toEqual([
+      { id: "context-compression" },
+    ]);
+  });
+
+  it("omits plugins when openRouterPlugins is an empty array", () => {
+    const request = makeOpenCodeRequest();
+    request.options.openRouterPlugins = [];
+    const config = buildOpenCodeConfig(request.options, false) as {
+      provider: {
+        openrouter: { options: { plugins?: unknown } };
+      };
+    };
+    expect(config.provider.openrouter.options.plugins).toBeUndefined();
+  });
+});
