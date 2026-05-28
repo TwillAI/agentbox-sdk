@@ -397,15 +397,12 @@ async function ensureSandboxOpenCodeServer(
     // alive forever. We only care that the shell *attempted* to spawn —
     // actual readiness is verified by the curl probe loop below, which is
     // the only authoritative signal anyway.
-    const launchResult = await time(
-      debugOpencode,
-      "spawn opencode serve",
-      () =>
-        sandbox.run(launchCommand, {
-          cwd: options.cwd,
-          env: serveEnv,
-          timeoutMs: 10_000,
-        }),
+    const launchResult = await time(debugOpencode, "spawn opencode serve", () =>
+      sandbox.run(launchCommand, {
+        cwd: options.cwd,
+        env: serveEnv,
+        timeoutMs: 20_000,
+      }),
     );
     if (launchResult.exitCode !== 0) {
       await target.cleanup().catch(() => undefined);
