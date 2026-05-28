@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import path from "node:path";
 
 import {
@@ -6,6 +7,7 @@ import {
   type PermissionRequestedEvent,
   type RawAgentEvent,
 } from "../../events";
+import type { Sandbox } from "../../sandboxes";
 import {
   AgentProvider,
   type AgentAttachRequest,
@@ -91,6 +93,82 @@ function codexConfigDir(options: AgentOptions<"codex">): string {
 
 const REMOTE_CODEX_APP_SERVER_PORT = 43181;
 const REMOTE_CODEX_APP_SERVER_ID = "shared-app-server";
+const CODEX_APP_SERVER_TOKEN_FILENAME = "codex-app-server-token";
+
+function defaultRemoteCodexTokenPath(): string {
+  return path.posix.join(
+    agentboxRoot(AgentProvider.Codex, true),
+    CODEX_APP_SERVER_TOKEN_FILENAME,
+  );
+}
+
+const codexAppServerTokenCache = new WeakMap<Sandbox, Promise<string>>();
+
+async function readCodexAppServerTokenFile(
+  sandbox: Sandbox,
+  tokenFilePath: string,
+): Promise<string | undefined> {
+  const result = await sandbox.run(
+    `if [ -f ${shellQuote(tokenFilePath)} ]; then cat ${shellQuote(tokenFilePath)}; fi`,
+  );
+  if (result.exitCode !== 0) {
+    return undefined;
+  }
+  const value = result.stdout.trim();
+  return value.length > 0 ? value : undefined;
+}
+
+async function ensureCodexAppServerToken(
+  sandbox: Sandbox,
+  tokenFilePath: string,
+): Promise<string> {
+  let cached = codexAppServerTokenCache.get(sandbox);
+  if (!cached) {
+    cached = (async () => {
+      const existing = await readCodexAppServerTokenFile(
+        sandbox,
+        tokenFilePath,
+      );
+      return existing ?? crypto.randomBytes(32).toString("hex");
+    })();
+    codexAppServerTokenCache.set(sandbox, cached);
+  }
+  return cached;
+}
+
+async function getCodexAppServerToken(
+  sandbox: Sandbox,
+  tokenFilePath: string = defaultRemoteCodexTokenPath(),
+): Promise<string> {
+  let cached = codexAppServerTokenCache.get(sandbox);
+  if (!cached) {
+    cached = (async () => {
+      const existing = await readCodexAppServerTokenFile(
+        sandbox,
+        tokenFilePath,
+      );
+      if (!existing) {
+        throw new Error(
+          `Codex app-server token file is missing at ${tokenFilePath}. ` +
+            `setup() must run before connecting to the codex app-server.`,
+        );
+      }
+      return existing;
+    })();
+    codexAppServerTokenCache.set(sandbox, cached);
+  }
+  return cached;
+}
+
+function withCodexAppServerAuthHeaders(
+  base: Record<string, string>,
+  token: string,
+): Record<string, string> {
+  return {
+    ...base,
+    Authorization: `Bearer ${token}`,
+  };
+}
 
 function compactEnv(
   values: Record<string, string | undefined>,
@@ -680,9 +758,10 @@ async function withCodexAppServer<T>(
     );
   }
   const previewUrl = await sandbox.getPreviewLink(REMOTE_CODEX_APP_SERVER_PORT);
+  const token = await getCodexAppServerToken(sandbox);
   const transport = await connectJsonRpcWebSocket(
     toRemoteCodexWebSocketUrl(previewUrl),
-    { headers: sandbox.previewHeaders },
+    { headers: withCodexAppServerAuthHeaders(sandbox.previewHeaders, token) },
   );
   const client = new JsonRpcLineClient<CodexNotification>(
     transport.source,
@@ -819,7 +898,20 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
       ...(options.provider?.env ?? {}),
     });
 
-    const { artifacts: serverArtifacts } = buildArtifactsFor(sharedTarget);
+    const tokenFilePath = path.posix.join(
+      sharedTarget.layout.rootDir,
+      CODEX_APP_SERVER_TOKEN_FILENAME,
+    );
+    const appServerToken = await ensureCodexAppServerToken(
+      sandbox,
+      tokenFilePath,
+    );
+
+    const { artifacts: baseServerArtifacts } = buildArtifactsFor(sharedTarget);
+    const serverArtifacts = [
+      ...baseServerArtifacts,
+      { path: tokenFilePath, content: appServerToken },
+    ];
     const { artifacts: skillArtifacts, installCommands } =
       await prepareSkillArtifacts(provider, options.skills, target.layout);
 
@@ -864,6 +956,7 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
             `mkdir -p ${shellQuote(sharedTarget.layout.rootDir)}`,
             `if curl -fsS http://127.0.0.1:${REMOTE_CODEX_APP_SERVER_PORT}/readyz >/dev/null 2>&1; then exit 0; fi`,
             `if [ -f ${shellQuote(pidFilePath)} ]; then kill "$(cat ${shellQuote(pidFilePath)})" >/dev/null 2>&1 || true; rm -f ${shellQuote(pidFilePath)}; fi`,
+            `chmod 600 ${shellQuote(tokenFilePath)}`,
             `(${[
               `nohup ${[
                 "env",
@@ -873,6 +966,10 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
                     "app-server",
                     "--listen",
                     `ws://0.0.0.0:${REMOTE_CODEX_APP_SERVER_PORT}`,
+                    "--ws-auth",
+                    "capability-token",
+                    "--ws-token-file",
+                    tokenFilePath,
                   ],
                   options,
                 ),
@@ -979,9 +1076,10 @@ async function createRuntime(
       sandbox.getPreviewLink(REMOTE_CODEX_APP_SERVER_PORT),
     );
 
+    const token = await getCodexAppServerToken(sandbox);
     const transport = await connectRemoteCodexAppServer(
       toRemoteCodexWebSocketUrl(previewUrl),
-      sandbox.previewHeaders,
+      withCodexAppServerAuthHeaders(sandbox.previewHeaders, token),
     );
     debugCodex("★ codex transport established");
     return {
