@@ -126,42 +126,45 @@ describe("reasoning param", () => {
   });
 });
 
-describe("buildOpenCodeConfig openRouterPlugins", () => {
-  it("omits plugins when openRouterPlugins is unset", () => {
-    const config = buildOpenCodeConfig(
-      makeOpenCodeRequest().options,
-      false,
-    ) as {
-      provider: {
-        openrouter: { options: { baseURL: string; plugins?: unknown } };
-      };
-    };
-    expect(config.provider.openrouter.options.plugins).toBeUndefined();
+describe("buildOpenCodeConfig openRouter extraBody", () => {
+  type OpenRouterOptions = {
+    baseURL: string;
+    extraBody: { transforms: string[]; plugins?: Array<{ id: string }> };
+  };
+  const openRouterOptions = (config: unknown): OpenRouterOptions =>
+    (config as { provider: { openrouter: { options: OpenRouterOptions } } })
+      .provider.openrouter.options;
+
+  it("always applies the middle-out transform", () => {
+    const options = openRouterOptions(
+      buildOpenCodeConfig(makeOpenCodeRequest().options, false),
+    );
+    expect(options.extraBody.transforms).toEqual(["middle-out"]);
   });
 
-  it("forwards openRouterPlugins into the openrouter options block", () => {
+  it("omits plugins when openRouterPlugins is unset", () => {
+    const options = openRouterOptions(
+      buildOpenCodeConfig(makeOpenCodeRequest().options, false),
+    );
+    expect(options.extraBody.plugins).toBeUndefined();
+  });
+
+  it("forwards openRouterPlugins into extraBody alongside middle-out", () => {
     const request = makeOpenCodeRequest();
     request.options.openRouterPlugins = [{ id: "context-compression" }];
-    const config = buildOpenCodeConfig(request.options, false) as {
-      provider: {
-        openrouter: {
-          options: { plugins: Array<{ id: string }> };
-        };
-      };
-    };
-    expect(config.provider.openrouter.options.plugins).toEqual([
-      { id: "context-compression" },
-    ]);
+    const options = openRouterOptions(
+      buildOpenCodeConfig(request.options, false),
+    );
+    expect(options.extraBody.transforms).toEqual(["middle-out"]);
+    expect(options.extraBody.plugins).toEqual([{ id: "context-compression" }]);
   });
 
   it("omits plugins when openRouterPlugins is an empty array", () => {
     const request = makeOpenCodeRequest();
     request.options.openRouterPlugins = [];
-    const config = buildOpenCodeConfig(request.options, false) as {
-      provider: {
-        openrouter: { options: { plugins?: unknown } };
-      };
-    };
-    expect(config.provider.openrouter.options.plugins).toBeUndefined();
+    const options = openRouterOptions(
+      buildOpenCodeConfig(request.options, false),
+    );
+    expect(options.extraBody.plugins).toBeUndefined();
   });
 });

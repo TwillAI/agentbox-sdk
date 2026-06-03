@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 import {
@@ -43,7 +44,7 @@ import {
 import { buildOpenCodeSubagentConfig } from "../config/subagents";
 import { fetchJson, streamSseResilient } from "../transports/app-server";
 import { spawnCommand, waitForHttpReady } from "../transports/spawn";
-import { sleep } from "../../shared/network";
+import { sleep, waitFor } from "../../shared/network";
 import { shellQuote } from "../../shared/shell";
 import { extractOpenCodeCostData } from "../cost";
 import { debugOpencode, time } from "../../shared/debug";
@@ -69,6 +70,113 @@ const LOCAL_OPENCODE_PORT = 4096;
 const SANDBOX_OPENCODE_READY_TIMEOUT_MS = 90_000;
 const LOCAL_OPENCODE_READY_TIMEOUT_MS = 20_000;
 const SHARED_OPENCODE_TARGET_ID = "shared-opencode-server";
+
+/**
+ * LLM provider API keys opencode reads from its process env. These are
+ * the only env vars whose change must restart the server — see
+ * {@link hashLlmApiKeys}.
+ */
+const LLM_API_KEY_ENV_VARS = [
+  "OPENROUTER_API_KEY",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GOOGLE_GENERATIVE_AI_API_KEY",
+  "GEMINI_API_KEY",
+] as const;
+
+/**
+ * Stable fingerprint of the LLM provider API keys in the caller-provided
+ * environment. The opencode server reads these credentials from its
+ * process env at spawn time only — there is no per-request credential
+ * override over the HTTP API, and keys are never written into the config
+ * file. So a key change between runs is invisible to an already-running
+ * server. Folding this fingerprint into the setupId makes such a change
+ * flip the setup marker, miss the preflight, and trigger a kill-and-respawn
+ * so the new credentials actually take effect. We hash only the known LLM
+ * key names (not the whole env) so unrelated env churn doesn't needlessly
+ * restart the shared server.
+ */
+function hashLlmApiKeys(env: Record<string, string> | undefined): string {
+  const hasher = createHash("sha256");
+  for (const key of LLM_API_KEY_ENV_VARS) {
+    if (env?.[key] !== undefined) {
+      hasher.update(`${key}=${env[key]}\n`);
+    }
+  }
+  return hasher.digest("hex");
+}
+
+/**
+ * Stop a local `opencode serve` listening on {@link LOCAL_OPENCODE_PORT}
+ * and wait until the port is actually released, so the cold path that
+ * follows binds a fresh server (and its readiness probe can't get a false
+ * positive from the lingering old process).
+ *
+ * Best-effort + unix-only: kills by port via `lsof`. Local opencode mode
+ * already relies on unix-only spawn behaviour elsewhere, so this is an
+ * acceptable platform constraint.
+ */
+async function killLocalOpenCodeServer(): Promise<void> {
+  await time(debugOpencode, "kill local opencode server", async () => {
+    const killer = spawnCommand({
+      command: "sh",
+      args: [
+        "-c",
+        `lsof -ti tcp:${LOCAL_OPENCODE_PORT} | xargs kill 2>/dev/null || true`,
+      ],
+    });
+    await killer.wait().catch(() => undefined);
+    // Wait for the health endpoint to stop responding — the port is then
+    // free for the fresh spawn below.
+    await waitFor(
+      async () => {
+        try {
+          const res = await fetch(
+            `http://127.0.0.1:${LOCAL_OPENCODE_PORT}/global/health`,
+          );
+          return !res.ok;
+        } catch {
+          return true;
+        }
+      },
+      { timeoutMs: 5_000, intervalMs: 200 },
+    ).catch(() => undefined);
+  });
+}
+
+/**
+ * Stop the sandbox `opencode serve` recorded in `pidFilePath` and wait
+ * until its health endpoint stops responding. The daemon is launched
+ * under `setsid` so its process-group id equals its pid — killing the
+ * group (`kill -- -PID`) reaps any children too, with a plain `kill PID`
+ * fallback.
+ */
+async function killSandboxOpenCodeServer(
+  sandbox: NonNullable<AgentOptions<"open-code">["sandbox"]>,
+  pidFilePath: string,
+  cwd: string | undefined,
+  port: number,
+): Promise<void> {
+  await time(debugOpencode, "kill sandbox opencode server", async () => {
+    await sandbox
+      .run(
+        `kill -- -"$(cat ${shellQuote(pidFilePath)})" 2>/dev/null || kill "$(cat ${shellQuote(pidFilePath)})" 2>/dev/null || true`,
+        { cwd, timeoutMs: 5_000 },
+      )
+      .catch(() => undefined);
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const probe = await sandbox.run(
+        `curl -fsS --max-time 2 http://127.0.0.1:${port}/global/health >/dev/null 2>&1`,
+        { cwd, timeoutMs: 5_000 },
+      );
+      if (probe.exitCode !== 0) {
+        return;
+      }
+      await sleep(200);
+    }
+  });
+}
 
 function toRawEvent(
   runId: string,
@@ -210,15 +318,10 @@ export function buildOpenCodeConfig(
   // dominates the runtime appendix that follows.
   //
   // Setup-time field: changing `options.systemPrompt` between runs
-  // changes `agentbox.json`'s content hash, which invalidates the
-  // setup-manifest cache and re-uploads the config on the next
-  // `setup()` call. The opencode server reads agent definitions at
-  // startup, so a config change does NOT take effect on a server
-  // already running — `setup()` will spawn a fresh server (cold path)
-  // when no opencode instance is up; on warm paths it short-circuits
-  // and the running server keeps the old prompt. Callers that need to
-  // change the system prompt mid-process should bring up a new
-  // sandbox/Agent instance.
+  // changes `agentbox.json`'s content hash, which flips the setupId and
+  // misses the preflight on the next `setup()` call. The opencode server
+  // reads agent definitions at startup, so the drift path restarts the
+  // server (kill + cold spawn) so the new prompt actually takes effect.
   const baseAgent = {
     mode: "primary",
     prompt: options.systemPrompt || FALLBACK_OPEN_CODE_AGENT_PROMPT,
@@ -243,6 +346,18 @@ export function buildOpenCodeConfig(
     options.openRouterPlugins && options.openRouterPlugins.length > 0
       ? options.openRouterPlugins
       : undefined;
+  // OpenRouter request-body params must travel via `extraBody` — that's the
+  // only channel `@openrouter/ai-sdk-provider`'s `createOpenRouter()` merges
+  // into every request. A top-level `plugins` option is silently dropped by
+  // the constructor, so the directive never reaches OpenRouter and the model's
+  // hard context limit is enforced instead. `transforms: ["middle-out"]` is
+  // OpenRouter's built-in, always-available compaction (drops/compresses the
+  // middle of the history to fit the window); it doesn't depend on a plugin id
+  // being recognized, so it's an unconditional safety net against overflow.
+  const openRouterExtraBody = {
+    transforms: ["middle-out"],
+    ...(openRouterPlugins ? { plugins: openRouterPlugins } : {}),
+  };
 
   return {
     $schema: "https://opencode.ai/config.json",
@@ -252,7 +367,7 @@ export function buildOpenCodeConfig(
       openrouter: {
         options: {
           baseURL: openRouterBaseUrl || "https://openrouter.ai/api/v1",
-          ...(openRouterPlugins ? { plugins: openRouterPlugins } : {}),
+          extraBody: openRouterExtraBody,
         },
       },
       ...(googleBaseUrl
@@ -270,14 +385,16 @@ export function buildOpenCodeConfig(
 /**
  * Sandbox-side preparation for opencode (remote case). Idempotent:
  *
- *   1. Compute setupId for the artifact set + daemon expectation, then
- *      run `preflightSetup`: one no-upload sandbox.run that checks the
- *      `setup.id` marker AND probes loopback `/global/health`. If both
- *      match, return immediately — no tarball stream, no spawn.
+ *   1. Compute setupId for the artifact set + daemon expectation + an
+ *      LLM API-key fingerprint, then run `preflightSetup`: one no-upload
+ *      sandbox.run that checks the `setup.id` marker AND probes loopback
+ *      `/global/health`. If both match, return immediately — no tarball
+ *      stream, no spawn.
  *   2. Cold/drifted path: upload artifacts (config, plugins, skills,
- *      sub-agent definitions) via the differential-setup manifest,
- *      spawn `opencode serve` on the static port, poll until ready,
- *      then mark setup complete.
+ *      sub-agent definitions) via the differential-setup manifest, stop
+ *      any stale server still on the port (its env/config changed), spawn
+ *      a fresh `opencode serve` on the static port, poll until ready, then
+ *      mark setup complete.
  *
  * No return value: `execute` recomputes baseUrl from
  * `sandbox.getPreviewLink(SANDBOX_OPENCODE_PORT)` independently.
@@ -328,7 +445,10 @@ async function ensureSandboxOpenCodeServer(
       artifacts: allArtifacts,
       installCommands,
       daemon: daemonInfo,
-      extras: [`enableRtk:${enableRtk}`],
+      extras: [
+        `enableRtk:${enableRtk}`,
+        `apiKeys:${hashLlmApiKeys(options.env)}`,
+      ],
     });
     if (await preflightSetup(target, setupId, daemonInfo)) {
       debugOpencode("opencode setup() preflight hit — skipping");
@@ -390,6 +510,17 @@ async function ensureSandboxOpenCodeServer(
       ].join(" ")})`,
     ].join(" && ");
 
+    // Reaching here means setup drifted (config, skills, plugins, or
+    // `options.env`/credentials changed) or no server is up yet. If a stale
+    // server is still listening on the port it would (a) keep serving with
+    // the old env/config and (b) make the readiness probe below a false
+    // positive, so stop it first and wait for the port to free. When nothing
+    // is running this is a cheap no-op. NB: this restarts the *shared* server,
+    // so a concurrent run pinned to the same sandbox port would be reset — an
+    // inherent property of the single-port design, fine for the sequential
+    // "next command" case this guards against.
+    await killSandboxOpenCodeServer(sandbox, pidFilePath, options.cwd, port);
+
     // Use `sandbox.run` instead of `runAsync().wait()`. The launch shell is
     // a fire-and-forget detacher that exits in milliseconds; we don't need
     // a streaming handle, and `runAsync` on daytona ties exit detection to
@@ -447,31 +578,23 @@ async function ensureSandboxOpenCodeServer(
 /**
  * Host-side preparation for opencode (local mode). Idempotent:
  *
- *   1. Probe `127.0.0.1:LOCAL_OPENCODE_PORT/global/health`. If a
- *      previous setup() (or anything else) left a server running on
- *      the static port, return immediately.
- *   2. Cold path: build the on-disk config, spawn `opencode serve` on
- *      the static port, wait for ready.
+ *   1. Compute the setupId over the artifact set, daemon expectation,
+ *      and an `options.env` fingerprint, then `preflightSetup`: if the
+ *      `setup.id` marker matches AND the server answers
+ *      `127.0.0.1:LOCAL_OPENCODE_PORT/global/health`, reuse it.
+ *   2. Drift/cold path: stop any stale server still on the port (its env
+ *      or config no longer matches), re-apply the on-disk config, spawn a
+ *      fresh `opencode serve`, wait for ready.
  *
  * The spawned process is left running across runs — `execute` doesn't
  * own its lifecycle, the process is the property of the host that
- * invoked `setup()`.
+ * invoked `setup()`. A drifting `setup()` (changed credentials/config)
+ * restarts the shared server so the new settings take effect.
  */
 async function ensureLocalOpenCodeServer(
   request: AgentSetupRequest<"open-code">,
 ): Promise<void> {
   const options = request.options;
-
-  try {
-    await waitForHttpReady(
-      `http://127.0.0.1:${LOCAL_OPENCODE_PORT}/global/health`,
-      { timeoutMs: 1_000 },
-    );
-    debugOpencode("local opencode server already running — reusing");
-    return;
-  } catch {
-    debugOpencode("local opencode server not running — cold-spawning");
-  }
 
   const plugins = assertHooksSupported(request.provider, options);
   assertCommandsSupported(request.provider, options.commands);
@@ -510,19 +633,37 @@ async function ensureLocalOpenCodeServer(
       content: JSON.stringify(openCodeConfig, null, 2),
     },
   ];
-  // Local mode already short-circuits the spawn when the host server is
-  // up (waitForHttpReady at the top). The setupId check covers the
-  // artifact set, so re-running with new config still triggers a
-  // re-apply (the spawn would still be skipped since the server is up
-  // — that's a known limitation, separate from this change).
+  // The setupId encodes the artifact set AND a fingerprint of the LLM
+  // provider API keys in `options.env`; the daemon probe adds liveness. A
+  // reuse therefore requires both that nothing drifted and that the server
+  // is up — and the marker lives on disk under the shared target, so a fresh
+  // process / new Agent carrying a different OPENROUTER_API_KEY sees the
+  // mismatch.
+  const daemonInfo = {
+    port: LOCAL_OPENCODE_PORT,
+    healthPath: "/global/health",
+  };
   const setupId = computeSetupId({
     artifacts: allArtifacts,
     installCommands,
+    daemon: daemonInfo,
+    extras: [`apiKeys:${hashLlmApiKeys(options.env)}`],
   });
-  const preflightHit = await preflightSetup(target, setupId);
-  if (!preflightHit) {
-    await applyDifferentialSetup(target, allArtifacts, installCommands);
+  if (await preflightSetup(target, setupId, daemonInfo)) {
+    debugOpencode("local opencode server up-to-date — reusing");
+    return;
   }
+  debugOpencode("local opencode server drifted/absent — (re)spawning");
+
+  await applyDifferentialSetup(target, allArtifacts, installCommands);
+
+  // Stop any stale server still bound to the port (drift: its env/config no
+  // longer matches) so the spawn below binds fresh and its readiness probe
+  // can't get a false positive from the old process. No-op when nothing is
+  // running. NB: this restarts the *shared* host server — a concurrent run
+  // on the same port would be reset, an inherent property of the single-port
+  // design, fine for the sequential "next command" case this guards against.
+  await killLocalOpenCodeServer();
 
   spawnCommand({
     command: options.provider?.binary ?? "opencode",
