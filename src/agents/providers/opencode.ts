@@ -358,6 +358,23 @@ export function buildOpenCodeConfig(
     transforms: ["middle-out"],
     ...(openRouterPlugins ? { plugins: openRouterPlugins } : {}),
   };
+  // Per-model `limit` overrides. opencode merges these over the models.dev
+  // catalog entry (`provider.ts` keeps catalog values for fields left
+  // unset), and `limit.input` is what flips its compaction budget from the
+  // zero-margin `context - maxOutputTokens` to `input - reserved` — see
+  // {@link OpenRouterModelLimit}.
+  const openRouterModelEntries = Object.entries(
+    options.openRouterModels ?? {},
+  ).filter(([, limit]) => limit && Object.keys(limit).length > 0);
+  const openRouterModels =
+    openRouterModelEntries.length > 0
+      ? Object.fromEntries(
+          openRouterModelEntries.map(([modelId, limit]) => [
+            modelId,
+            { limit },
+          ]),
+        )
+      : undefined;
 
   return {
     $schema: "https://opencode.ai/config.json",
@@ -369,6 +386,7 @@ export function buildOpenCodeConfig(
           baseURL: openRouterBaseUrl || "https://openrouter.ai/api/v1",
           extraBody: openRouterExtraBody,
         },
+        ...(openRouterModels ? { models: openRouterModels } : {}),
       },
       ...(googleBaseUrl
         ? { google: { options: { baseURL: googleBaseUrl } } }
