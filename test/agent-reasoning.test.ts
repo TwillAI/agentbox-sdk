@@ -168,3 +168,60 @@ describe("buildOpenCodeConfig openRouter extraBody", () => {
     expect(options.extraBody.plugins).toBeUndefined();
   });
 });
+
+describe("buildOpenCodeConfig openRouter model limits", () => {
+  type OpenRouterProvider = {
+    options: { baseURL: string };
+    models?: Record<
+      string,
+      { limit: { context?: number; input?: number; output?: number } }
+    >;
+  };
+  const openRouterProvider = (config: unknown): OpenRouterProvider =>
+    (config as { provider: { openrouter: OpenRouterProvider } }).provider
+      .openrouter;
+
+  it("omits models when openRouterModels is unset", () => {
+    const provider = openRouterProvider(
+      buildOpenCodeConfig(makeOpenCodeRequest().options, false),
+    );
+    expect(provider.models).toBeUndefined();
+  });
+
+  it("omits models when openRouterModels is empty", () => {
+    const request = makeOpenCodeRequest();
+    request.options.openRouterModels = {};
+    const provider = openRouterProvider(
+      buildOpenCodeConfig(request.options, false),
+    );
+    expect(provider.models).toBeUndefined();
+  });
+
+  it("skips entries whose limit object is empty", () => {
+    const request = makeOpenCodeRequest();
+    request.options.openRouterModels = { "z-ai/glm-5.1": {} };
+    const provider = openRouterProvider(
+      buildOpenCodeConfig(request.options, false),
+    );
+    expect(provider.models).toBeUndefined();
+  });
+
+  it("renders per-model limit overrides under provider.openrouter.models", () => {
+    const request = makeOpenCodeRequest();
+    request.options.openRouterModels = {
+      "z-ai/glm-5.1": { input: 170_752 },
+      "moonshotai/kimi-k2.6": { context: 262_142, input: 230_142 },
+    };
+    const provider = openRouterProvider(
+      buildOpenCodeConfig(request.options, false),
+    );
+    expect(provider.models).toEqual({
+      "z-ai/glm-5.1": { limit: { input: 170_752 } },
+      "moonshotai/kimi-k2.6": {
+        limit: { context: 262_142, input: 230_142 },
+      },
+    });
+    // The options block is untouched by model overrides.
+    expect(provider.options.baseURL).toBe("https://openrouter.ai/api/v1");
+  });
+});

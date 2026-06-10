@@ -176,9 +176,43 @@ export interface OpenRouterPlugin {
   [key: string]: unknown;
 }
 
+/**
+ * Per-model token-limit overrides for opencode's openrouter provider,
+ * keyed by the bare OpenRouter model id (e.g. `z-ai/glm-5.1`).
+ *
+ * opencode auto-compacts a session when the last response's token usage
+ * reaches `usable = limit.context - maxOutputTokens` — a zero-margin
+ * threshold: the *next* request stacks new user/tool content on top of
+ * that count plus opencode's hardcoded 32K `max_tokens` reserve, so any
+ * growth between usage checks overflows the upstream window and the
+ * request 400s ("requested about 205597 tokens ... maximum context
+ * length is 204800"). OpenRouter's middle-out transform and
+ * context-compression plugin don't reliably catch sub-percent overflows,
+ * so the safety margin has to exist client-side.
+ *
+ * Setting `input` switches opencode's budget to
+ * `usable = limit.input - reserved` (`reserved` defaults to 20K), making
+ * compaction fire early enough to absorb between-check growth. Pick
+ * `input = catalog context - 32_000` so input + output reserve stays
+ * within the window with ~20K of slack. `context`/`output` override the
+ * models.dev catalog values when those are wrong for the routed endpoint.
+ */
+export interface OpenRouterModelLimit {
+  context?: number;
+  input?: number;
+  output?: number;
+}
+
 export interface OpenCodeAgentOptions extends AgentOptionsBase {
   provider?: OpenCodeProviderOptions;
   openRouterPlugins?: OpenRouterPlugin[];
+  /**
+   * Per-model `limit` overrides rendered under
+   * `provider.openrouter.models.<id>.limit` in the generated opencode
+   * config. See {@link OpenRouterModelLimit} for why these matter.
+   * Setup-time field: changing it invalidates the setup-manifest cache.
+   */
+  openRouterModels?: Record<string, OpenRouterModelLimit>;
   /**
    * Setup-time system prompt baked into the opencode agent's `prompt` field.
    *
