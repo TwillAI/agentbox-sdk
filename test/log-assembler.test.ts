@@ -322,7 +322,12 @@ describe("ProviderLogAssembler — claude-code", () => {
       messageId: childMessageId,
       parent_tool_use_id: parentToolUseId,
       message: {
-        content: [{ type: "tool_use", id: "child_tool_1" }],
+        // The CLI emits assistant SDKMessages per content block, so the
+        // streamed text must survive the tool_use-only final event.
+        content: [
+          { type: "text", text: "child text" },
+          { type: "tool_use", id: "child_tool_1" },
+        ],
       },
     });
   });
@@ -943,5 +948,322 @@ describe("ProviderLogAssembler — opencode sub-agent linkage", () => {
     expect(partOf(more)).toMatchObject({
       parentTaskCallId: "call_task_A",
     });
+  });
+});
+
+describe("ProviderLogAssembler — claude-code per-block assistant events", () => {
+  // The CLI emits one `assistant` SDKMessage PER CONTENT BLOCK (all sharing
+  // the same `message.id`, each carrying only its own block) — verified
+  // against claude-agent-sdk 0.2.123 with includePartialMessages. These tests
+  // pin the assembler against that emission pattern.
+
+  function assistantBlock(
+    messageId: string,
+    block: Record<string, unknown>,
+    parentToolUseId: string | null = null,
+  ) {
+    return {
+      type: "assistant",
+      uuid: `u-block-${String(block.type)}`,
+      session_id: "sess",
+      parent_tool_use_id: parentToolUseId,
+      message: {
+        id: messageId,
+        role: "assistant",
+        type: "message",
+        model: "claude-sonnet",
+        content: [block],
+      },
+    };
+  }
+
+  function snapshotText(snapshot: Record<string, unknown>): string {
+    const message = snapshot.message as {
+      content: Array<Record<string, unknown>>;
+    };
+    return message.content
+      .filter((b) => b.type === "text")
+      .map((b) => String(b.text ?? ""))
+      .join("");
+  }
+
+  it("keeps streamed text when the tool_use block's assistant event arrives", () => {
+    const assembler = new ProviderLogAssembler();
+    assembler.process("claude-code", streamStart(MSG_ID));
+    assembler.process("claude-code", streamThinkingDelta("let me check"));
+    assembler.process(
+      "claude-code",
+      assistantBlock(MSG_ID, { type: "thinking", thinking: "let me check" }),
+    );
+    assembler.process("claude-code", streamTextDelta("Checking the repo."));
+    assembler.process(
+      "claude-code",
+      assistantBlock(MSG_ID, { type: "text", text: "Checking the repo." }),
+    );
+    const [snap] = assembler.process(
+      "claude-code",
+      assistantBlock(MSG_ID, {
+        type: "tool_use",
+        id: "tool_1",
+        name: "Bash",
+        input: { command: "ls" },
+      }),
+    );
+
+    expect(snap).toMatchObject({
+      type: "message.updated",
+      messageId: MSG_ID,
+      message: {
+        content: [
+          { type: "thinking", thinking: "let me check" },
+          { type: "text", text: "Checking the repo." },
+          { type: "tool_use", id: "tool_1", name: "Bash" },
+        ],
+      },
+    });
+  });
+
+  it("keeps assembling deltas that arrive after a per-block assistant event", () => {
+    const assembler = new ProviderLogAssembler();
+    assembler.process("claude-code", streamStart(MSG_ID));
+    assembler.process("claude-code", streamThinkingDelta("hmm"));
+    // Thinking block's assistant event lands mid-stream; the text block of
+    // the SAME message keeps streaming afterwards.
+    assembler.process(
+      "claude-code",
+      assistantBlock(MSG_ID, { type: "thinking", thinking: "hmm" }),
+    );
+    const produced = assembler.process("claude-code", streamTextDelta("Hello"));
+    expect(produced).toHaveLength(1);
+    expect(produced[0]?.messageId).toBe(MSG_ID);
+    expect(snapshotText(produced[0]!)).toBe("Hello");
+  });
+
+  it("does not detach the main stream when a forwarded subagent message arrives", () => {
+    const assembler = new ProviderLogAssembler();
+    assembler.process("claude-code", streamStart(MSG_ID));
+    assembler.process("claude-code", streamTextDelta("Main says: "));
+    const [sub] = assembler.process(
+      "claude-code",
+      assistantBlock(
+        "msg_sub",
+        { type: "text", text: "pong from subagent" },
+        "toolu_task",
+      ),
+    );
+    expect(sub?.parent_tool_use_id).toBe("toolu_task");
+    const produced = assembler.process("claude-code", streamTextDelta("hello"));
+    expect(produced).toHaveLength(1);
+    expect(produced[0]?.messageId).toBe(MSG_ID);
+    expect(snapshotText(produced[0]!)).toBe("Main says: hello");
+  });
+
+  it("backfills text from the assistant event when no deltas were observed", () => {
+    const assembler = new ProviderLogAssembler();
+    assembler.process("claude-code", streamStart(MSG_ID));
+    const [snap] = assembler.process(
+      "claude-code",
+      assistantBlock(MSG_ID, { type: "text", text: "full text" }),
+    );
+    expect(snapshotText(snap!)).toBe("full text");
+  });
+
+  it("returns snapshots in chronological first-seen order", () => {
+    const assembler = new ProviderLogAssembler();
+    assembler.process("claude-code", streamStart("msg_1"));
+    assembler.process(
+      "claude-code",
+      assistantBlock("msg_1", {
+        type: "tool_use",
+        id: "tool_1",
+        name: "Bash",
+        input: {},
+      }),
+    );
+    assembler.process("claude-code", {
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "tool_1", content: "ok" },
+        ],
+      },
+    });
+    assembler.process("claude-code", streamStart("msg_2"));
+    assembler.process(
+      "claude-code",
+      assistantBlock("msg_2", { type: "text", text: "done" }),
+    );
+    assembler.process("claude-code", {
+      type: "result",
+      subtype: "success",
+      result: "done",
+    });
+
+    const order = assembler
+      .getSnapshots("claude-code")
+      .map((s) =>
+        s.type === "message.updated"
+          ? `message:${String(s.messageId)}`
+          : String(s.type),
+      );
+    expect(order).toEqual(["message:msg_1", "user", "message:msg_2", "result"]);
+  });
+
+  it("drops stream-frequency noise events from the assembled trace", () => {
+    const assembler = new ProviderLogAssembler();
+    const noise = [
+      { type: "rate_limit_event", rate_limit_info: {} },
+      { type: "tool_progress", tool_use_id: "t", elapsed_time_seconds: 1 },
+      { type: "system", subtype: "status", status: "requesting" },
+      { type: "system", subtype: "hook_started", hook_name: "X" },
+      { type: "system", subtype: "hook_response", hook_name: "X" },
+      { type: "system", subtype: "api_retry", attempt: 1 },
+    ];
+    for (const event of noise) {
+      expect(assembler.process("claude-code", event)).toEqual([]);
+    }
+    expect(
+      assembler.process("claude-code", {
+        type: "system",
+        subtype: "init",
+        session_id: "sess",
+      }),
+    ).toHaveLength(1);
+    expect(assembler.getSnapshots("claude-code")).toHaveLength(1);
+  });
+
+  it("re-anchors the last message on seed so post-reconnect deltas keep flowing", () => {
+    const server = new ProviderLogAssembler();
+    server.process("claude-code", streamStart(MSG_ID));
+    server.process("claude-code", streamTextDelta("partial tex"));
+    const history = server.getSnapshots("claude-code");
+
+    const client = new ProviderLogAssembler();
+    client.seedFromSnapshots("claude-code", history);
+    // No fresh message_start after reconnect — the seeded last message is
+    // still mid-stream and deltas must keep attributing to it.
+    const produced = client.process("claude-code", streamTextDelta("t done"));
+    expect(produced).toHaveLength(1);
+    expect(produced[0]?.messageId).toBe(MSG_ID);
+    expect(snapshotText(produced[0]!)).toBe("partial text done");
+  });
+});
+
+describe("ProviderLogAssembler — codex/opencode persistence parity", () => {
+  it("codex getSnapshots retains non-item passthroughs (turn/completed, error) in order", () => {
+    const assembler = new ProviderLogAssembler();
+    assembler.process("codex", {
+      method: "item/started",
+      params: { item: { id: "item_1", type: "agentMessage", text: "hi" } },
+    });
+    assembler.process("codex", {
+      method: "error",
+      params: { message: "boom" },
+    });
+    assembler.process("codex", {
+      method: "turn/completed",
+      params: { usage: { total_cost_usd: 0.42 } },
+    });
+
+    const order = assembler
+      .getSnapshots("codex")
+      .map((s) => String(s.method ?? "(none)"));
+    expect(order).toEqual(["item/started", "error", "turn/completed"]);
+  });
+
+  it("codex drops mcpServer/* and unknown delta methods from the trace", () => {
+    const assembler = new ProviderLogAssembler();
+    expect(
+      assembler.process("codex", { method: "mcpServer/log", params: {} }),
+    ).toEqual([]);
+    expect(
+      assembler.process("codex", {
+        method: "item/somethingNew/outputDelta",
+        params: {},
+      }),
+    ).toEqual([]);
+    expect(assembler.getSnapshots("codex")).toEqual([]);
+  });
+
+  it("codex seed restores passthroughs and item order", () => {
+    const a = new ProviderLogAssembler();
+    a.process("codex", {
+      method: "item/started",
+      params: { item: { id: "item_1", type: "agentMessage", text: "hi" } },
+    });
+    a.process("codex", {
+      method: "turn/completed",
+      params: { usage: { total_cost_usd: 0.42 } },
+    });
+
+    const b = new ProviderLogAssembler();
+    b.seedFromSnapshots("codex", a.getSnapshots("codex"));
+    const order = b
+      .getSnapshots("codex")
+      .map((s) => String(s.method ?? "(none)"));
+    expect(order).toEqual(["item/started", "turn/completed"]);
+  });
+
+  it("opencode getSnapshots retains user messages and part-less events in order", () => {
+    const assembler = new ProviderLogAssembler();
+    assembler.process("open-code", {
+      type: "message.updated",
+      properties: {
+        info: { id: "msg_user", role: "user", sessionID: "sess_main" },
+      },
+    });
+    assembler.process("open-code", {
+      type: "message.part.updated",
+      properties: {
+        part: {
+          id: "prt_1",
+          messageID: "msg_a",
+          sessionID: "sess_main",
+          type: "text",
+          text: "hello",
+        },
+      },
+    });
+    assembler.process("open-code", {
+      type: "session.error",
+      properties: { sessionID: "sess_main", error: "boom" },
+    });
+
+    const order = assembler
+      .getSnapshots("open-code")
+      .map((s) => String(s.type));
+    expect(order).toEqual([
+      "message.updated",
+      "message.part.updated",
+      "session.error",
+    ]);
+  });
+
+  it("opencode dedupes repeated message.updated passthroughs by info.id", () => {
+    const assembler = new ProviderLogAssembler();
+    assembler.process("open-code", {
+      type: "message.updated",
+      properties: {
+        info: { id: "msg_a", role: "assistant", sessionID: "sess_main" },
+      },
+    });
+    assembler.process("open-code", {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg_a",
+          role: "assistant",
+          sessionID: "sess_main",
+          tokens: 12,
+        },
+      },
+    });
+
+    const snaps = assembler.getSnapshots("open-code");
+    expect(snaps).toHaveLength(1);
+    const info = (snaps[0]?.properties as Record<string, unknown>)
+      .info as Record<string, unknown>;
+    expect(info.tokens).toBe(12);
   });
 });

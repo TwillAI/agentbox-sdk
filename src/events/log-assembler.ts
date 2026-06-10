@@ -36,9 +36,47 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+/**
+ * Codex JSON-RPC notifications that carry no renderable trace content (or are
+ * unbounded-frequency). Dropped instead of passed through so they don't bloat
+ * the assembled history.
+ */
+function isCodexNoiseEvent(method: string | undefined): boolean {
+  if (!method) return false;
+  if (method.startsWith("mcpServer/")) return true;
+  // Delta-typed methods the assembler doesn't fold are per-token frequency;
+  // never persist them as standalone snapshots.
+  return method.toLowerCase().includes("delta");
+}
+
 class CodexLogAssembler {
   private readonly byItemId = new Map<string, JsonRecord>();
   private readonly textByItemId = new Map<string, string>();
+  // Non-item events (turn/completed usage, error notifications, thread
+  // responses). Returned by `process()` for the live channel; tracked here so
+  // `getSnapshots()` — the end-of-run persistence source — keeps them too.
+  private readonly passThroughSnapshots: JsonRecord[] = [];
+  // First-seen chronological order across items and passthroughs.
+  private readonly snapshotOrder: Array<
+    { kind: "item"; id: string } | { kind: "passthrough"; index: number }
+  > = [];
+
+  private trackItem(itemId: string, snapshot: JsonRecord): void {
+    if (!this.byItemId.has(itemId)) {
+      this.snapshotOrder.push({ kind: "item", id: itemId });
+    }
+    this.byItemId.set(itemId, snapshot);
+  }
+
+  private pushPassThrough(event: JsonRecord): JsonRecord {
+    const passthrough = clone(event);
+    this.snapshotOrder.push({
+      kind: "passthrough",
+      index: this.passThroughSnapshots.length,
+    });
+    this.passThroughSnapshots.push(passthrough);
+    return clone(passthrough);
+  }
 
   process(event: unknown): JsonRecord[] {
     if (!isRecord(event)) {
@@ -55,7 +93,7 @@ class CodexLogAssembler {
       method === "item/completed"
     ) {
       if (item && typeof item.id === "string") {
-        this.byItemId.set(item.id, clone(event));
+        this.trackItem(item.id, clone(event));
         const text = typeof item.text === "string" ? item.text : undefined;
         if (text !== undefined) {
           this.textByItemId.set(item.id, text);
@@ -123,7 +161,8 @@ class CodexLogAssembler {
       ];
     }
 
-    return [clone(event)];
+    if (isCodexNoiseEvent(method)) return [];
+    return [this.pushPassThrough(event)];
   }
 
   /**
@@ -133,12 +172,25 @@ class CodexLogAssembler {
   seed(snapshots: JsonRecord[]): void {
     this.byItemId.clear();
     this.textByItemId.clear();
+    this.passThroughSnapshots.length = 0;
+    this.snapshotOrder.length = 0;
     for (const snapshot of snapshots) {
       if (!isRecord(snapshot)) continue;
       const params = isRecord(snapshot.params) ? snapshot.params : {};
       const item = isRecord(params.item) ? params.item : null;
-      if (!item || typeof item.id !== "string") continue;
-      this.byItemId.set(item.id, clone(snapshot));
+      if (!item || typeof item.id !== "string") {
+        const method =
+          typeof snapshot.method === "string" ? snapshot.method : undefined;
+        if (!isCodexNoiseEvent(method)) {
+          this.snapshotOrder.push({
+            kind: "passthrough",
+            index: this.passThroughSnapshots.length,
+          });
+          this.passThroughSnapshots.push(clone(snapshot));
+        }
+        continue;
+      }
+      this.trackItem(item.id, clone(snapshot));
       const text = typeof item.text === "string" ? item.text : undefined;
       if (text !== undefined) {
         this.textByItemId.set(item.id, text);
@@ -175,12 +227,20 @@ class CodexLogAssembler {
         },
       },
     };
-    this.byItemId.set(itemId, next);
+    this.trackItem(itemId, next);
     return clone(next);
   }
 
   getSnapshots(): JsonRecord[] {
-    return Array.from(this.byItemId.values()).map(clone);
+    const out: JsonRecord[] = [];
+    for (const entry of this.snapshotOrder) {
+      const snapshot =
+        entry.kind === "item"
+          ? this.byItemId.get(entry.id)
+          : this.passThroughSnapshots[entry.index];
+      if (snapshot) out.push(clone(snapshot));
+    }
+    return out;
   }
 }
 
@@ -203,6 +263,53 @@ class OpenCodeLogAssembler {
   private readonly childSessionToTaskCallId = new Map<string, string>();
   private readonly childMessageIdToTaskCallId = new Map<string, string>();
   private readonly messageIdToSessionId = new Map<string, string>();
+  // Part-less events (user `message.updated`, session lifecycle, errors).
+  // Returned by `process()` for the live channel; tracked here so
+  // `getSnapshots()` — the end-of-run persistence source — keeps them too.
+  // `message.updated` events are keyed by info.id (they re-emit on metadata
+  // updates, latest wins); everything else appends.
+  private readonly keyedPassThrough = new Map<string, JsonRecord>();
+  private readonly passThroughSnapshots: JsonRecord[] = [];
+  // First-seen chronological order across parts and passthroughs.
+  private readonly snapshotOrder: Array<
+    | { kind: "part"; id: string }
+    | { kind: "keyed"; key: string }
+    | { kind: "passthrough"; index: number }
+  > = [];
+
+  private trackPart(partId: string, snapshot: JsonRecord): void {
+    if (!this.byPartId.has(partId)) {
+      this.snapshotOrder.push({ kind: "part", id: partId });
+    }
+    this.byPartId.set(partId, snapshot);
+  }
+
+  private pushPassThrough(event: JsonRecord): JsonRecord {
+    const passthrough = clone(event);
+    const info = isRecord(event.properties)
+      ? isRecord((event.properties as JsonRecord).info)
+        ? ((event.properties as JsonRecord).info as JsonRecord)
+        : null
+      : null;
+    if (
+      event.type === "message.updated" &&
+      info &&
+      typeof info.id === "string"
+    ) {
+      const key = `message:${info.id}`;
+      if (!this.keyedPassThrough.has(key)) {
+        this.snapshotOrder.push({ kind: "keyed", key });
+      }
+      this.keyedPassThrough.set(key, passthrough);
+      return clone(passthrough);
+    }
+    this.snapshotOrder.push({
+      kind: "passthrough",
+      index: this.passThroughSnapshots.length,
+    });
+    this.passThroughSnapshots.push(passthrough);
+    return clone(passthrough);
+  }
 
   process(event: unknown): JsonRecord[] {
     if (!isRecord(event)) {
@@ -298,7 +405,7 @@ class OpenCodeLogAssembler {
       info.role === "user"
     ) {
       this.userMessageIds.add(info.id);
-      return [clone(event)];
+      return [this.pushPassThrough(event)];
     }
 
     // 6. Derive `parentTaskCallId` for the snapshot we're about to emit.
@@ -379,11 +486,11 @@ class OpenCodeLogAssembler {
           );
         }
       }
-      this.byPartId.set(eventPart.id, enriched);
+      this.trackPart(eventPart.id, enriched);
       return [clone(enriched)];
     }
 
-    return [clone(event)];
+    return [this.pushPassThrough(event)];
   }
 
   seed(snapshots: JsonRecord[]): void {
@@ -395,6 +502,9 @@ class OpenCodeLogAssembler {
     this.childSessionToTaskCallId.clear();
     this.childMessageIdToTaskCallId.clear();
     this.messageIdToSessionId.clear();
+    this.keyedPassThrough.clear();
+    this.passThroughSnapshots.length = 0;
+    this.snapshotOrder.length = 0;
     for (const snapshot of snapshots) {
       if (!isRecord(snapshot)) continue;
       const type = typeof snapshot.type === "string" ? snapshot.type : "";
@@ -424,6 +534,7 @@ class OpenCodeLogAssembler {
         info.role === "user"
       ) {
         this.userMessageIds.add(info.id);
+        this.pushPassThrough(snapshot);
         continue;
       }
       const part = isRecord(properties.part)
@@ -431,8 +542,12 @@ class OpenCodeLogAssembler {
         : isRecord(snapshot.part)
           ? snapshot.part
           : null;
+      if (!part || typeof part.id !== "string") {
+        this.pushPassThrough(snapshot);
+        continue;
+      }
       if (part && typeof part.id === "string") {
-        this.byPartId.set(part.id, clone(snapshot));
+        this.trackPart(part.id, clone(snapshot));
         if (typeof part.text === "string") {
           this.textByPartId.set(part.id, part.text);
         }
@@ -570,13 +685,46 @@ class OpenCodeLogAssembler {
         part,
       },
     };
-    this.byPartId.set(partId, next);
+    this.trackPart(partId, next);
     return clone(next);
   }
 
   getSnapshots(): JsonRecord[] {
-    return Array.from(this.byPartId.values()).map(clone);
+    const out: JsonRecord[] = [];
+    for (const entry of this.snapshotOrder) {
+      const snapshot =
+        entry.kind === "part"
+          ? this.byPartId.get(entry.id)
+          : entry.kind === "keyed"
+            ? this.keyedPassThrough.get(entry.key)
+            : this.passThroughSnapshots[entry.index];
+      if (snapshot) out.push(clone(snapshot));
+    }
+    return out;
   }
+}
+
+/**
+ * Stream-frequency events that carry no renderable trace content. They are
+ * dropped instead of passed through so they don't bloat the assembled
+ * history (a long run emits one `system/status` + `rate_limit_event` per API
+ * request and one `tool_progress` per tick).
+ */
+function isClaudeNoiseEvent(event: JsonRecord): boolean {
+  const type = typeof event.type === "string" ? event.type : "";
+  if (type === "rate_limit_event" || type === "tool_progress") return true;
+  if (type === "system") {
+    const sub = typeof event.subtype === "string" ? event.subtype : "";
+    return (
+      sub === "status" ||
+      sub === "hook_started" ||
+      sub === "hook_response" ||
+      sub === "hook_progress" ||
+      sub === "api_retry" ||
+      sub === "auth_status"
+    );
+  }
+  return false;
 }
 
 class ClaudeCodeLogAssembler {
@@ -605,6 +753,14 @@ class ClaudeCodeLogAssembler {
   // insertion order so `getSnapshots()` returns the full trace, not just the
   // deduped assistant messages.
   private readonly passThroughSnapshots: JsonRecord[] = [];
+  // First-seen chronological order of everything `getSnapshots()` returns:
+  // messages anchor at the position of their first event (message_start or
+  // first assistant block) and passthroughs at arrival. Without this the
+  // persisted trace would list every message first and every tool_result /
+  // system event after, scrambling replay order for sequential consumers.
+  private readonly snapshotOrder: Array<
+    { kind: "message"; id: string } | { kind: "passthrough"; index: number }
+  > = [];
 
   process(event: unknown): JsonRecord[] {
     if (!isRecord(event)) return [];
@@ -666,32 +822,48 @@ class ClaudeCodeLogAssembler {
       const message = isRecord(event.message) ? event.message : null;
       const id = message && typeof message.id === "string" ? message.id : null;
       if (!id || !message) {
-        const passthrough = clone(event);
-        this.passThroughSnapshots.push(passthrough);
-        return [clone(passthrough)];
+        return [this.pushPassThrough(event)];
       }
 
       this.setParentToolUseId(id, event);
       const final = extractClaudeAssistantContent(message);
-      this.textByMessageId.set(id, final.text);
-      // Don't clobber streamed thinking with an empty final.thinking. With
-      // `thinking: { display: "summarized" }` (what claude-code currently
-      // configures), the SDK ships thinking only via `thinking_delta` stream
-      // events — the final assistant SDKMessage has no thinking block, so
-      // overwriting would erase the accumulated stream and the persisted
-      // snapshot would lose all reasoning.
-      if (final.thinking) {
+      // The CLI emits one `assistant` SDKMessage PER CONTENT BLOCK (all
+      // sharing the same `message.id`), so no single event is authoritative
+      // for the whole message. A tool_use block's event carries no text and
+      // a per-block text event carries only its own block — blindly
+      // overwriting would wipe text/thinking accumulated from stream deltas
+      // (or from an earlier block's event). Keep whichever rendition is
+      // longer: deltas win while streaming works; the final block event
+      // backfills when deltas were missed (reconnect, summarized thinking).
+      const streamedText = this.textByMessageId.get(id) ?? "";
+      if (final.text.length > streamedText.length) {
+        this.textByMessageId.set(id, final.text);
+      }
+      const streamedThinking = this.thinkingByMessageId.get(id) ?? "";
+      if (final.thinking.length > streamedThinking.length) {
         this.thinkingByMessageId.set(id, final.thinking);
       }
       this.mergeExtraBlocks(id, final.extraBlocks);
-      const snapshot = this.upsertMessage(id);
-      this.currentMessageId = null;
-      return [snapshot];
+      // Deliberately do NOT clear `currentMessageId`: per-block assistant
+      // events arrive mid-stream, and later blocks of the same message keep
+      // streaming `content_block_delta`s afterwards. The next `message_start`
+      // re-anchors naturally. (This also keeps a forwarded subagent assistant
+      // message from detaching the main agent's in-flight stream.)
+      return [this.upsertMessage(id)];
     }
 
+    if (isClaudeNoiseEvent(event)) return [];
+    return [this.pushPassThrough(event)];
+  }
+
+  private pushPassThrough(event: JsonRecord): JsonRecord {
     const passthrough = clone(event);
+    this.snapshotOrder.push({
+      kind: "passthrough",
+      index: this.passThroughSnapshots.length,
+    });
     this.passThroughSnapshots.push(passthrough);
-    return [clone(passthrough)];
+    return clone(passthrough);
   }
 
   seed(snapshots: JsonRecord[]): void {
@@ -702,17 +874,32 @@ class ClaudeCodeLogAssembler {
     this.byMessageId.clear();
     this.extraBlocksByMessageId.clear();
     this.passThroughSnapshots.length = 0;
+    this.snapshotOrder.length = 0;
 
     for (const snapshot of snapshots) {
       if (!isRecord(snapshot)) continue;
       if (snapshot.type !== "message.updated") {
-        this.passThroughSnapshots.push(clone(snapshot));
+        if (!isClaudeNoiseEvent(snapshot)) {
+          this.snapshotOrder.push({
+            kind: "passthrough",
+            index: this.passThroughSnapshots.length,
+          });
+          this.passThroughSnapshots.push(clone(snapshot));
+        }
         continue;
       }
       const messageId =
         typeof snapshot.messageId === "string" ? snapshot.messageId : null;
       if (!messageId) continue;
+      if (!this.byMessageId.has(messageId)) {
+        this.snapshotOrder.push({ kind: "message", id: messageId });
+      }
       this.byMessageId.set(messageId, clone(snapshot));
+      // The replayed history is chronological, so the last message snapshot
+      // is the one that may still be mid-stream. Re-anchor it so deltas that
+      // arrive after a reconnect keep flowing into the right message instead
+      // of being dropped until the next message_start.
+      this.currentMessageId = messageId;
       const parentToolUseId =
         typeof snapshot.parent_tool_use_id === "string"
           ? snapshot.parent_tool_use_id
@@ -799,14 +986,22 @@ class ClaudeCodeLogAssembler {
         content,
       },
     };
+    if (!this.byMessageId.has(messageId)) {
+      this.snapshotOrder.push({ kind: "message", id: messageId });
+    }
     this.byMessageId.set(messageId, next);
     return clone(next);
   }
 
   getSnapshots(): JsonRecord[] {
     const out: JsonRecord[] = [];
-    for (const snapshot of this.byMessageId.values()) out.push(clone(snapshot));
-    for (const snapshot of this.passThroughSnapshots) out.push(clone(snapshot));
+    for (const entry of this.snapshotOrder) {
+      const snapshot =
+        entry.kind === "message"
+          ? this.byMessageId.get(entry.id)
+          : this.passThroughSnapshots[entry.index];
+      if (snapshot) out.push(clone(snapshot));
+    }
     return out;
   }
 }

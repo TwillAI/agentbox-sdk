@@ -910,6 +910,10 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     );
 
     let accumulatedText = "";
+    // Thinking chars streamed via thinking_delta for the current main-agent
+    // message; used to avoid re-emitting the full thinking block carried by
+    // the per-block assistant message.
+    let streamedThinkingChars = 0;
     let pendingMessages = 1;
     let firstStreamEventLogged = false;
     let firstTextDeltaLogged = false;
@@ -1004,8 +1008,23 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
             );
           }
           const partial = message as SDKPartialAssistantMessage;
+          // Subagent partials (forwarded when `forwardSubagentText` is on)
+          // must not leak into the main run's normalized text/reasoning
+          // stream or its accumulated final-answer fallback. The raw event
+          // already carries the nested transcript for assembler consumers.
+          if (partial.parent_tool_use_id) continue;
+          // A new main-agent message resets the accumulated fallback text so
+          // cancelled/failed runs surface the latest message instead of a
+          // concatenation of every text delta in the run.
+          const streamType = (partial.event as { type?: string } | undefined)
+            ?.type;
+          if (streamType === "message_start") {
+            accumulatedText = "";
+            streamedThinkingChars = 0;
+          }
           const { text, thinking } = extractStreamDeltas(partial);
           if (thinking) {
+            streamedThinkingChars += thinking.length;
             sink.emitEvent(
               createNormalizedEvent(
                 "reasoning.delta",
@@ -1036,8 +1055,17 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
 
         if (message.type === "assistant") {
           const asst = message as SDKAssistantMessage;
+          // Forwarded subagent messages (parent_tool_use_id set) are not part
+          // of the main conversation: emitting them as message.completed
+          // would surface the subagent's final answer as a top-level message
+          // (it is already rendered inside the Task tool's result).
+          if (asst.parent_tool_use_id) continue;
           const thinking = extractAssistantThinking(asst);
-          if (thinking) {
+          // Thinking already streamed via thinking_delta events would be
+          // double-emitted here (the CLI repeats the full block content on
+          // the per-block assistant message). Only backfill when no deltas
+          // were observed for this message.
+          if (thinking && streamedThinkingChars === 0) {
             sink.emitEvent(
               createNormalizedEvent(
                 "reasoning.delta",
