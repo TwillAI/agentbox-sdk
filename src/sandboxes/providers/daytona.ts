@@ -29,6 +29,16 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
 > {
   private readonly client: Daytona;
   private sandbox?: DaytonaSandboxObject;
+  /**
+   * Per-sandbox preview access token, captured from `getPreviewLink`.
+   * Daytona's preview proxy now requires this token to reach a sandbox's
+   * ports: unauthenticated requests get 307-redirected to an Auth0 login
+   * (which surfaces as a 307 on WebSocket upgrades and a 404 on plain GETs).
+   * The token is sandbox-level and stable across ports, so caching the most
+   * recent one is sufficient — every consumer calls `getPreviewLink` to build
+   * the URL right before reading `previewHeaders`. See {@link previewHeaders}.
+   */
+  private previewToken?: string;
 
   constructor(options: DaytonaSandboxOptions) {
     super(options);
@@ -318,13 +328,30 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
 
   async openPort(port: number): Promise<void> {
     this.requireProvisioned();
-    await this.requireSandbox().getPreviewLink(port);
+    const preview = await this.requireSandbox().getPreviewLink(port);
+    this.previewToken = preview.token;
+  }
+
+  /**
+   * Headers callers must attach to HTTP/WebSocket requests against this
+   * sandbox's preview URLs. Daytona private sandboxes gate their preview
+   * proxy behind `x-daytona-preview-token`; without it the proxy 307-redirects
+   * to Auth0, which breaks every provider (claude-code `/start` 404, codex WS
+   * "307", opencode `/session` 404). The token is captured lazily from
+   * `getPreviewLink`/`openPort`, both of which every consumer calls to build
+   * the URL immediately before reading these headers.
+   */
+  override get previewHeaders(): Record<string, string> {
+    return this.previewToken
+      ? { "x-daytona-preview-token": this.previewToken }
+      : {};
   }
 
   async getPreviewLink(port: number): Promise<string> {
     this.requireProvisioned();
     const sandbox = this.requireSandbox();
     const preview = await sandbox.getPreviewLink(port);
+    this.previewToken = preview.token;
     return preview.url;
   }
 

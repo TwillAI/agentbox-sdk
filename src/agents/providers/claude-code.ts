@@ -60,6 +60,12 @@ const DAEMON_PATH = "/tmp/agentbox/claude-code/daemon.mjs";
 const DAEMON_LOG_PATH = "/tmp/agentbox/claude-code/daemon.log";
 const DAEMON_PID_PATH = "/tmp/agentbox/claude-code/daemon.pid";
 
+// How long to wait for a freshly-spawned daemon to start listening before
+// giving up, and how often to re-probe. Only paid on a cold launch — the warm
+// path short-circuits on the initial `/__version` probe before we get here.
+const DAEMON_READY_TIMEOUT_MS = 30_000;
+const DAEMON_READY_POLL_INTERVAL_MS = 250;
+
 /**
  * Path to the on-disk `.claude` config directory agentbox uses for a
  * given run. Resolves to `/tmp/agentbox/claude-code/.claude` in a
@@ -602,23 +608,63 @@ async function ensureClaudeCodeDaemonUncached(
         }`,
       );
     }
-    // No readiness polling here. uploadAndRun returns after the
-    // launch shell exits, but the detached `node daemon.mjs` may still
-    // be a few hundred ms away from `listen()`. We rely on the host
-    // retrying the first HTTP request on ECONNREFUSED instead, which
-    // costs nothing on the warm path and absorbs the cold-start race
-    // without burning a sandbox round-trip per check.
+
+    // `uploadAndRun` returns once the launch shell exits, but the detached
+    // `node daemon.mjs` may still be a few hundred ms away from `listen()`.
+    // We can't lean on the host retrying the first request on ECONNREFUSED:
+    // `execute()` dials the daemon through Daytona's preview proxy (see
+    // `daemonBaseUrl`), and that proxy turns "no backend listening yet" into
+    // an HTTP 404 ("Not found") instead of a connection refusal — a real
+    // response that `fetchWithDaemonRetry` returns rather than retries, so
+    // `/start` fails with a hard 404. Poll the daemon over loopback until it
+    // reports the expected version before returning, so the proxy always has
+    // a live backend to forward to.
+    const deadline = Date.now() + DAEMON_READY_TIMEOUT_MS;
+    let lastProbe = "";
+    while (Date.now() < deadline) {
+      const ready = await sandbox.run(
+        `curl -fsS --max-time 1 http://127.0.0.1:${DAEMON_PORT}/__version 2>/dev/null`,
+        { cwd: options.cwd, timeoutMs: 10_000 },
+      );
+      lastProbe = ready.combinedOutput.trim();
+      if (ready.exitCode === 0 && lastProbe === DAEMON_PROTOCOL_VERSION) {
+        return;
+      }
+      await sleep(DAEMON_READY_POLL_INTERVAL_MS);
+    }
+
+    // Boot stalled — surface the daemon log tail so the failure is debuggable
+    // rather than a bare timeout.
+    const logTail = await sandbox
+      .run(`tail -n 20 ${shellQuote(DAEMON_LOG_PATH)} 2>/dev/null`, {
+        cwd: options.cwd,
+      })
+      .catch(() => undefined);
+    throw new Error(
+      `claude-code daemon did not become ready within ${DAEMON_READY_TIMEOUT_MS}ms` +
+        (lastProbe ? ` (last /__version response: ${lastProbe})` : "") +
+        (logTail?.combinedOutput ? `\n${logTail.combinedOutput}` : ""),
+    );
   });
 }
 
 const DAEMON_FIRST_REQUEST_RETRY_BUDGET_MS = 30_000;
 const DAEMON_FIRST_REQUEST_RETRY_INTERVAL_MS = 250;
 
+// Statuses the Daytona preview proxy returns while the daemon's port has no
+// live backend yet (or is mid-restart): a 404/502/503/504 here is the proxy,
+// not the daemon — the daemon always defines `/runs/<id>/start`, so it never
+// 404s that route itself. Retry these during the boot window instead of
+// surfacing them as a hard failure.
+const TRANSIENT_PROXY_STATUSES = new Set([404, 502, 503, 504]);
+
 /**
  * Retry helper for the first HTTP request hitting a freshly-spawned
  * daemon. Re-issues the request if `fetch` throws (most often
- * ECONNREFUSED while node is still booting). Treats anything else —
- * including 4xx/5xx — as a real response and returns immediately.
+ * ECONNREFUSED while node is still booting) or if the preview proxy
+ * answers with a transient "no backend yet" status. Any other status —
+ * including the daemon's own 4xx/5xx — is a real response and returned
+ * immediately.
  */
 async function fetchWithDaemonRetry(
   input: string,
@@ -626,9 +672,16 @@ async function fetchWithDaemonRetry(
 ): Promise<Response> {
   const deadline = Date.now() + DAEMON_FIRST_REQUEST_RETRY_BUDGET_MS;
   let lastError: unknown;
+  let lastResponse: Response | undefined;
   while (Date.now() < deadline) {
     try {
-      return await fetch(input, init);
+      const response = await fetch(input, init);
+      if (TRANSIENT_PROXY_STATUSES.has(response.status)) {
+        lastResponse = response;
+        await sleep(DAEMON_FIRST_REQUEST_RETRY_INTERVAL_MS);
+        continue;
+      }
+      return response;
     } catch (error) {
       lastError = error;
       // Abort signals must NOT be retried.
@@ -639,6 +692,11 @@ async function fetchWithDaemonRetry(
       }
       await sleep(DAEMON_FIRST_REQUEST_RETRY_INTERVAL_MS);
     }
+  }
+  // Budget exhausted: prefer returning the last real (transient) response so
+  // the caller surfaces the actual proxy status, otherwise rethrow.
+  if (lastResponse) {
+    return lastResponse;
   }
   throw lastError ?? new Error("claude-code daemon request timed out");
 }

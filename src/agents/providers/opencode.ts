@@ -519,57 +519,127 @@ async function ensureSandboxOpenCodeServer(
     // so a concurrent run pinned to the same sandbox port would be reset — an
     // inherent property of the single-port design, fine for the sequential
     // "next command" case this guards against.
-    await killSandboxOpenCodeServer(sandbox, pidFilePath, options.cwd, port);
+    // Launch `opencode serve` and wait for readiness, RELAUNCHING if the
+    // server process dies before it starts listening.
+    //
+    // Why retries: a freshly-forked Daytona sandbox can briefly fail
+    // filesystem operations while its copy-on-write disk settles. opencode
+    // creates a SQLite store on first boot, and during that window the create
+    // can fail with "unable to open database file", which crashes the server
+    // before it ever listens. The previous single-shot launch then polled a
+    // dead port for the whole 90s timeout and threw an opaque "did not become
+    // ready" with no server log — the exact "stuck setting up opencode"
+    // symptom. We instead notice the process exited (via `kill -0` on the
+    // pid), relaunch, and on total failure include the opencode log so a
+    // genuine (non-transient) startup error is finally visible.
+    //
+    // We can't poll the preview URL: some sandbox proxies (Vercel's in
+    // particular) return a synthetic 200 with an empty body for ports whose
+    // listener hasn't started accepting yet, so a fetch-based check would get
+    // a false positive while opencode is still doing its first-run DB
+    // migration. The loopback curl below is the only authoritative signal.
+    const OPENCODE_MAX_LAUNCH_ATTEMPTS = 4;
+    const OPENCODE_RELAUNCH_BACKOFF_MS = 1_000;
+    const readyDeadline = Date.now() + SANDBOX_OPENCODE_READY_TIMEOUT_MS;
+    const pidAlive = `kill -0 "$(cat ${shellQuote(pidFilePath)} 2>/dev/null)" 2>/dev/null`;
+    let lastLog = "";
 
-    // Use `sandbox.run` instead of `runAsync().wait()`. The launch shell is
-    // a fire-and-forget detacher that exits in milliseconds; we don't need
-    // a streaming handle, and `runAsync` on daytona ties exit detection to
-    // the session's process tree, which the daemon (intentionally) keeps
-    // alive forever. We only care that the shell *attempted* to spawn —
-    // actual readiness is verified by the curl probe loop below, which is
-    // the only authoritative signal anyway.
-    const launchResult = await time(debugOpencode, "spawn opencode serve", () =>
-      sandbox.run(launchCommand, {
-        cwd: options.cwd,
-        env: serveEnv,
-        timeoutMs: 20_000,
-      }),
-    );
-    if (launchResult.exitCode !== 0) {
-      await target.cleanup().catch(() => undefined);
-      throw new Error(
-        `Could not start OpenCode server: ${launchResult.combinedOutput || launchResult.stderr}`,
-      );
-    }
+    const becameReady = await time(
+      debugOpencode,
+      "launch + poll opencode until ready",
+      async () => {
+        for (
+          let attempt = 1;
+          attempt <= OPENCODE_MAX_LAUNCH_ATTEMPTS && Date.now() < readyDeadline;
+          attempt++
+        ) {
+          // Stop any stale/previous server first (no-op when nothing runs) so
+          // a relaunch binds a fresh process and the readiness probe can't be
+          // a false positive against a dying one.
+          await killSandboxOpenCodeServer(
+            sandbox,
+            pidFilePath,
+            options.cwd,
+            port,
+          );
 
-    // Poll opencode readiness from INSIDE the sandbox via curl localhost.
-    // We can't poll the preview URL because some sandbox proxies (Vercel's
-    // in particular) return a synthetic 200 OK with an empty body for
-    // requests to ports whose listeners haven't started accepting
-    // connections yet — a trivial fetch-based readiness check would get a
-    // false positive while opencode is still doing its first-run DB
-    // migration, and the subsequent POST /session would race the migration
-    // and come back with the same empty 200.
-    await time(debugOpencode, "poll opencode until ready", async () => {
-      const readyDeadline = Date.now() + SANDBOX_OPENCODE_READY_TIMEOUT_MS;
-      let attempt = 0;
-      while (Date.now() < readyDeadline) {
-        attempt++;
-        const probe = await sandbox.run(
-          `curl -fsS http://127.0.0.1:${port}/global/health >/dev/null 2>&1`,
-          { cwd: options.cwd, timeoutMs: 5_000 },
-        );
-        if (probe.exitCode === 0) {
-          debugOpencode("ready after %d probe attempt(s)", attempt);
-          return;
+          // Fire-and-forget detacher; it exits in milliseconds. Actual
+          // readiness is verified by the probe loop, the only real signal.
+          const launchResult = await sandbox.run(launchCommand, {
+            cwd: options.cwd,
+            env: serveEnv,
+            timeoutMs: 40_000,
+          });
+          if (launchResult.exitCode !== 0) {
+            await target.cleanup().catch(() => undefined);
+            throw new Error(
+              `Could not start OpenCode server: ${launchResult.combinedOutput || launchResult.stderr}`,
+            );
+          }
+
+          while (Date.now() < readyDeadline) {
+            const probe = await sandbox.run(
+              `curl -fsS http://127.0.0.1:${port}/global/health >/dev/null 2>&1`,
+              { cwd: options.cwd, timeoutMs: 5_000 },
+            );
+            if (probe.exitCode === 0) {
+              debugOpencode("ready on attempt %d", attempt);
+              return true;
+            }
+            // If the server already exited, don't keep polling a dead port —
+            // capture its log and break out to relaunch.
+            const alive = await sandbox.run(pidAlive, {
+              cwd: options.cwd,
+              timeoutMs: 5_000,
+            });
+            if (alive.exitCode !== 0) {
+              lastLog =
+                (
+                  await sandbox
+                    .run(`tail -n 40 ${shellQuote(logFilePath)} 2>/dev/null`, {
+                      cwd: options.cwd,
+                    })
+                    .catch(() => undefined)
+                )?.combinedOutput?.trim() ?? lastLog;
+              debugOpencode(
+                "opencode died on attempt %d/%d; relaunching. log:\n%s",
+                attempt,
+                OPENCODE_MAX_LAUNCH_ATTEMPTS,
+                lastLog,
+              );
+              break;
+            }
+            await sleep(500);
+          }
+
+          // The process is still alive but the deadline passed → a genuine
+          // hang, not a crash a relaunch would fix. Stop retrying.
+          if (Date.now() >= readyDeadline) break;
+          await sleep(OPENCODE_RELAUNCH_BACKOFF_MS);
         }
-        await sleep(500);
+        return false;
+      },
+    );
+
+    if (!becameReady) {
+      // Best-effort: grab the latest log if we don't already have one (e.g. a
+      // hang where the process never died).
+      if (!lastLog) {
+        lastLog =
+          (
+            await sandbox
+              .run(`tail -n 40 ${shellQuote(logFilePath)} 2>/dev/null`, {
+                cwd: options.cwd,
+              })
+              .catch(() => undefined)
+          )?.combinedOutput?.trim() ?? "";
       }
       await target.cleanup().catch(() => undefined);
       throw new Error(
-        `OpenCode server did not become ready within ${SANDBOX_OPENCODE_READY_TIMEOUT_MS}ms.`,
+        `OpenCode server did not become ready within ${SANDBOX_OPENCODE_READY_TIMEOUT_MS}ms.` +
+          (lastLog ? `\nopencode log:\n${lastLog}` : ""),
       );
-    });
+    }
 
     await markSetupComplete(target, setupId);
   });

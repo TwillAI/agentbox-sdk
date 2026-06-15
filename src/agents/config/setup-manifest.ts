@@ -102,19 +102,17 @@ function computeTargetArtifacts(
  *   2. Run their normal setup steps.
  *   3. Pass it to {@link markSetupComplete} once everything succeeded.
  */
-export function computeSetupId(
-  parts: {
-    artifacts?: TextArtifact[];
-    installCommands?: string[];
-    daemon?: PreflightDaemon;
-    /**
-     * Anything else that, if changed, requires re-running setup —
-     * provider-specific extras like daemon protocol version, login env
-     * key presence, etc. Hashed verbatim.
-     */
-    extras?: string[];
-  },
-): string {
+export function computeSetupId(parts: {
+  artifacts?: TextArtifact[];
+  installCommands?: string[];
+  daemon?: PreflightDaemon;
+  /**
+   * Anything else that, if changed, requires re-running setup —
+   * provider-specific extras like daemon protocol version, login env
+   * key presence, etc. Hashed verbatim.
+   */
+  extras?: string[];
+}): string {
   const hasher = createHash("sha256");
   hasher.update(`v${MANIFEST_VERSION}\n`);
   for (const a of [...(parts.artifacts ?? [])].sort((x, y) =>
@@ -195,14 +193,35 @@ export async function markSetupComplete(
   target: SetupTarget,
   setupId: string,
 ): Promise<void> {
-  await time(debugSetup, `markSetupComplete ${target.provider}`, () =>
-    target.runCommand(
-      [
-        `mkdir -p ${shellQuote(target.layout.rootDir)}`,
-        `printf '%s' ${shellQuote(setupId)} > ${shellQuote(path.posix.join(target.layout.rootDir, SETUP_ID_FILENAME))}`,
-      ].join(" && "),
-    ),
-  );
+  await time(debugSetup, `markSetupComplete ${target.provider}`, async () => {
+    const setupIdFile = path.posix.join(
+      target.layout.rootDir,
+      SETUP_ID_FILENAME,
+    );
+    // Write the marker through the upload path (the toolbox file API on
+    // sandboxes), NOT a `printf > setup.id` shell redirect. On forked
+    // Daytona VMs the exec/shell view of /tmp can be read-only while the
+    // toolbox file-upload API still writes there, so a shell redirect fails
+    // EROFS even though every artifact shipped via `uploadAndRun` (which
+    // uploads files the same way) succeeds. markSetupComplete was the only
+    // setup write using a shell redirect, so it was the only one that hit
+    // "Read-only file system". Routing it through `uploadAndRun` keeps it
+    // consistent with the artifact writes and immune to the read-only shell
+    // view. The trailing `true` is a no-op command — only the file upload
+    // matters here. Upload failures reject (so a genuinely unwritable target
+    // still throws); the marker file's parent dir is created implicitly by
+    // the upload, mirroring how artifacts seed their directories.
+    const result = await target.uploadAndRun(
+      [{ path: setupIdFile, content: setupId }],
+      "true",
+    );
+    if (result.exitCode !== 0) {
+      const detail = result.combinedOutput?.trim();
+      throw new Error(
+        `markSetupComplete failed (${result.exitCode})${detail ? `\n${detail}` : ""}`,
+      );
+    }
+  });
 }
 
 /**
