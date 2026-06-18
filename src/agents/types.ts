@@ -365,6 +365,22 @@ export interface AgentProviderAdapter<
    * is already listening.
    */
   setup(request: AgentSetupRequest<P>): Promise<void>;
+  /**
+   * Stop the long-lived provider CLI server that {@link setup} boots
+   * (claude-code relay daemon, codex app-server, opencode `serve`).
+   *
+   * agentbox NEVER calls this on its own — not on run completion, not on
+   * abort, and not when {@link setup} sees a changed config/credential
+   * set. It exists purely so a developer can explicitly tear a server
+   * down (to reclaim resources, or to force the changed config to apply
+   * on the next cold {@link setup}).
+   *
+   * Best-effort and idempotent: a no-op when nothing is running, or when
+   * the provider has no shared server for the current mode (host-mode
+   * claude-code runs the SDK in-process; local codex spawns a fresh
+   * app-server per run).
+   */
+  killServer(request: AgentSetupRequest<P>): Promise<void>;
   execute(
     request: AgentExecutionRequest<P>,
     sink: AgentRunSink,

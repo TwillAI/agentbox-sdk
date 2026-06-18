@@ -22,6 +22,41 @@ export type DaytonaRaw = {
   sandbox?: DaytonaSandboxObject;
 };
 
+// Stable states where `start()` is the right move (the sandbox is at rest).
+const STARTABLE_STATES = new Set<string>(["stopped", "archived"]);
+// Terminal states — there's no recovering by waiting; fail fast.
+const TERMINAL_STATES = new Set<string>([
+  "error",
+  "build_failed",
+  "destroyed",
+  "destroying",
+]);
+// Any other non-"started" state (creating, starting, restoring, stopping,
+// snapshotting, forking, pulling_snapshot, resizing, …) is an in-flight
+// transition: calling `start()` during it makes Daytona 409 with "Sandbox
+// state change in progress", so we wait it out instead.
+
+const ATTACH_SETTLE_TIMEOUT_MS = 120_000;
+const ATTACH_POLL_INTERVAL_MS = 2_000;
+
+/**
+ * Detect Daytona's 409 "Sandbox state change in progress" conflict, raised
+ * when `start()`/`stop()` races a transition that's already underway. Matches
+ * the structured error (statusCode / name) and a message fallback in case the
+ * error class doesn't survive a re-throw across module boundaries.
+ */
+function isStateChangeInProgressError(err: unknown): boolean {
+  const e = err as
+    | { statusCode?: number; name?: string; message?: string }
+    | undefined;
+  if (!e) return false;
+  return (
+    e.statusCode === 409 ||
+    e.name === "DaytonaConflictError" ||
+    /state change in progress/i.test(e.message ?? "")
+  );
+}
+
 export class DaytonaSandboxAdapter extends SandboxAdapter<
   "daytona",
   DaytonaSandboxOptions,
@@ -73,21 +108,57 @@ export class DaytonaSandboxAdapter extends SandboxAdapter<
       throw new Error(`Daytona sandbox ${id} not found`);
     }
     this.sandbox = existing;
-    const state = (existing.state as string | undefined) ?? "unknown";
-    const isWarm = state === "started";
-    if (!isWarm) {
-      await existing.start();
+    this.isWarmFlag = (existing.state as string | undefined) === "started";
+    await this.ensureStarted(existing);
+  }
+
+  /**
+   * Bring a sandbox to the `started` state, tolerating in-flight transitions.
+   *
+   * `start()` only works from a resting state (`stopped`/`archived`); calling
+   * it while the sandbox is creating/starting/restoring/snapshotting/etc. — or
+   * racing another caller that's already starting it — makes Daytona 409 with
+   * "Sandbox state change in progress". So we poll: start from a resting
+   * state, wait out a transition, fail fast on a terminal state, and treat a
+   * 409 as "someone else is mid-transition" and keep waiting.
+   */
+  private async ensureStarted(sandbox: DaytonaSandboxObject): Promise<void> {
+    let current = sandbox;
+    const deadline = Date.now() + ATTACH_SETTLE_TIMEOUT_MS;
+    for (;;) {
+      const state = (current.state as string | undefined) ?? "unknown";
+      if (state === "started") return;
+      if (TERMINAL_STATES.has(state)) {
+        throw new Error(
+          `Daytona sandbox ${current.id} is in a terminal state: ${state}`,
+        );
+      }
+      if (STARTABLE_STATES.has(state)) {
+        try {
+          await current.start();
+          return;
+        } catch (err) {
+          if (!isStateChangeInProgressError(err)) throw err;
+          // Raced an in-flight transition — fall through to polling.
+        }
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Timed out waiting for Daytona sandbox ${current.id} to start (state=${state})`,
+        );
+      }
+      await sleep(ATTACH_POLL_INTERVAL_MS);
+      current = await this.client.get(current.id);
+      this.sandbox = current;
     }
-    this.isWarmFlag = isWarm;
   }
 
   protected async provision(): Promise<void> {
     const existing = await this.findMatchingSandbox();
     if (existing) {
       this.sandbox = existing;
-      const isWarm = existing.state === "started";
-      await existing.start();
-      this.isWarmFlag = isWarm;
+      this.isWarmFlag = existing.state === "started";
+      await this.ensureStarted(existing);
       return;
     }
 

@@ -749,6 +749,27 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
    * match what we'd produce, we skip the artifact upload AND the daemon
    * boot entirely.
    */
+  /**
+   * Explicit, developer-invoked teardown of the in-sandbox claude-code
+   * relay daemon (see {@link AgentProviderAdapter.killServer}). agentbox
+   * never calls this on its own. Best-effort and idempotent: a no-op when
+   * the daemon isn't running or no sandbox is configured. After it returns
+   * the next `setup()` re-spawns the daemon (its `/__version` probe fails).
+   */
+  async killServer(request: AgentSetupRequest<"claude-code">): Promise<void> {
+    const sandbox = request.options.sandbox;
+    if (!sandbox) return;
+    await sandbox
+      .run(
+        [
+          `if [ -f ${shellQuote(DAEMON_PID_PATH)} ]; then kill -TERM "$(cat ${shellQuote(DAEMON_PID_PATH)})" 2>/dev/null || true; rm -f ${shellQuote(DAEMON_PID_PATH)}; fi`,
+          `fuser -k -n tcp ${DAEMON_PORT} 2>/dev/null || true`,
+        ].join("; "),
+        { cwd: request.options.cwd, timeoutMs: 10_000 },
+      )
+      .catch(() => undefined);
+  }
+
   async setup(request: AgentSetupRequest<"claude-code">): Promise<void> {
     await time(debugClaude, "claude-code setup()", async () => {
       const options = request.options;

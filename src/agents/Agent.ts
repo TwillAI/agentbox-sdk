@@ -538,6 +538,33 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
     }
   }
 
+  /**
+   * Stop the long-lived provider CLI server booted by {@link Agent.setup}
+   * (claude-code relay daemon, codex app-server, opencode `serve`).
+   *
+   * agentbox NEVER kills a running server on its own — not on run
+   * completion, not on `abort()`, and not when {@link Agent.setup} detects
+   * a changed config/credential set. This method is the single, explicit,
+   * developer-driven teardown. Call it to free a server's resources, or to
+   * apply a changed config: after `killServer()` the next {@link setup}
+   * cold-starts a fresh server with the new configuration.
+   *
+   * Best-effort and idempotent: a no-op when no server is running, or when
+   * the provider has no shared server for the current mode (host-mode
+   * claude-code runs the SDK in-process; local codex spawns a fresh
+   * app-server per run, torn down with the run).
+   */
+  async killServer(): Promise<void> {
+    debugAgent("killServer() provider=%s", this.provider);
+    await this.adapter.killServer({
+      provider: this.provider,
+      options: this.options,
+    });
+    // Drop the cached setup so the next setup()/stream() re-runs against a
+    // fresh server instead of short-circuiting on the now-dead one.
+    this.setupPromise = undefined;
+  }
+
   stream(runConfig: AgentRunConfig): AgentRun {
     if (runConfig.resumeSessionId && runConfig.forkSessionId) {
       throw new Error(

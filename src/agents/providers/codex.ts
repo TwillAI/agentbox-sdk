@@ -1222,9 +1222,45 @@ async function buildCodexInputItems(
   return inputItems;
 }
 
+/**
+ * Explicit, developer-invoked teardown of the shared codex app-server
+ * (see {@link AgentProviderAdapter.killServer}). agentbox never calls this
+ * automatically. No-op in local mode, where codex spawns a fresh
+ * `app-server` per run (its lifecycle is tied to the run, not shared).
+ */
+async function killCodexAppServer(
+  request: AgentSetupRequest<"codex">,
+): Promise<void> {
+  const { options } = request;
+  const sandbox = options.sandbox;
+  if (!sandbox) return;
+  const sharedTarget = await createSetupTarget(
+    request.provider,
+    REMOTE_CODEX_APP_SERVER_ID,
+    options,
+  );
+  const pidFilePath = path.posix.join(
+    sharedTarget.layout.rootDir,
+    "codex-app-server.pid",
+  );
+  await sandbox
+    .run(
+      [
+        `if [ -f ${shellQuote(pidFilePath)} ]; then kill "$(cat ${shellQuote(pidFilePath)})" 2>/dev/null || true; rm -f ${shellQuote(pidFilePath)}; fi`,
+        `fuser -k -n tcp ${REMOTE_CODEX_APP_SERVER_PORT} 2>/dev/null || true`,
+      ].join("; "),
+      { cwd: options.cwd, timeoutMs: 10_000 },
+    )
+    .catch(() => undefined);
+}
+
 export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
   async setup(request: AgentSetupRequest<"codex">): Promise<void> {
     await setupCodex(request);
+  }
+
+  async killServer(request: AgentSetupRequest<"codex">): Promise<void> {
+    await killCodexAppServer(request);
   }
 
   async execute(

@@ -455,6 +455,22 @@ async function ensureSandboxOpenCodeServer(
       return;
     }
 
+    // Preflight missed: either no server is up, or one IS up but the
+    // desired config/credentials drifted from what it booted with. We must
+    // NEVER auto-kill a running server to apply that drift — it is shared
+    // across runs (single static port), so restarting it would reset any
+    // concurrent run. Restarts are the developer's explicit call via
+    // `agent.killServer()`. So if a healthy server is already listening,
+    // reuse it untouched; the new config is staged on disk and takes effect
+    // only on the next cold start (after `killServer()`).
+    if (await isSandboxOpenCodeServerHealthy(sandbox, options.cwd, port)) {
+      debugOpencode(
+        "opencode server already running but setup drifted — reusing it " +
+          "without restart; call agent.killServer() to apply the new config",
+      );
+      return;
+    }
+
     const commonEnv = {
       OPENCODE_CONFIG: configPath,
       OPENCODE_CONFIG_DIR: target.layout.opencodeDir,
@@ -510,15 +526,13 @@ async function ensureSandboxOpenCodeServer(
       ].join(" ")})`,
     ].join(" && ");
 
-    // Reaching here means setup drifted (config, skills, plugins, or
-    // `options.env`/credentials changed) or no server is up yet. If a stale
-    // server is still listening on the port it would (a) keep serving with
-    // the old env/config and (b) make the readiness probe below a false
-    // positive, so stop it first and wait for the port to free. When nothing
-    // is running this is a cheap no-op. NB: this restarts the *shared* server,
-    // so a concurrent run pinned to the same sandbox port would be reset — an
-    // inherent property of the single-port design, fine for the sequential
-    // "next command" case this guards against.
+    // Reaching here means NO healthy server is up (the health check above
+    // returned early when one was) — this is a genuine cold start. The kill
+    // in the relaunch loop below therefore only ever reaps a dead/wedged
+    // process or one we ourselves spawned this call that then crashed; it
+    // never tears down a healthy server serving a concurrent run. Stopping a
+    // stale/dying process first also keeps the readiness probe from getting a
+    // false positive against it.
     // Launch `opencode serve` and wait for readiness, RELAUNCHING if the
     // server process dies before it starts listening.
     //
@@ -723,16 +737,27 @@ async function ensureLocalOpenCodeServer(
     debugOpencode("local opencode server up-to-date — reusing");
     return;
   }
-  debugOpencode("local opencode server drifted/absent — (re)spawning");
+
+  // Preflight missed: either no server is up, or one IS up but the desired
+  // config/credentials drifted. We never auto-kill a running server to apply
+  // that drift (it is shared across runs on a static port); restarts are the
+  // developer's explicit call via `agent.killServer()`. Reuse a healthy
+  // server untouched — the staged config takes effect on the next cold start.
+  if (await isLocalOpenCodeServerHealthy()) {
+    debugOpencode(
+      "local opencode server already running but setup drifted — reusing it " +
+        "without restart; call agent.killServer() to apply the new config",
+    );
+    return;
+  }
+  debugOpencode("local opencode server absent — spawning");
 
   await applyDifferentialSetup(target, allArtifacts, installCommands);
 
-  // Stop any stale server still bound to the port (drift: its env/config no
-  // longer matches) so the spawn below binds fresh and its readiness probe
-  // can't get a false positive from the old process. No-op when nothing is
-  // running. NB: this restarts the *shared* host server — a concurrent run
-  // on the same port would be reset, an inherent property of the single-port
-  // design, fine for the sequential "next command" case this guards against.
+  // No healthy server is up (the health check above returned early when one
+  // was), so this is a genuine cold start. Reap any stale/dead process still
+  // bound to the port so the spawn below binds fresh and its readiness probe
+  // can't get a false positive from a dying one. No-op when nothing is there.
   await killLocalOpenCodeServer();
 
   spawnCommand({
@@ -772,6 +797,70 @@ async function setupOpenCode(
 }
 
 /**
+ * Is an opencode server already answering `/global/health` on `port`
+ * inside the sandbox? Used by setup() to decide between reusing a live
+ * server (the no-auto-kill path) and cold-starting one — never to decide
+ * whether to kill a healthy server.
+ */
+async function isSandboxOpenCodeServerHealthy(
+  sandbox: NonNullable<AgentOptions<"open-code">["sandbox"]>,
+  cwd: string | undefined,
+  port: number,
+): Promise<boolean> {
+  const probe = await sandbox
+    .run(
+      `curl -fsS --max-time 2 http://127.0.0.1:${port}/global/health >/dev/null 2>&1`,
+      { cwd, timeoutMs: 5_000 },
+    )
+    .catch(() => undefined);
+  return probe?.exitCode === 0;
+}
+
+/** Host-side counterpart of {@link isSandboxOpenCodeServerHealthy}. */
+async function isLocalOpenCodeServerHealthy(): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `http://127.0.0.1:${LOCAL_OPENCODE_PORT}/global/health`,
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Explicit, developer-invoked teardown of the opencode server (see
+ * {@link AgentProviderAdapter.killServer}). agentbox never calls this
+ * automatically. After it returns, the next `setup()` cold-starts a fresh
+ * server (the health probe in `preflightSetup` fails, so the warm-path
+ * marker no longer short-circuits).
+ */
+async function killOpenCodeServer(
+  request: AgentSetupRequest<"open-code">,
+): Promise<void> {
+  const { options } = request;
+  if (options.sandbox) {
+    const target = await createSetupTarget(
+      request.provider,
+      SHARED_OPENCODE_TARGET_ID,
+      options,
+    );
+    const pidFilePath = path.posix.join(
+      target.layout.rootDir,
+      "opencode-serve.pid",
+    );
+    await killSandboxOpenCodeServer(
+      options.sandbox,
+      pidFilePath,
+      options.cwd,
+      SANDBOX_OPENCODE_PORT,
+    );
+    return;
+  }
+  await killLocalOpenCodeServer();
+}
+
+/**
  * Build the per-call runtime handle. Pure deterministic computation in
  * the local case; one cheap `sandbox.getPreviewLink` (cached inside the
  * provider adapter) in the sandbox case. Assumes the corresponding
@@ -803,6 +892,10 @@ async function buildOpenCodeRuntime(
 export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
   async setup(request: AgentSetupRequest<"open-code">): Promise<void> {
     await setupOpenCode(request);
+  }
+
+  async killServer(request: AgentSetupRequest<"open-code">): Promise<void> {
+    await killOpenCodeServer(request);
   }
 
   async execute(
