@@ -95,6 +95,19 @@ export function buildClaudeHookSettings(
   return { hooks };
 }
 
+/**
+ * Settings keys that enable "ultracode" / dynamic workflows for a claude-code
+ * run (`enableWorkflows` makes the Workflow tool available; `ultracode` turns
+ * on standing xhigh-effort orchestration). Written into the agentbox-managed
+ * `settings.json`. Returns an empty object when ultracode is off so callers can
+ * spread it unconditionally.
+ */
+export function buildClaudeWorkflowSettings(
+  ultracode: boolean | undefined,
+): Record<string, unknown> {
+  return ultracode ? { enableWorkflows: true, ultracode: true } : {};
+}
+
 export function buildCodexHooksFile(
   hooks: CodexHooksConfig | undefined,
 ): Record<string, unknown> | undefined {

@@ -164,6 +164,18 @@ export interface ClaudeCodeProviderOptions {
    * silence them when hook noise drowns out the rest of the event stream.
    */
   includeHookEvents?: boolean;
+  /**
+   * Enable "ultracode" for claude-code runs: xhigh reasoning effort plus
+   * standing dynamic-workflow orchestration (the built-in `Workflow` tool).
+   *
+   * When `true`, agentbox writes `enableWorkflows: true` + `ultracode: true`
+   * into the managed `settings.json` and forces `effort: "xhigh"` on the query.
+   *
+   * Requires an xhigh-capable model (e.g. Opus) and a recent runtime — the
+   * Workflows feature shipped around Claude Code 2.1.154 / Agent SDK 0.3.149.
+   * On older CLIs the settings keys are simply ignored.
+   */
+  ultracode?: boolean;
 }
 
 export interface CodexAgentOptions extends AgentOptionsBase {

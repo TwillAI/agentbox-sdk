@@ -23,6 +23,7 @@ import {
   type AgentExecutionRequest,
   type AgentOptions,
   type AgentProviderAdapter,
+  type AgentReasoningEffort,
   type AgentRunSink,
   type AgentSetupRequest,
   type UserContent,
@@ -33,7 +34,11 @@ import {
   assertCommandsSupported,
   buildClaudeCommandArtifacts,
 } from "../config/commands";
-import { buildClaudeHookSettings, assertHooksSupported } from "../config/hooks";
+import {
+  buildClaudeHookSettings,
+  buildClaudeWorkflowSettings,
+  assertHooksSupported,
+} from "../config/hooks";
 import { buildClaudeMcpConfig } from "../config/mcp";
 import { agentboxRoot, createSetupTarget } from "../config/setup";
 import { activateRtk } from "../config/rtk";
@@ -45,6 +50,10 @@ import {
 } from "../config/setup-manifest";
 import { prepareSkillArtifacts } from "../config/skills";
 import { buildClaudeSubagentArtifacts } from "../config/subagents";
+import {
+  resolveCapabilityToken,
+  withBearerToken,
+} from "../config/capability-token";
 import { extractClaudeCostData } from "../cost";
 import { debugClaude, debugRelay, time } from "../../shared/debug";
 import type { Sandbox } from "../../sandboxes";
@@ -54,11 +63,21 @@ import type { Sandbox } from "../../sandboxes";
  * surface changes; the host probes `GET /__version` and respawns the
  * daemon on mismatch so warm sandboxes pick up the new code.
  */
-const DAEMON_PROTOCOL_VERSION = "2";
+//
+// Bumped 2 -> 3: the daemon now requires an `Authorization: Bearer <token>`
+// capability token on every route except `/__version`. The version bump
+// forces warm (unauthenticated) daemons on existing sandboxes to respawn
+// with the auth-enabled build.
+const DAEMON_PROTOCOL_VERSION = "3";
 const DAEMON_PORT = 43180;
 const DAEMON_PATH = "/tmp/agentbox/claude-code/daemon.mjs";
 const DAEMON_LOG_PATH = "/tmp/agentbox/claude-code/daemon.log";
 const DAEMON_PID_PATH = "/tmp/agentbox/claude-code/daemon.pid";
+// Per-sandbox capability token guarding the daemon. Minted at setup, written
+// 0600, and loaded by the daemon at boot (argv[3]); the host reads the same
+// file to send the bearer. Co-located with the daemon so the version-bump
+// respawn refreshes both together.
+const DAEMON_TOKEN_PATH = "/tmp/agentbox/claude-code/daemon-token";
 
 // How long to wait for a freshly-spawned daemon to start listening before
 // giving up, and how often to re-probe. Only paid on a cold launch — the warm
@@ -112,6 +131,13 @@ export function buildClaudeQueryOptions(params: {
 
   const includeHookEvents = provider?.includeHookEvents ?? false;
 
+  // Ultracode requires xhigh effort (plus an xhigh-capable model). Force it
+  // here so callers only have to flip the single `ultracode` flag; the CLI
+  // silently downgrades if the selected model can't do xhigh.
+  const effort: AgentReasoningEffort | undefined = provider?.ultracode
+    ? "xhigh"
+    : run.reasoning;
+
   return {
     cwd: params.cwd ?? params.request.options.cwd,
     env: params.env,
@@ -126,7 +152,7 @@ export function buildClaudeQueryOptions(params: {
       ? { additionalDirectories: provider.additionalDirectories }
       : {}),
     ...(run.model ? { model: run.model } : {}),
-    ...(run.reasoning ? { effort: run.reasoning } : {}),
+    ...(effort ? { effort } : {}),
     ...(provider?.permissionMode
       ? { permissionMode: provider.permissionMode as PermissionMode }
       : {}),
@@ -228,11 +254,30 @@ function createClaudeCodeDaemonScript(): string {
   const version = JSON.stringify(DAEMON_PROTOCOL_VERSION);
   return `import http from "node:http";
 import { execSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { timingSafeEqual } from "node:crypto";
 import { query, getSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 
 const VERSION = ${version};
 const port = Number(process.argv[2] ?? "${DAEMON_PORT}");
+// Capability token: every route except the loopback /__version probe
+// requires \`Authorization: Bearer <token>\`. Loaded once at boot from the
+// 0600 file the host writes alongside this script. Fails closed (rejects
+// all run-control requests) when the file is missing or empty.
+const tokenFilePath = process.argv[3] ?? "";
+let AUTH_TOKEN = "";
+try { if (tokenFilePath) AUTH_TOKEN = readFileSync(tokenFilePath, "utf8").trim(); } catch {}
+
+function isAuthorized(req) {
+  if (!AUTH_TOKEN) return false;
+  const header = req.headers["authorization"] || "";
+  const presented = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (!presented) return false;
+  const a = Buffer.from(presented);
+  const b = Buffer.from(AUTH_TOKEN);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 const liveRuns = new Map();
 
 // The SDK's default spawn does \`existsSync(pathToClaudeCodeExecutable)\`
@@ -469,6 +514,14 @@ const server = http.createServer((req, res) => {
     res.end(VERSION);
     return;
   }
+  // Capability-token gate for every run-control route. The /__version probe
+  // above stays open: it carries no secret and the host probes it over
+  // loopback (no bearer) to detect daemon liveness/version.
+  if (!isAuthorized(req)) {
+    res.writeHead(401, { "content-type": "text/plain" });
+    res.end("unauthorized");
+    return;
+  }
   const url = req.url ?? "";
   let m;
   if (req.method === "POST" && (m = url.match(/^\\/runs\\/([^/]+)\\/start$/))) {
@@ -569,6 +622,15 @@ async function ensureClaudeCodeDaemonUncached(
     // (rather than via a separate `sandbox.run`) to save a round-trip
     // on remote sandboxes. If the SDK isn't installed, the launch
     // fails with a clear error which `uploadAndRun` surfaces.
+    // Mint (or reuse) the daemon capability token before launch. Written as
+    // a 0600 artifact below and passed to the daemon as argv[3]; the host
+    // reads the same file to send the bearer on every request.
+    const daemonToken = await resolveCapabilityToken(
+      sandbox,
+      DAEMON_TOKEN_PATH,
+      true,
+    );
+
     const daemonDir = path.posix.dirname(DAEMON_PATH);
     const daemonNodeModules = `${daemonDir}/node_modules/@anthropic-ai`;
     const launchCommand = [
@@ -576,13 +638,18 @@ async function ensureClaudeCodeDaemonUncached(
       `if [ -z "$NPM_ROOT" ] || [ ! -d "$NPM_ROOT/@anthropic-ai/claude-agent-sdk" ]; then echo "claude-code daemon launch: @anthropic-ai/claude-agent-sdk not found under $NPM_ROOT" >&2; exit 1; fi`,
       `mkdir -p ${shellQuote(daemonNodeModules)}`,
       `ln -sfn "$NPM_ROOT/@anthropic-ai/claude-agent-sdk" ${shellQuote(daemonNodeModules + "/claude-agent-sdk")}`,
+      // The base uploadAndRun only chmods execute-bit artifacts, so the 0600
+      // tarball mode is dropped on Daytona (and other non-Modal providers).
+      // Tighten the just-written token file explicitly — matching codex —
+      // so the bearer is never group/world-readable inside the sandbox.
+      `chmod 600 ${shellQuote(DAEMON_TOKEN_PATH)}`,
       `if [ -f ${shellQuote(DAEMON_PID_PATH)} ]; then kill -TERM "$(cat ${shellQuote(DAEMON_PID_PATH)})" 2>/dev/null || true; fi`,
       `(fuser -k -n tcp ${DAEMON_PORT} 2>/dev/null || true)`,
       // Brief grace so the kernel releases the port before the new
       // daemon's listen() — only matters on warm-sandbox respawns;
       // adds 200ms otherwise.
       `sleep 0.2`,
-      `(nohup node ${shellQuote(DAEMON_PATH)} ${DAEMON_PORT} > ${shellQuote(DAEMON_LOG_PATH)} 2>&1 & echo $! > ${shellQuote(DAEMON_PID_PATH)})`,
+      `(nohup node ${shellQuote(DAEMON_PATH)} ${DAEMON_PORT} ${shellQuote(DAEMON_TOKEN_PATH)} > ${shellQuote(DAEMON_LOG_PATH)} 2>&1 & echo $! > ${shellQuote(DAEMON_PID_PATH)})`,
     ].join(" && ");
 
     const launch = await time(
@@ -595,6 +662,11 @@ async function ensureClaudeCodeDaemonUncached(
               path: DAEMON_PATH,
               content: createClaudeCodeDaemonScript(),
               mode: 0o644,
+            },
+            {
+              path: DAEMON_TOKEN_PATH,
+              content: daemonToken,
+              mode: 0o600,
             },
           ],
           launchCommand,
@@ -739,6 +811,20 @@ async function daemonBaseUrl(sandbox: Sandbox): Promise<string> {
   return url.replace(/\/$/, "");
 }
 
+/**
+ * Headers for every host -> daemon request: the sandbox preview headers
+ * (Daytona's private-sandbox token, when set) plus the daemon capability
+ * token as a bearer. Reads the per-sandbox token file (cached); `create:
+ * false` because setup() must have minted and written it first — a missing
+ * file means setup never ran against this sandbox.
+ */
+async function daemonAuthHeaders(
+  sandbox: Sandbox,
+): Promise<Record<string, string>> {
+  const token = await resolveCapabilityToken(sandbox, DAEMON_TOKEN_PATH, false);
+  return withBearerToken(sandbox.previewHeaders, token);
+}
+
 export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code"> {
   /**
    * Sandbox-side preparation. Uploads `.claude/` artifacts and ensures
@@ -797,7 +883,14 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         () => prepareSkillArtifacts(provider, options.skills, target.layout),
       );
 
+      // Add the ultracode/workflow settings keys. Gated on the claude-code
+      // provider option and folded into the setup hash, so toggling ultracode
+      // re-runs setup with the new settings.json.
       const hookSettings = buildClaudeHookSettings(hooks) ?? {};
+      const workflowSettings = buildClaudeWorkflowSettings(
+        options.provider?.ultracode,
+      );
+      const claudeSettings = { ...hookSettings, ...workflowSettings };
       const mcpConfigJson =
         buildClaudeMcpConfig(options.mcps) ??
         JSON.stringify({ mcpServers: {} }, null, 2);
@@ -806,7 +899,10 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         ...skillArtifacts,
         ...buildClaudeCommandArtifacts(options.commands, target.layout),
         ...buildClaudeSubagentArtifacts(options.subAgents, target.layout),
-        { path: settingsPath, content: JSON.stringify(hookSettings, null, 2) },
+        {
+          path: settingsPath,
+          content: JSON.stringify(claudeSettings, null, 2),
+        },
         { path: mcpConfigPath, content: mcpConfigJson },
       ];
 
@@ -890,6 +986,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     const baseUrl = await time(debugClaude, "getPreviewLink daemon", () =>
       daemonBaseUrl(sandbox),
     );
+    const authHeaders = await daemonAuthHeaders(sandbox);
     const startUrl = `${baseUrl}/runs/${encodeURIComponent(request.runId)}/start`;
 
     const sdkOptions = buildClaudeQueryOptions({
@@ -926,7 +1023,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       try {
         await fetch(
           `${baseUrl}/runs/${encodeURIComponent(request.runId)}/abort`,
-          { method: "POST", headers: sandbox.previewHeaders },
+          { method: "POST", headers: authHeaders },
         );
       } catch {
         // ignore — abort is best-effort
@@ -945,7 +1042,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
           method: "POST",
           headers: {
             "content-type": "application/json",
-            ...sandbox.previewHeaders,
+            ...authHeaders,
           },
           body: JSON.stringify({ content: mapped }),
         },
@@ -959,7 +1056,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         signal: fetchAbort.signal,
         headers: {
           "content-type": "application/json",
-          ...sandbox.previewHeaders,
+          ...authHeaders,
         },
         body: JSON.stringify(requestBody),
       }),
@@ -1249,6 +1346,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
    */
   async attachAbort(request: AgentAttachRequest<"claude-code">): Promise<void> {
     const baseUrl = await daemonBaseUrl(request.sandbox);
+    const authHeaders = await daemonAuthHeaders(request.sandbox);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 3_000);
     try {
@@ -1257,7 +1355,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         {
           method: "POST",
           signal: controller.signal,
-          headers: request.sandbox.previewHeaders,
+          headers: authHeaders,
         },
       ).catch((error) => {
         debugClaude("attachAbort POST failed: %o", error);
@@ -1278,6 +1376,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     content: UserContent,
   ): Promise<void> {
     const baseUrl = await daemonBaseUrl(request.sandbox);
+    const authHeaders = await daemonAuthHeaders(request.sandbox);
     const inputParts = await validateProviderUserInput(
       AgentProvider.ClaudeCode,
       content,
@@ -1289,7 +1388,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         method: "POST",
         headers: {
           "content-type": "application/json",
-          ...request.sandbox.previewHeaders,
+          ...authHeaders,
         },
         body: JSON.stringify({ content: mapped }),
       },

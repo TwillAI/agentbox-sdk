@@ -68,6 +68,14 @@ export interface PreflightDaemon {
   port: number;
   healthPath: string;
   expectedVersionMatch?: string;
+  /**
+   * Extra curl args (a raw, already-quoted shell fragment) injected before
+   * the URL in the liveness probe — e.g. `-u "user:$(cat <tokenfile>)"` when
+   * the health route is behind auth (opencode). Deliberately NOT folded into
+   * {@link computeSetupId}: it's a probe credential, not a setup input, so it
+   * must never invalidate existing `setup.id` markers.
+   */
+  curlAuthArg?: string;
 }
 
 function hashArtifact(artifact: TextArtifact): string {
@@ -163,13 +171,14 @@ export async function preflightSetup(
       ];
       if (daemon) {
         const url = `http://127.0.0.1:${daemon.port}${daemon.healthPath}`;
+        const auth = daemon.curlAuthArg ? `${daemon.curlAuthArg} ` : "";
         if (daemon.expectedVersionMatch) {
           checks.push(
-            `curl -fsS --max-time 2 ${shellQuote(url)} 2>/dev/null | grep -q ${shellQuote(daemon.expectedVersionMatch)}`,
+            `curl -fsS --max-time 2 ${auth}${shellQuote(url)} 2>/dev/null | grep -q ${shellQuote(daemon.expectedVersionMatch)}`,
           );
         } else {
           checks.push(
-            `curl -fsS --max-time 2 ${shellQuote(url)} >/dev/null 2>&1`,
+            `curl -fsS --max-time 2 ${auth}${shellQuote(url)} >/dev/null 2>&1`,
           );
         }
       }
