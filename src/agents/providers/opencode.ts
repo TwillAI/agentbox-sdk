@@ -32,7 +32,8 @@ import {
   buildOpenCodePluginArtifacts,
 } from "../config/hooks";
 import { buildOpenCodeMcpConfig } from "../config/mcp";
-import { createSetupTarget } from "../config/setup";
+import { agentboxRoot, createSetupTarget } from "../config/setup";
+import { resolveCapabilityToken } from "../config/capability-token";
 import { activateRtk } from "../config/rtk";
 import { prepareSkillArtifacts } from "../config/skills";
 import {
@@ -70,6 +71,85 @@ const LOCAL_OPENCODE_PORT = 4096;
 const SANDBOX_OPENCODE_READY_TIMEOUT_MS = 90_000;
 const LOCAL_OPENCODE_READY_TIMEOUT_MS = 20_000;
 const SHARED_OPENCODE_TARGET_ID = "shared-opencode-server";
+
+// Daytona sandboxes stay `public: true` (the user-facing app preview must be
+// publicly reachable), so the opencode server port is publicly reachable too.
+// We close that hole with opencode's native HTTP basic auth: a per-sandbox
+// capability token is set as OPENCODE_SERVER_PASSWORD at launch and presented
+// by the host on every request. Username defaults to `opencode`.
+const OPENCODE_AUTH_USERNAME = "opencode";
+
+/**
+ * Stable path (under the opencode agentbox root) of the capability token file.
+ * setup() writes it, the host reads it to build the basic-auth header, and the
+ * in-sandbox health probes read it to authenticate — all must resolve the same
+ * path. Matches the target's `layout.rootDir` (see `agentboxRoot`).
+ */
+function opencodeServerTokenPath(): string {
+  return path.posix.join(
+    agentboxRoot(AgentProvider.OpenCode, true),
+    "opencode-auth-token",
+  );
+}
+
+/**
+ * Raw, already-quoted curl auth fragment: opencode's HTTP basic-auth password
+ * is the capability token, read from the 0600 file inside the sandbox at probe
+ * time. Reused by the loopback health probe and the warm-path preflight probe.
+ */
+function opencodeCurlAuthArg(): string {
+  return `-u "opencode:$(cat ${shellQuote(opencodeServerTokenPath())} 2>/dev/null)"`;
+}
+
+/**
+ * Authenticated loopback health probe. Once OPENCODE_SERVER_PASSWORD is set,
+ * opencode gates `/global/health` behind basic auth, so the probe presents the
+ * token as the password; otherwise a healthy server answers 401 and `curl -f`
+ * would report it as down.
+ */
+function opencodeHealthCurl(port: number): string {
+  return `curl -fsS --max-time 2 ${opencodeCurlAuthArg()} http://127.0.0.1:${port}/global/health >/dev/null 2>&1`;
+}
+
+/**
+ * Does the in-sandbox opencode server actually ENFORCE the capability token?
+ * An unauthenticated probe must be rejected with 401; a 200 means the running
+ * binary ignored OPENCODE_SERVER_PASSWORD (too old) and the public port is
+ * wide open. Used to gate warm reuse and as a fail-closed launch assertion.
+ */
+async function isSandboxOpenCodeServerAuthEnforced(
+  sandbox: NonNullable<AgentOptions<"open-code">["sandbox"]>,
+  cwd: string | undefined,
+  port: number,
+): Promise<boolean> {
+  const probe = await sandbox
+    .run(
+      `test "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:${port}/global/health)" = "401"`,
+      { cwd, timeoutMs: 5_000 },
+    )
+    .catch(() => undefined);
+  return probe?.exitCode === 0;
+}
+
+/**
+ * Host -> server headers: the sandbox preview headers (Daytona private-sandbox
+ * token, when set) plus opencode's basic-auth credential built from the
+ * per-sandbox capability token. `create: false` — setup() must have minted and
+ * written the token first.
+ */
+async function opencodeAuthHeaders(
+  sandbox: NonNullable<AgentOptions<"open-code">["sandbox"]>,
+): Promise<Record<string, string>> {
+  const token = await resolveCapabilityToken(
+    sandbox,
+    opencodeServerTokenPath(),
+    false,
+  );
+  const basic = Buffer.from(`${OPENCODE_AUTH_USERNAME}:${token}`).toString(
+    "base64",
+  );
+  return { ...sandbox.previewHeaders, Authorization: `Basic ${basic}` };
+}
 
 /**
  * LLM provider API keys opencode reads from its process env. These are
@@ -166,10 +246,10 @@ async function killSandboxOpenCodeServer(
       .catch(() => undefined);
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
-      const probe = await sandbox.run(
-        `curl -fsS --max-time 2 http://127.0.0.1:${port}/global/health >/dev/null 2>&1`,
-        { cwd, timeoutMs: 5_000 },
-      );
+      const probe = await sandbox.run(opencodeHealthCurl(port), {
+        cwd,
+        timeoutMs: 5_000,
+      });
       if (probe.exitCode !== 0) {
         return;
       }
@@ -417,6 +497,16 @@ async function ensureSandboxOpenCodeServer(
       options,
     );
 
+    // Mint (or reuse) the capability token before building artifacts. Written
+    // 0600 below and set as OPENCODE_SERVER_PASSWORD at launch; the host reads
+    // the same file to authenticate every request.
+    const serverTokenPath = opencodeServerTokenPath();
+    const serverToken = await resolveCapabilityToken(
+      sandbox,
+      serverTokenPath,
+      true,
+    );
+
     const { artifacts: skillArtifacts, installCommands } =
       await prepareSkillArtifacts(
         request.provider,
@@ -437,10 +527,22 @@ async function ensureSandboxOpenCodeServer(
         path: configPath,
         content: JSON.stringify(openCodeConfig, null, 2),
       },
+      {
+        path: serverTokenPath,
+        content: serverToken,
+      },
     ];
 
     const enableRtk = options.enableRtk === true;
-    const daemonInfo = { port, healthPath: "/global/health" };
+    // curlAuthArg lets the warm-path preflight probe authenticate against the
+    // now password-gated /global/health; without it the probe always 401s and
+    // the cheap short-circuit never fires. It is intentionally excluded from
+    // computeSetupId (see PreflightDaemon) so it can't invalidate markers.
+    const daemonInfo = {
+      port,
+      healthPath: "/global/health",
+      curlAuthArg: opencodeCurlAuthArg(),
+    };
     const setupId = computeSetupId({
       artifacts: allArtifacts,
       installCommands,
@@ -464,11 +566,25 @@ async function ensureSandboxOpenCodeServer(
     // reuse it untouched; the new config is staged on disk and takes effect
     // only on the next cold start (after `killServer()`).
     if (await isSandboxOpenCodeServerHealthy(sandbox, options.cwd, port)) {
+      if (
+        await isSandboxOpenCodeServerAuthEnforced(sandbox, options.cwd, port)
+      ) {
+        debugOpencode(
+          "opencode server already running but setup drifted — reusing it " +
+            "without restart; call agent.killServer() to apply the new config",
+        );
+        return;
+      }
+      // Healthy but NOT enforcing the capability token — a server from before
+      // auth was introduced (or a build that ignores OPENCODE_SERVER_PASSWORD).
+      // This is the one case we DO auto-restart a running server: an
+      // unauthenticated, publicly-reachable opencode port is exactly the
+      // vulnerability we're closing, so security overrides the no-auto-kill
+      // rule. Fall through to the cold path, which kills it and relaunches
+      // with the password env.
       debugOpencode(
-        "opencode server already running but setup drifted — reusing it " +
-          "without restart; call agent.killServer() to apply the new config",
+        "opencode server running without capability auth — restarting to enforce it",
       );
-      return;
     }
 
     const commonEnv = {
@@ -494,7 +610,15 @@ async function ensureSandboxOpenCodeServer(
       target.layout.rootDir,
       "opencode-serve.log",
     );
-    const serveEnv = { ...(options.env ?? {}), ...commonEnv };
+    const serveEnv = {
+      ...(options.env ?? {}),
+      ...commonEnv,
+      // Native opencode HTTP basic auth. The host presents this token on
+      // every request (see opencodeAuthHeaders); the in-sandbox health probes
+      // present it too (see opencodeHealthCurl).
+      OPENCODE_SERVER_USERNAME: OPENCODE_AUTH_USERNAME,
+      OPENCODE_SERVER_PASSWORD: serverToken,
+    };
     // Detach the daemon fully from the spawning shell:
     //   - `setsid` puts opencode in its own session + process group so the
     //     sandbox doesn't kill it when our wrapper shell exits.
@@ -509,6 +633,7 @@ async function ensureSandboxOpenCodeServer(
     // marked as "running" for the entire ready timeout.
     const launchCommand = [
       `mkdir -p ${shellQuote(target.layout.rootDir)}`,
+      `chmod 600 ${shellQuote(serverTokenPath)} 2>/dev/null || true`,
       `(${[
         `setsid nohup ${[
           binary,
@@ -592,10 +717,10 @@ async function ensureSandboxOpenCodeServer(
           }
 
           while (Date.now() < readyDeadline) {
-            const probe = await sandbox.run(
-              `curl -fsS http://127.0.0.1:${port}/global/health >/dev/null 2>&1`,
-              { cwd: options.cwd, timeoutMs: 5_000 },
-            );
+            const probe = await sandbox.run(opencodeHealthCurl(port), {
+              cwd: options.cwd,
+              timeoutMs: 5_000,
+            });
             if (probe.exitCode === 0) {
               debugOpencode("ready on attempt %d", attempt);
               return true;
@@ -652,6 +777,27 @@ async function ensureSandboxOpenCodeServer(
       throw new Error(
         `OpenCode server did not become ready within ${SANDBOX_OPENCODE_READY_TIMEOUT_MS}ms.` +
           (lastLog ? `\nopencode log:\n${lastLog}` : ""),
+      );
+    }
+
+    // Fail closed: the running binary must actually enforce the capability
+    // token. An older opencode silently ignores OPENCODE_SERVER_PASSWORD,
+    // leaving the (publicly reachable) port unauthenticated — refuse to
+    // proceed rather than ship an open server.
+    if (
+      !(await isSandboxOpenCodeServerAuthEnforced(sandbox, options.cwd, port))
+    ) {
+      await killSandboxOpenCodeServer(
+        sandbox,
+        pidFilePath,
+        options.cwd,
+        port,
+      ).catch(() => undefined);
+      await target.cleanup().catch(() => undefined);
+      throw new Error(
+        "OpenCode server started but is not enforcing the capability token " +
+          "(OPENCODE_SERVER_PASSWORD ignored). Upgrade opencode-ai to a " +
+          "version that supports server authentication.",
       );
     }
 
@@ -808,10 +954,7 @@ async function isSandboxOpenCodeServerHealthy(
   port: number,
 ): Promise<boolean> {
   const probe = await sandbox
-    .run(
-      `curl -fsS --max-time 2 http://127.0.0.1:${port}/global/health >/dev/null 2>&1`,
-      { cwd, timeoutMs: 5_000 },
-    )
+    .run(opencodeHealthCurl(port), { cwd, timeoutMs: 5_000 })
     .catch(() => undefined);
   return probe?.exitCode === 0;
 }
@@ -876,7 +1019,7 @@ async function buildOpenCodeRuntime(
     ).replace(/\/$/, "");
     return {
       baseUrl,
-      previewHeaders: sandbox.previewHeaders,
+      previewHeaders: await opencodeAuthHeaders(sandbox),
       raw: { baseUrl, port: SANDBOX_OPENCODE_PORT },
     };
   }
@@ -1708,6 +1851,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
     const baseUrl = (
       await request.sandbox.getPreviewLink(SANDBOX_OPENCODE_PORT)
     ).replace(/\/$/, "");
+    const authHeaders = await opencodeAuthHeaders(request.sandbox);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 3_000);
     try {
@@ -1716,7 +1860,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
         signal: controller.signal,
         headers: {
           "content-type": "application/json",
-          ...request.sandbox.previewHeaders,
+          ...authHeaders,
         },
       }).catch((error) => {
         debugOpencode(
@@ -1753,12 +1897,13 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
       content,
     );
     const parts = mapToOpenCodeParts(inputParts);
+    const authHeaders = await opencodeAuthHeaders(request.sandbox);
     const url = `${baseUrl}/session/${request.sessionId}/prompt_async`;
     const response = await fetch(url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        ...request.sandbox.previewHeaders,
+        ...authHeaders,
       },
       body: JSON.stringify({
         agent: openCodeAgentSlug(undefined),

@@ -30,10 +30,7 @@ async function startFakeOpenCodeServer(): Promise<FakeOpenCodeServer> {
   const eventClients: Array<NodeJS.WritableStream & { end?: () => void }> = [];
   const queuedFrames: SseFrame[] = [];
 
-  const writeFrame = (
-    res: NodeJS.WritableStream,
-    frame: SseFrame,
-  ): void => {
+  const writeFrame = (res: NodeJS.WritableStream, frame: SseFrame): void => {
     const lines: string[] = [];
     if (frame.id !== undefined) lines.push(`id: ${frame.id}`);
     lines.push(`event: ${frame.event}`);
@@ -139,6 +136,15 @@ function makeFakeSandbox(baseUrl: string): Sandbox {
   return {
     getPreviewLink: async () => baseUrl,
     previewHeaders: {} as Record<string, string>,
+    // The opencode adapter reads a per-sandbox capability token off disk to
+    // build the basic-auth header (and writes/probes it during setup). The
+    // fake server doesn't validate the header, so any stable token works here.
+    run: async () => ({
+      exitCode: 0,
+      stdout: "test-capability-token",
+      stderr: "",
+      combinedOutput: "test-capability-token",
+    }),
   } as unknown as Sandbox;
 }
 
