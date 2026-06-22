@@ -1492,7 +1492,16 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       };
       let threadResponse: CodexThreadResponse;
       let threadResultEventName: string;
-      if (request.run.forkSessionId) {
+      // `clearContext` forces a brand-new thread, ignoring any resume/fork
+      // hints, so a follow-up starts from an empty conversation (the sandbox
+      // working directory is untouched).
+      if (request.run.clearContext) {
+        threadResponse = await client.request<CodexThreadResponse>(
+          "thread/start",
+          buildThreadParams(cwd, request.options, request),
+        );
+        threadResultEventName = "thread/start:result";
+      } else if (request.run.forkSessionId) {
         threadResponse = await client.request<CodexThreadResponse>(
           "thread/fork",
           buildForkParams(cwd, request.options, request),
@@ -1521,7 +1530,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
         toRawEvent(request.runId, threadResponse, threadResultEventName),
       );
 
-      if (request.run.forkSessionId) {
+      if (!request.run.clearContext && request.run.forkSessionId) {
         const targetTurnId = request.run.forkAtMessageId;
         const turns = threadResponse.thread.turns ?? [];
         const targetIndex = turns.findIndex((turn) => turn.id === targetTurnId);

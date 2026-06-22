@@ -566,16 +566,25 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
   }
 
   stream(runConfig: AgentRunConfig): AgentRun {
-    if (runConfig.resumeSessionId && runConfig.forkSessionId) {
-      throw new Error(
-        "AgentRunConfig.resumeSessionId and forkSessionId are mutually exclusive.",
-      );
-    }
-    if (runConfig.forkSessionId && !runConfig.forkAtMessageId) {
-      throw new Error("AgentRunConfig.forkSessionId requires forkAtMessageId.");
-    }
-    if (runConfig.forkAtMessageId && !runConfig.forkSessionId) {
-      throw new Error("AgentRunConfig.forkAtMessageId requires forkSessionId.");
+    // `clearContext` forces a fresh session and intentionally overrides any
+    // resume/fork hints (each adapter ignores them when it is set), so the
+    // mutual-exclusivity checks below only apply when it is off.
+    if (!runConfig.clearContext) {
+      if (runConfig.resumeSessionId && runConfig.forkSessionId) {
+        throw new Error(
+          "AgentRunConfig.resumeSessionId and forkSessionId are mutually exclusive.",
+        );
+      }
+      if (runConfig.forkSessionId && !runConfig.forkAtMessageId) {
+        throw new Error(
+          "AgentRunConfig.forkSessionId requires forkAtMessageId.",
+        );
+      }
+      if (runConfig.forkAtMessageId && !runConfig.forkSessionId) {
+        throw new Error(
+          "AgentRunConfig.forkAtMessageId requires forkSessionId.",
+        );
+      }
     }
 
     const runId = runConfig.runId ?? randomUUID();

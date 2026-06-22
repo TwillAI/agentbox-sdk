@@ -162,13 +162,18 @@ export function buildClaudeQueryOptions(params: {
     ...(provider?.allowedTools?.length
       ? { allowedTools: provider.allowedTools }
       : {}),
-    ...(run.resumeSessionId ? { resume: run.resumeSessionId } : {}),
+    // `clearContext` forces a brand-new conversation: skip both resume and
+    // fork so claude starts from an empty transcript (sandbox cwd is
+    // untouched).
+    ...(!run.clearContext && run.resumeSessionId
+      ? { resume: run.resumeSessionId }
+      : {}),
     // Fork-at-message: claude-agent-sdk natively supports slicing a
     // resumed transcript at a message UUID and writing the continuation
     // under a new session id when `forkSession: true` is set. The
     // captured message UUID comes from `SDKAssistantMessage.uuid`,
     // surfaced on normalized `message.started` events.
-    ...(run.forkSessionId
+    ...(!run.clearContext && run.forkSessionId
       ? {
           resume: run.forkSessionId,
           resumeSessionAt: run.forkAtMessageId,
@@ -979,8 +984,13 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     // Pre-mint the session id so callers waiting on `sessionIdReady`
     // unblock immediately and so the value we surface IS the session id
     // claude actually uses (we pass it in via the SDK's `sessionId`
-    // option). When resuming, honor the existing id instead.
-    const presetSessionId = request.run.resumeSessionId ?? randomUUID();
+    // option). When resuming, honor the existing id instead — unless
+    // `clearContext` forces a fresh conversation, in which case we always
+    // mint a new id.
+    const effectiveResumeSessionId = request.run.clearContext
+      ? undefined
+      : request.run.resumeSessionId;
+    const presetSessionId = effectiveResumeSessionId ?? randomUUID();
     sink.setSessionId(presetSessionId);
 
     const baseUrl = await time(debugClaude, "getPreviewLink daemon", () =>
@@ -1010,8 +1020,8 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         ...sdkOptions,
         // `sessionId` and `resume` are mutually exclusive — buildClaudeQueryOptions
         // already set `resume` for the resume path, so only stamp `sessionId` for
-        // fresh runs.
-        ...(request.run.resumeSessionId ? {} : { sessionId: presetSessionId }),
+        // fresh runs (which includes `clearContext` runs).
+        ...(effectiveResumeSessionId ? {} : { sessionId: presetSessionId }),
         autoApproveTools,
       },
     };

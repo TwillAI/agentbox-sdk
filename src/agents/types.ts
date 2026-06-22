@@ -72,6 +72,20 @@ export interface AgentRunConfig {
    * value to feed back here. Required when {@link forkSessionId} is set.
    */
   forkAtMessageId?: string;
+  /**
+   * Start the run in a brand-new conversation, discarding all prior
+   * conversational context for this task while keeping the sandbox working
+   * directory (code, installed deps, env) intact. When `true` this takes
+   * precedence over and ignores {@link resumeSessionId},
+   * {@link forkSessionId} and {@link forkAtMessageId} — the adapter always
+   * creates a fresh provider session/thread.
+   *
+   * Provider mapping:
+   * - claude-code: skip `resume`/`forkSession`, mint a fresh `sessionId`.
+   * - codex: `thread/start` (instead of `thread/resume`/`thread/fork`).
+   * - opencode: `POST /session` (instead of resume/fork).
+   */
+  clearContext?: boolean;
   reasoning?: AgentReasoningEffort;
 }
 

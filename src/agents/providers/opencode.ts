@@ -1195,6 +1195,15 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
 
     try {
       const interactiveApproval = isInteractiveApproval(request.options);
+      // `clearContext` forces a brand-new conversation: ignore any resume/fork
+      // hints so we fall through to `POST /session` for a fresh session. The
+      // sandbox working directory is left untouched.
+      const effectiveResumeSessionId = request.run.clearContext
+        ? undefined
+        : request.run.resumeSessionId;
+      const effectiveForkSessionId = request.run.clearContext
+        ? undefined
+        : request.run.forkSessionId;
       // Three branches around session resolution:
       // 1. resumeSessionId — reuse the session id directly, no HTTP call.
       // 2. forkSessionId   — POST /session/:id/fork { messageID } to slice
@@ -1202,9 +1211,9 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
       //    a new session id.
       // 3. neither         — POST /session to create a fresh session.
       let forkedSession: { id?: string; sessionId?: string } | null = null;
-      if (request.run.forkSessionId) {
+      if (effectiveForkSessionId) {
         forkedSession = await fetchJson<{ id?: string; sessionId?: string }>(
-          `${runtime.baseUrl}/session/${encodeURIComponent(request.run.forkSessionId)}/fork`,
+          `${runtime.baseUrl}/session/${encodeURIComponent(effectiveForkSessionId)}/fork`,
           {
             method: "POST",
             headers: {
@@ -1218,7 +1227,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
         );
       }
       const createdSession =
-        request.run.resumeSessionId || forkedSession
+        effectiveResumeSessionId || forkedSession
           ? null
           : await fetchJson<{ id?: string; sessionId?: string }>(
               `${runtime.baseUrl}/session`,
@@ -1234,7 +1243,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
               },
             );
       const sessionId =
-        request.run.resumeSessionId ??
+        effectiveResumeSessionId ??
         forkedSession?.id ??
         forkedSession?.sessionId ??
         createdSession?.id ??
