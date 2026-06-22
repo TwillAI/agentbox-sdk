@@ -12,6 +12,7 @@ import type {
   AgentSubAgentConfig,
   ClaudeCodeHooksConfig,
   CodexHooksConfig,
+  CodexModelProviderConfig,
   OpenCodePluginConfig,
 } from "./config/types";
 
@@ -110,6 +111,23 @@ export interface AgentOptionsBase {
    * is a no-op when already active. Toggle invalidates the setup cache.
    */
   enableRtk?: boolean;
+  /**
+   * Custom HTTP headers to attach to the agent's outbound LLM API requests.
+   *
+   * Forwarded per provider via whatever native mechanism each CLI exposes:
+   * - claude-code: `ANTHROPIC_CUSTOM_HEADERS` (applies to all Anthropic calls)
+   * - codex: `http_headers` on the active `[model_providers.*]` block in
+   *   config.toml — an `openai` override block is synthesized when codex would
+   *   otherwise fall back to its built-in openai provider (which has no block
+   *   to carry headers)
+   * - open-code: `provider.<id>.options.headers` in the opencode config
+   *
+   * Typical use: spend-tracking / routing tags for an LLM gateway, e.g.
+   * `{ "x-litellm-tags": "task:123" }`. Whether a header actually reaches the
+   * upstream depends on the CLI and provider; open-code's config-level headers
+   * in particular are subject to upstream support.
+   */
+  customHeaders?: Record<string, string>;
   approvalMode?: AgentApprovalMode;
   mcps?: AgentMcpConfig[];
   skills?: AgentSkillConfig[];
@@ -123,6 +141,31 @@ export interface CodexProviderOptions {
   brokerEndpoint?: string;
   useBroker?: boolean;
   hooks?: CodexHooksConfig;
+  /**
+   * Extra OpenAI-compatible model providers, written as
+   * `[model_providers.<id>]` blocks in Codex's config.toml. Lets Codex
+   * talk to OpenRouter, a local Ollama/LM Studio/vLLM server, or any other
+   * OpenAI-compatible endpoint.
+   *
+   * As a convenience that mirrors the opencode provider, an `openrouter`
+   * entry pointing at `https://openrouter.ai/api/v1` (override with
+   * `OPENROUTER_BASE_URL`) with `env_key = "OPENROUTER_API_KEY"` is added
+   * automatically whenever `OPENROUTER_API_KEY` is present in the agent
+   * env — unless you define an `openrouter` entry here yourself.
+   */
+  modelProviders?: Record<string, CodexModelProviderConfig>;
+  /**
+   * Top-level `model_provider` written into Codex's config.toml — selects
+   * which {@link modelProviders} table Codex routes every run through (the
+   * per-run {@link AgentRunConfig.model} stays a plain model slug).
+   *
+   * When omitted, AgentBox auto-selects `"openrouter"` if
+   * `OPENROUTER_API_KEY` is present in the agent env and `OPENAI_API_KEY`
+   * is not — the same "set the key and go" ergonomics the opencode
+   * provider has. Otherwise Codex falls back to its built-in `openai`
+   * provider.
+   */
+  modelProvider?: string;
   /**
    * When `false`, writes `supports_websockets = false` into Codex's
    * config.toml. Useful in environments where outbound WebSocket

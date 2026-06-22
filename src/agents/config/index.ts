@@ -14,6 +14,7 @@ export type {
   CodexHookEvent,
   CodexHookMatcherGroup,
   CodexHooksConfig,
+  CodexModelProviderConfig,
   EmbeddedSkillConfig,
   OpenCodePluginConfig,
   OpenCodePluginEvent,

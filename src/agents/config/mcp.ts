@@ -1,4 +1,4 @@
-import type { AgentMcpConfig } from "./types";
+import type { AgentMcpConfig, CodexModelProviderConfig } from "./types";
 
 const SAFE_TOML_KEY = /^[a-zA-Z0-9_-]+$/;
 
@@ -16,6 +16,66 @@ function tomlString(value: string): string {
 
 function tomlStringArray(values: string[]): string {
   return `[${values.map(tomlString).join(", ")}]`;
+}
+
+/**
+ * Serialize a string map as a TOML inline table with quoted keys, e.g.
+ * `{ "X-Title" = "AgentBox", "api-version" = "2025-04-01" }`. Keys are
+ * quoted so header names / params that aren't bare-key safe (hyphens,
+ * dots) round-trip correctly.
+ */
+function tomlInlineTable(values: Record<string, string>): string {
+  const entries = Object.entries(values).map(
+    ([key, value]) => `${tomlString(key)} = ${tomlString(value)}`,
+  );
+  return `{ ${entries.join(", ")} }`;
+}
+
+/**
+ * Emit a `[model_providers.<id>]` block mirroring codex's
+ * `ModelProviderInfo`. Field names are the snake_case keys codex parses
+ * with `deny_unknown_fields`, so only known fields are written and only
+ * when set. `name` is required by codex, so it falls back to the id.
+ */
+function appendCodexModelProviderBlock(
+  blocks: string[],
+  id: string,
+  cfg: CodexModelProviderConfig,
+): void {
+  assertSafeTomlKey(id, "Model provider");
+
+  blocks.push(`[model_providers.${id}]`);
+  blocks.push(`name = ${tomlString(cfg.name ?? id)}`);
+  if (cfg.baseUrl) {
+    blocks.push(`base_url = ${tomlString(cfg.baseUrl)}`);
+  }
+  if (cfg.envKey) {
+    blocks.push(`env_key = ${tomlString(cfg.envKey)}`);
+  }
+  if (cfg.wireApi) {
+    blocks.push(`wire_api = ${tomlString(cfg.wireApi)}`);
+  }
+  if (cfg.queryParams && Object.keys(cfg.queryParams).length > 0) {
+    blocks.push(`query_params = ${tomlInlineTable(cfg.queryParams)}`);
+  }
+  if (cfg.httpHeaders && Object.keys(cfg.httpHeaders).length > 0) {
+    blocks.push(`http_headers = ${tomlInlineTable(cfg.httpHeaders)}`);
+  }
+  if (cfg.envHttpHeaders && Object.keys(cfg.envHttpHeaders).length > 0) {
+    blocks.push(`env_http_headers = ${tomlInlineTable(cfg.envHttpHeaders)}`);
+  }
+  if (cfg.requestMaxRetries !== undefined) {
+    blocks.push(`request_max_retries = ${Math.trunc(cfg.requestMaxRetries)}`);
+  }
+  if (cfg.streamMaxRetries !== undefined) {
+    blocks.push(`stream_max_retries = ${Math.trunc(cfg.streamMaxRetries)}`);
+  }
+  if (cfg.streamIdleTimeoutMs !== undefined) {
+    blocks.push(
+      `stream_idle_timeout_ms = ${Math.trunc(cfg.streamIdleTimeoutMs)}`,
+    );
+  }
+  blocks.push("");
 }
 
 export function buildClaudeMcpConfig(
@@ -130,6 +190,17 @@ export interface CodexConfigTomlOptions {
    * about provider-level overrides at spawn time.
    */
   openAiBaseUrl?: string;
+  /**
+   * Top-level `model_provider` key — selects which `[model_providers.*]`
+   * table codex routes through. Omitted when undefined (codex defaults to
+   * its built-in `openai` provider).
+   */
+  modelProvider?: string;
+  /**
+   * Custom OpenAI-compatible providers, emitted as `[model_providers.<id>]`
+   * blocks. Used to make OpenRouter / local OSS servers available to codex.
+   */
+  modelProviders?: Record<string, CodexModelProviderConfig>;
 }
 
 export function buildCodexConfigToml(
@@ -142,6 +213,8 @@ export function buildCodexConfigToml(
     enableSkills = false,
     enableMultiAgent = false,
     openAiBaseUrl,
+    modelProvider,
+    modelProviders,
   } = opts;
 
   const blocks: string[] = [];
@@ -149,6 +222,19 @@ export function buildCodexConfigToml(
   if (openAiBaseUrl) {
     blocks.push(`openai_base_url = ${tomlString(openAiBaseUrl)}`);
     blocks.push("");
+  }
+
+  // Provider selection (`model_provider`) must precede the
+  // `[model_providers.*]` tables: TOML treats every key after a table
+  // header as belonging to that table, so a bare top-level key written
+  // afterwards would be parsed into the last provider block instead.
+  if (modelProvider) {
+    blocks.push(`model_provider = ${tomlString(modelProvider)}`);
+    blocks.push("");
+  }
+
+  for (const [id, cfg] of Object.entries(modelProviders ?? {})) {
+    appendCodexModelProviderBlock(blocks, id, cfg);
   }
 
   for (const mcp of mcps ?? []) {

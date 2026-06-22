@@ -968,6 +968,19 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       IS_SANDBOX: "1",
     };
 
+    // Custom headers reach Claude Code via ANTHROPIC_CUSTOM_HEADERS
+    // (newline-separated `Name: Value` lines). Merge with any value the
+    // caller already set in `env` rather than clobbering it.
+    const customHeaders = request.options.customHeaders;
+    if (customHeaders && Object.keys(customHeaders).length > 0) {
+      const serialized = Object.entries(customHeaders)
+        .map(([name, value]) => `${name}: ${value}`)
+        .join("\n");
+      env.ANTHROPIC_CUSTOM_HEADERS = env.ANTHROPIC_CUSTOM_HEADERS
+        ? `${env.ANTHROPIC_CUSTOM_HEADERS}\n${serialized}`
+        : serialized;
+    }
+
     const inputParts = await time(
       debugClaude,
       "validateProviderUserInput",
