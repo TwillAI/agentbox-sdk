@@ -74,6 +74,12 @@ export function buildOpenCodeSubagentConfig(
         mode: "subagent",
         description: subAgent.description,
         prompt: subAgent.instructions,
+        // opencode reads a per-agent `model` as a "<providerID>/<modelID>"
+        // string (e.g. "openrouter/deepseek/deepseek-v4-flash"). Without it,
+        // the sub-agent silently inherits the orchestrator's model instead of
+        // the one it was configured with — unlike claude-code (frontmatter
+        // `model`) and codex (TOML `model`), which both carry it through.
+        ...(subAgent.model ? { model: subAgent.model } : {}),
         ...(mapOpenCodeTools(subAgent.tools)
           ? { tools: mapOpenCodeTools(subAgent.tools) }
           : {}),
