@@ -28,6 +28,7 @@ import {
   validateProviderUserInput,
 } from "../input";
 import { assertCommandsSupported } from "../config/commands";
+import type { CodexModelProviderConfig } from "../config/types";
 import { assertHooksSupported, buildCodexHooksFile } from "../config/hooks";
 import { activateRtk } from "../config/rtk";
 import { buildCodexConfigToml } from "../config/mcp";
@@ -701,6 +702,86 @@ function resolveCodexOpenAiBaseUrlFromOptions(
   return options.env?.OPENAI_BASE_URL ?? options.provider?.env?.OPENAI_BASE_URL;
 }
 
+/**
+ * Env codex reads credentials from, merging the agent's base env and the
+ * provider-scoped overrides (the same precedence `createRuntime` and the
+ * app-server launch use). Used to detect provider API keys.
+ */
+function codexCredentialEnv(
+  options: AgentOptions<"codex">,
+): Record<string, string> {
+  return { ...(options.env ?? {}), ...(options.provider?.env ?? {}) };
+}
+
+/**
+ * Resolve the codex `model_providers` map + top-level `model_provider`
+ * selection for an agent.
+ *
+ * Starts from the caller's explicit `provider.modelProviders`. Selection is
+ * only the caller's explicit `provider.modelProvider`; when omitted, Codex
+ * falls back to its built-in `openai` provider.
+ */
+export function resolveCodexModelProviders(options: AgentOptions<"codex">): {
+  modelProviders: Record<string, CodexModelProviderConfig>;
+  modelProvider: string | undefined;
+} {
+  const modelProviders: Record<string, CodexModelProviderConfig> = {
+    ...(options.provider?.modelProviders ?? {}),
+  };
+
+  const modelProvider = options.provider?.modelProvider;
+
+  const customHeaders = options.customHeaders;
+  if (customHeaders && Object.keys(customHeaders).length > 0) {
+    // Codex can only attach `http_headers` to a `[model_providers.<id>]` block.
+    // When no explicit provider is selected, Codex uses its built-in `openai`
+    // provider, which has no table to hang headers on and cannot be overridden
+    // as `[model_providers.openai]`. Do not synthesize/select a replacement
+    // provider solely for headers: that changes Codex's model-provider identity
+    // and breaks child-agent model resolution in `spawn_agent`.
+    for (const [id, cfg] of Object.entries(modelProviders)) {
+      modelProviders[id] = {
+        ...cfg,
+        httpHeaders: { ...(cfg.httpHeaders ?? {}), ...customHeaders },
+      };
+    }
+  }
+
+  return { modelProviders, modelProvider };
+}
+
+/**
+ * Stable fingerprint of the API-key secrets the resolved providers depend
+ * on. The codex app-server reads these from its process env at launch
+ * time only (the secret value is never written into config.toml — only
+ * the `env_key` *name* is), so a key change is invisible to an
+ * already-running shared server. Folding this into the setupId flips the
+ * setup marker, misses the preflight, and forces a respawn so the new
+ * credentials take effect — mirroring opencode's `hashLlmApiKeys`.
+ */
+function hashCodexProviderCredentials(
+  options: AgentOptions<"codex">,
+  modelProviders: Record<string, CodexModelProviderConfig>,
+): string {
+  const env = codexCredentialEnv(options);
+  const envKeyNames = new Set<string>(["OPENAI_API_KEY"]);
+  for (const cfg of Object.values(modelProviders)) {
+    if (cfg.envKey) {
+      envKeyNames.add(cfg.envKey);
+    }
+    for (const envVar of Object.values(cfg.envHttpHeaders ?? {})) {
+      envKeyNames.add(envVar);
+    }
+  }
+  const hasher = crypto.createHash("sha256");
+  for (const name of [...envKeyNames].sort()) {
+    if (env[name] !== undefined) {
+      hasher.update(`${name}=${env[name]}\n`);
+    }
+  }
+  return hasher.digest("hex");
+}
+
 async function ensureCodexLoginViaConfig(
   request: AgentSetupRequest<"codex">,
   target: SetupTarget,
@@ -848,6 +929,14 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
   const hooks = assertHooksSupported(provider, options);
   assertCommandsSupported(provider, options.commands);
 
+  // Resolve custom model providers once so both the config.toml artifact and
+  // the credential fingerprint below see the same provider map.
+  const { modelProviders, modelProvider } = resolveCodexModelProviders(options);
+  const providerCredHash = hashCodexProviderCredentials(
+    options,
+    modelProviders,
+  );
+
   const usesRemoteWebSocket =
     options.sandbox && options.sandbox.provider !== SandboxProvider.LocalDocker;
 
@@ -859,8 +948,13 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
     artifacts: Array<{ path: string; content: string; executable?: boolean }>;
     installCommands: string[];
   } {
+    const defaultModel = options.provider?.defaultModel;
     const { artifacts: subAgentArtifacts, agentSections } =
-      buildCodexSubagentArtifacts(options.subAgents, layoutTarget.layout);
+      buildCodexSubagentArtifacts(
+        options.subAgents,
+        layoutTarget.layout,
+        defaultModel,
+      );
     const hooksFile = buildCodexHooksFile(hooks);
     const enableMultiAgent = (options.subAgents?.length ?? 0) > 0;
     const enableSkills = (options.skills?.length ?? 0) > 0;
@@ -873,6 +967,9 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
       enableSkills,
       enableMultiAgent,
       openAiBaseUrl,
+      model: defaultModel,
+      modelProvider,
+      modelProviders,
     });
 
     const artifacts: Array<{
@@ -937,7 +1034,7 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
       artifacts: [...serverArtifacts, ...skillArtifacts],
       installCommands,
       daemon: daemonInfo,
-      extras: [`enableRtk:${enableRtk}`],
+      extras: [`enableRtk:${enableRtk}`, `providerCreds:${providerCredHash}`],
     });
     if (await preflightSetup(sharedTarget, setupId, daemonInfo)) {
       debugCodex("codex remote setup() preflight hit — skipping");
@@ -962,13 +1059,19 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
     const serverCwd = sharedTarget.layout.rootDir;
     const launchResult = await time(
       debugCodex,
-      "launch app-server (probe + spawn-if-cold)",
+      "restart app-server after setup miss",
       () =>
         sandbox.run(
           [
             `mkdir -p ${shellQuote(sharedTarget.layout.rootDir)}`,
-            `if curl -fsS http://127.0.0.1:${REMOTE_CODEX_APP_SERVER_PORT}/readyz >/dev/null 2>&1; then exit 0; fi`,
-            `if [ -f ${shellQuote(pidFilePath)} ]; then kill "$(cat ${shellQuote(pidFilePath)})" >/dev/null 2>&1 || true; rm -f ${shellQuote(pidFilePath)}; fi`,
+            [
+              `if curl -fsS http://127.0.0.1:${REMOTE_CODEX_APP_SERVER_PORT}/readyz >/dev/null 2>&1; then`,
+              `  if [ -f ${shellQuote(pidFilePath)} ]; then kill "$(cat ${shellQuote(pidFilePath)})" >/dev/null 2>&1 || true; else fuser -k -n tcp ${REMOTE_CODEX_APP_SERVER_PORT} >/dev/null 2>&1 || true; fi`,
+              `  for i in 1 2 3 4 5; do if ! curl -fsS http://127.0.0.1:${REMOTE_CODEX_APP_SERVER_PORT}/readyz >/dev/null 2>&1; then break; fi; sleep 0.2; done`,
+              `  if curl -fsS http://127.0.0.1:${REMOTE_CODEX_APP_SERVER_PORT}/readyz >/dev/null 2>&1; then if [ -f ${shellQuote(pidFilePath)} ]; then kill -9 "$(cat ${shellQuote(pidFilePath)})" >/dev/null 2>&1 || true; else fuser -k -n tcp ${REMOTE_CODEX_APP_SERVER_PORT} >/dev/null 2>&1 || true; fi; fi`,
+              `  rm -f ${shellQuote(pidFilePath)}`,
+              `fi`,
+            ].join("\n"),
             `chmod 600 ${shellQuote(tokenFilePath)}`,
             `(${[
               `nohup ${[
@@ -1041,7 +1144,7 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
   const setupId = computeSetupId({
     artifacts: allArtifacts,
     installCommands,
-    extras: [`enableRtk:${enableRtk}`],
+    extras: [`enableRtk:${enableRtk}`, `providerCreds:${providerCredHash}`],
   });
   if (await preflightSetup(target, setupId)) {
     debugCodex("codex local setup() preflight hit — skipping");

@@ -439,6 +439,16 @@ export function buildOpenCodeConfig(
     ...(openRouterPlugins ? { plugins: openRouterPlugins } : {}),
   };
 
+  // Custom request headers go on each provider's `options.headers`. opencode's
+  // config-level header support is subject to upstream behavior, so treat this
+  // as best-effort. Includes an `anthropic` entry so the Anthropic provider
+  // (no entry otherwise) can carry the headers too.
+  const customHeaders =
+    options.customHeaders && Object.keys(options.customHeaders).length > 0
+      ? options.customHeaders
+      : undefined;
+  const headerOpts = customHeaders ? { headers: customHeaders } : {};
+
   return {
     $schema: "https://opencode.ai/config.json",
     ...(mcpConfig ? { mcp: mcpConfig } : {}),
@@ -448,11 +458,13 @@ export function buildOpenCodeConfig(
         options: {
           baseURL: openRouterBaseUrl || "https://openrouter.ai/api/v1",
           extraBody: openRouterExtraBody,
+          ...headerOpts,
         },
       },
       ...(googleBaseUrl
-        ? { google: { options: { baseURL: googleBaseUrl } } }
+        ? { google: { options: { baseURL: googleBaseUrl, ...headerOpts } } }
         : {}),
+      ...(customHeaders ? { anthropic: { options: { ...headerOpts } } } : {}),
     },
     agent: {
       agentbox: baseAgent,

@@ -139,6 +139,49 @@ export type CodexHooksConfig = Partial<
   Record<CodexHookEvent, CodexHookMatcherGroup[]>
 >;
 
+/**
+ * One OpenAI-compatible model provider for Codex, serialized into a
+ * `[model_providers.<id>]` block in config.toml. Mirrors codex's
+ * `ModelProviderInfo` (which uses snake_case keys and
+ * `deny_unknown_fields`) but with the camelCase field names AgentBox
+ * exposes publicly. Use it to point Codex at a local Ollama/LM Studio/vLLM
+ * server or any other OpenAI-compatible endpoint.
+ */
+export interface CodexModelProviderConfig {
+  /** Friendly display name. Defaults to the provider id when omitted. */
+  name?: string;
+  /** Base URL of the OpenAI-compatible API (e.g. `http://localhost:8000/v1`). */
+  baseUrl?: string;
+  /**
+   * Name of the environment variable holding the API key. The variable
+   * must be present in the agent env (`options.env` / `provider.env`) so
+   * the codex process can read it — AgentBox never writes the secret into
+   * config.toml.
+   */
+  envKey?: string;
+  /**
+   * Wire protocol the endpoint speaks. Codex removed the `"chat"` (Chat
+   * Completions) wire API in Feb 2026 and now rejects it at config load,
+   * so prefer `"responses"` (the Responses API) — what LM Studio and modern
+   * Ollama expose. Omit to use codex's default
+   * (`"responses"`). `"chat"` remains in the type only for older codex
+   * builds / chat→responses proxies.
+   */
+  wireApi?: "chat" | "responses" | "responses_websocket";
+  /** Extra query-string params appended to every request. */
+  queryParams?: Record<string, string>;
+  /** Static HTTP headers added to every request. */
+  httpHeaders?: Record<string, string>;
+  /** HTTP headers whose values come from env vars (header name -> env var name). */
+  envHttpHeaders?: Record<string, string>;
+  /** Maximum number of times to retry a failed request. */
+  requestMaxRetries?: number;
+  /** Maximum number of reconnect attempts for a dropped stream. */
+  streamMaxRetries?: number;
+  /** Idle timeout (ms) before a stalled stream is treated as lost. */
+  streamIdleTimeoutMs?: number;
+}
+
 export type OpenCodePluginEvent =
   | "command.executed"
   | "file.edited"

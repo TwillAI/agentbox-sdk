@@ -145,6 +145,62 @@ await agent.run({
 
 `xhigh` requires a model that supports it (e.g. Claude Opus 4.7+, Codex `gpt-5.4`).
 
+### Open-source & custom models (OpenRouter, OSS)
+
+Codex isn't limited to OpenAI models — it can route through any
+OpenAI-compatible endpoint (OpenRouter, a local Ollama/LM Studio/vLLM
+server, a proxy). Just like the opencode provider lights up OpenRouter
+from `OPENROUTER_API_KEY`, the codex provider does too: set the key in the
+agent env and pass an OpenRouter model slug.
+
+```ts
+const agent = new Agent("codex", {
+  sandbox,
+  cwd: "/workspace",
+  approvalMode: "auto",
+  env: { OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY! },
+});
+
+await agent.run({
+  model: "openai/gpt-5.3-codex", // any OpenRouter model slug
+  input: "Explain the project structure.",
+});
+```
+
+When `OPENROUTER_API_KEY` is present (and `OPENAI_API_KEY` is not), AgentBox
+auto-registers an `openrouter` model provider pointing at
+`https://openrouter.ai/api/v1` and selects it. Override the endpoint with
+`OPENROUTER_BASE_URL`.
+
+For any other OpenAI-compatible endpoint, declare providers explicitly via
+`provider.modelProviders` and pick one with `provider.modelProvider`:
+
+```ts
+new Agent("codex", {
+  sandbox,
+  cwd: "/workspace",
+  env: { TOGETHER_API_KEY: process.env.TOGETHER_API_KEY! },
+  provider: {
+    modelProvider: "together",
+    modelProviders: {
+      together: {
+        name: "Together",
+        baseUrl: "https://api.together.xyz/v1",
+        envKey: "TOGETHER_API_KEY",
+        wireApi: "responses", // codex removed the "chat" wire API
+      },
+    },
+  },
+});
+```
+
+These are written into Codex's `config.toml` as `[model_providers.*]`
+blocks, which the codex app-server reads via `CODEX_HOME`. The model slug
+stays a per-run value; the provider is agent-level config. Note that codex
+dropped the Chat Completions wire API in early 2026 — providers must speak
+the Responses API (`wire_api = "responses"`), which OpenRouter and LM
+Studio support; chat-only backends need a responses→chat proxy.
+
 ## Sandboxes
 
 Five sandbox providers are supported. Each gives you an isolated environment with the same interface:

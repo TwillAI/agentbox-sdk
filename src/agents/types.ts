@@ -12,6 +12,7 @@ import type {
   AgentSubAgentConfig,
   ClaudeCodeHooksConfig,
   CodexHooksConfig,
+  CodexModelProviderConfig,
   OpenCodePluginConfig,
 } from "./config/types";
 
@@ -110,6 +111,22 @@ export interface AgentOptionsBase {
    * is a no-op when already active. Toggle invalidates the setup cache.
    */
   enableRtk?: boolean;
+  /**
+   * Custom HTTP headers to attach to the agent's outbound LLM API requests.
+   *
+   * Forwarded per provider via whatever native mechanism each CLI exposes:
+   * - claude-code: `ANTHROPIC_CUSTOM_HEADERS` (applies to all Anthropic calls)
+   * - codex: `http_headers` on the active `[model_providers.*]` block in
+   *   config.toml. When Codex falls back to its built-in `openai` provider,
+   *   there is no provider block to carry headers, so headers are ignored.
+   * - open-code: `provider.<id>.options.headers` in the opencode config
+   *
+   * Typical use: spend-tracking / routing tags for an LLM gateway, e.g.
+   * `{ "x-litellm-tags": "task:123" }`. Whether a header actually reaches the
+   * upstream depends on the CLI and provider; open-code's config-level headers
+   * in particular are subject to upstream support.
+   */
+  customHeaders?: Record<string, string>;
   approvalMode?: AgentApprovalMode;
   mcps?: AgentMcpConfig[];
   skills?: AgentSkillConfig[];
@@ -123,6 +140,37 @@ export interface CodexProviderOptions {
   brokerEndpoint?: string;
   useBroker?: boolean;
   hooks?: CodexHooksConfig;
+  /**
+   * Extra OpenAI-compatible model providers, written as
+   * `[model_providers.<id>]` blocks in Codex's config.toml. Lets Codex
+   * talk to a local Ollama/LM Studio/vLLM server or another
+   * OpenAI-compatible endpoint.
+   */
+  modelProviders?: Record<string, CodexModelProviderConfig>;
+  /**
+   * Top-level `model_provider` written into Codex's config.toml — selects
+   * which {@link modelProviders} table Codex routes every run through (the
+   * per-run {@link AgentRunConfig.model} stays a plain model slug).
+   *
+   * When omitted, Codex falls back to its built-in `openai` provider.
+   */
+  modelProvider?: string;
+  /**
+   * Default model slug written as the top-level `model` in Codex's
+   * config.toml and used as the fallback `model` for any sub-agent
+   * ({@link AgentSubAgentConfig}) that does not set its own.
+   *
+   * Why this exists: when Codex spawns a *named* sub-agent it reloads the
+   * child config from the on-disk config-layer stack (config.toml + the
+   * role's TOML) and drops the parent turn's runtime model. If neither
+   * layer carries a `model`, the child's model resolves to `None` and
+   * `spawn_agent` fails service-tier validation with "could not resolve the
+   * child model". Setting this guarantees a resolvable model is always on
+   * disk. The per-run {@link AgentRunConfig.model} still overrides it for
+   * the root turn via `thread/start`; this only backstops role spawns and
+   * runs that omit a model.
+   */
+  defaultModel?: string;
   /**
    * When `false`, writes `supports_websockets = false` into Codex's
    * config.toml. Useful in environments where outbound WebSocket

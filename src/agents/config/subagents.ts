@@ -74,6 +74,12 @@ export function buildOpenCodeSubagentConfig(
         mode: "subagent",
         description: subAgent.description,
         prompt: subAgent.instructions,
+        // opencode reads a per-agent `model` as a "<providerID>/<modelID>"
+        // string (e.g. "openrouter/deepseek/deepseek-v4-flash"). Without it,
+        // the sub-agent silently inherits the orchestrator's model instead of
+        // the one it was configured with — unlike claude-code (frontmatter
+        // `model`) and codex (TOML `model`), which both carry it through.
+        ...(subAgent.model ? { model: subAgent.model } : {}),
         ...(mapOpenCodeTools(subAgent.tools)
           ? { tools: mapOpenCodeTools(subAgent.tools) }
           : {}),
@@ -85,6 +91,14 @@ export function buildOpenCodeSubagentConfig(
 export function buildCodexSubagentArtifacts(
   subAgents: AgentSubAgentConfig[] | undefined,
   layout: SetupLayout,
+  /**
+   * Fallback model slug for sub-agents that don't set their own. Codex
+   * reloads a named sub-agent's config from disk and loses the parent's
+   * runtime model, so a role TOML with no `model` resolves to `None` and
+   * `spawn_agent` fails service-tier validation. Writing this default keeps
+   * role spawns working. Sourced from `CodexProviderOptions.defaultModel`.
+   */
+  defaultModel?: string,
 ): {
   artifacts: TextArtifact[];
   agentSections: string[];
@@ -105,8 +119,9 @@ export function buildCodexSubagentArtifacts(
     const tomlLines: string[] = [
       `model_instructions_file = ${tomlString(roleConfigPromptPath)}`,
     ];
-    if (subAgent.model) {
-      tomlLines.push(`model = ${tomlString(subAgent.model)}`);
+    const model = subAgent.model ?? defaultModel;
+    if (model) {
+      tomlLines.push(`model = ${tomlString(model)}`);
     }
     tomlLines.push(
       `model_reasoning_effort = ${tomlString("medium")}`,
