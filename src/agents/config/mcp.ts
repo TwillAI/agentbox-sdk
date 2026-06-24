@@ -191,6 +191,14 @@ export interface CodexConfigTomlOptions {
    */
   openAiBaseUrl?: string;
   /**
+   * Top-level `model` key. Backstops the per-run `thread/start` model and,
+   * crucially, gives named sub-agent (role) spawns a resolvable model: codex
+   * rebuilds the child config from the on-disk config-layer stack and drops
+   * the parent turn's runtime model, so without a `model` on disk
+   * `spawn_agent` fails service-tier validation. Omitted when undefined.
+   */
+  model?: string;
+  /**
    * Top-level `model_provider` key — selects which `[model_providers.*]`
    * table codex routes through. Omitted when undefined (codex defaults to
    * its built-in `openai` provider).
@@ -198,7 +206,7 @@ export interface CodexConfigTomlOptions {
   modelProvider?: string;
   /**
    * Custom OpenAI-compatible providers, emitted as `[model_providers.<id>]`
-   * blocks. Used to make OpenRouter / local OSS servers available to codex.
+   * blocks. Used to make local OSS servers available to codex.
    */
   modelProviders?: Record<string, CodexModelProviderConfig>;
 }
@@ -213,6 +221,7 @@ export function buildCodexConfigToml(
     enableSkills = false,
     enableMultiAgent = false,
     openAiBaseUrl,
+    model,
     modelProvider,
     modelProviders,
   } = opts;
@@ -221,6 +230,14 @@ export function buildCodexConfigToml(
 
   if (openAiBaseUrl) {
     blocks.push(`openai_base_url = ${tomlString(openAiBaseUrl)}`);
+    blocks.push("");
+  }
+
+  // Bare top-level key — must precede every `[table]` header (TOML assigns
+  // any key after a header to that table), so it sits with the other
+  // top-level keys above the `[model_providers.*]` / `[mcp_servers.*]` blocks.
+  if (model) {
+    blocks.push(`model = ${tomlString(model)}`);
     blocks.push("");
   }
 

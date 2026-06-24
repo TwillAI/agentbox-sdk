@@ -91,6 +91,14 @@ export function buildOpenCodeSubagentConfig(
 export function buildCodexSubagentArtifacts(
   subAgents: AgentSubAgentConfig[] | undefined,
   layout: SetupLayout,
+  /**
+   * Fallback model slug for sub-agents that don't set their own. Codex
+   * reloads a named sub-agent's config from disk and loses the parent's
+   * runtime model, so a role TOML with no `model` resolves to `None` and
+   * `spawn_agent` fails service-tier validation. Writing this default keeps
+   * role spawns working. Sourced from `CodexProviderOptions.defaultModel`.
+   */
+  defaultModel?: string,
 ): {
   artifacts: TextArtifact[];
   agentSections: string[];
@@ -111,8 +119,9 @@ export function buildCodexSubagentArtifacts(
     const tomlLines: string[] = [
       `model_instructions_file = ${tomlString(roleConfigPromptPath)}`,
     ];
-    if (subAgent.model) {
-      tomlLines.push(`model = ${tomlString(subAgent.model)}`);
+    const model = subAgent.model ?? defaultModel;
+    if (model) {
+      tomlLines.push(`model = ${tomlString(model)}`);
     }
     tomlLines.push(
       `model_reasoning_effort = ${tomlString("medium")}`,

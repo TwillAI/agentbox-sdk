@@ -144,13 +144,13 @@ export type CodexHooksConfig = Partial<
  * `[model_providers.<id>]` block in config.toml. Mirrors codex's
  * `ModelProviderInfo` (which uses snake_case keys and
  * `deny_unknown_fields`) but with the camelCase field names AgentBox
- * exposes publicly. Use it to point Codex at OpenRouter, a local
- * Ollama/LM Studio/vLLM server, or any other OpenAI-compatible endpoint.
+ * exposes publicly. Use it to point Codex at a local Ollama/LM Studio/vLLM
+ * server or any other OpenAI-compatible endpoint.
  */
 export interface CodexModelProviderConfig {
   /** Friendly display name. Defaults to the provider id when omitted. */
   name?: string;
-  /** Base URL of the OpenAI-compatible API (e.g. `https://openrouter.ai/api/v1`). */
+  /** Base URL of the OpenAI-compatible API (e.g. `http://localhost:8000/v1`). */
   baseUrl?: string;
   /**
    * Name of the environment variable holding the API key. The variable
@@ -162,8 +162,8 @@ export interface CodexModelProviderConfig {
   /**
    * Wire protocol the endpoint speaks. Codex removed the `"chat"` (Chat
    * Completions) wire API in Feb 2026 and now rejects it at config load,
-   * so prefer `"responses"` (the Responses API) — what OpenRouter, LM
-   * Studio, and modern Ollama expose. Omit to use codex's default
+   * so prefer `"responses"` (the Responses API) — what LM Studio and modern
+   * Ollama expose. Omit to use codex's default
    * (`"responses"`). `"chat"` remains in the type only for older codex
    * builds / chat→responses proxies.
    */

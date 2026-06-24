@@ -16,6 +16,7 @@ import { prepareSkillArtifacts } from "../src/agents/config/skills";
 import {
   buildClaudeSubagentArtifacts,
   buildCodexSubagentArtifacts,
+  buildOpenCodeSubagentConfig,
 } from "../src/agents/config/subagents";
 import { resolveCodexModelProviders } from "../src/agents/providers/codex";
 import type { SetupLayout } from "../src/agents/config/types";
@@ -568,43 +569,144 @@ describe("config compilers", () => {
 
     expect(agentToml?.content).not.toMatch(/^model\s*=/m);
   });
+
+  it("falls back the Codex role model to the provider default model", () => {
+    const layout = {
+      rootDir: "/tmp/agentbox",
+      homeDir: "/tmp/agentbox/home",
+      xdgConfigHome: "/tmp/agentbox/.config",
+      agentsDir: "/tmp/agentbox/home/.agents",
+      claudeDir: "/tmp/agentbox/home/.claude",
+      opencodeDir: "/tmp/agentbox/.config/opencode",
+      codexDir: "/tmp/agentbox/.codex",
+    };
+    const result = buildCodexSubagentArtifacts(
+      [
+        {
+          name: "reviewer",
+          description: "Review code",
+          instructions: "Review the current worktree for likely regressions.",
+        },
+      ],
+      layout,
+      "gpt-5.1-codex",
+    );
+
+    const agentToml = result.artifacts.find((artifact) =>
+      artifact.path.endsWith("agents/reviewer.toml"),
+    );
+
+    // Without a resolvable model on disk, codex's role reload leaves the
+    // child model unset and spawn_agent fails service-tier validation.
+    expect(agentToml?.content).toContain('model = "gpt-5.1-codex"');
+  });
+
+  it("prefers an explicit Codex sub-agent model over the provider default", () => {
+    const layout = {
+      rootDir: "/tmp/agentbox",
+      homeDir: "/tmp/agentbox/home",
+      xdgConfigHome: "/tmp/agentbox/.config",
+      agentsDir: "/tmp/agentbox/home/.agents",
+      claudeDir: "/tmp/agentbox/home/.claude",
+      opencodeDir: "/tmp/agentbox/.config/opencode",
+      codexDir: "/tmp/agentbox/.codex",
+    };
+    const result = buildCodexSubagentArtifacts(
+      [
+        {
+          name: "reviewer",
+          description: "Review code",
+          instructions: "Review the current worktree for likely regressions.",
+          model: "gpt-5.4",
+        },
+      ],
+      layout,
+      "gpt-5.1-codex",
+    );
+
+    const agentToml = result.artifacts.find((artifact) =>
+      artifact.path.endsWith("agents/reviewer.toml"),
+    );
+
+    expect(agentToml?.content).toContain('model = "gpt-5.4"');
+    expect(agentToml?.content).not.toContain("gpt-5.1-codex");
+  });
+
+  it("honors a per-sub-agent model override for opencode", () => {
+    const config = buildOpenCodeSubagentConfig([
+      {
+        name: "explorer",
+        description: "Explore the codebase",
+        instructions: "Find where things live.",
+        model: "openrouter/deepseek/deepseek-v4-flash",
+      },
+    ]);
+
+    expect(config.explorer).toMatchObject({
+      mode: "subagent",
+      model: "openrouter/deepseek/deepseek-v4-flash",
+    });
+  });
+
+  it("omits the model key when no opencode sub-agent override is provided", () => {
+    const config = buildOpenCodeSubagentConfig([
+      {
+        name: "explorer",
+        description: "Explore the codebase",
+        instructions: "Find where things live.",
+      },
+    ]);
+
+    expect(config.explorer).not.toHaveProperty("model");
+  });
 });
 
 describe("codex model providers config", () => {
   it("emits a [model_providers.<id>] block with snake_case keys", () => {
     const toml = buildCodexConfigToml({
-      modelProvider: "openrouter",
+      modelProvider: "vllm",
       modelProviders: {
-        openrouter: {
-          name: "OpenRouter",
-          baseUrl: "https://openrouter.ai/api/v1",
-          envKey: "OPENROUTER_API_KEY",
+        vllm: {
+          name: "vLLM",
+          baseUrl: "http://localhost:8000/v1",
+          envKey: "VLLM_API_KEY",
           wireApi: "responses",
         },
       },
     });
 
-    expect(toml).toContain('model_provider = "openrouter"');
-    expect(toml).toContain("[model_providers.openrouter]");
-    expect(toml).toContain('name = "OpenRouter"');
-    expect(toml).toContain('base_url = "https://openrouter.ai/api/v1"');
-    expect(toml).toContain('env_key = "OPENROUTER_API_KEY"');
+    expect(toml).toContain('model_provider = "vllm"');
+    expect(toml).toContain("[model_providers.vllm]");
+    expect(toml).toContain('name = "vLLM"');
+    expect(toml).toContain('base_url = "http://localhost:8000/v1"');
+    expect(toml).toContain('env_key = "VLLM_API_KEY"');
     expect(toml).toContain('wire_api = "responses"');
   });
 
   it("writes model_provider before the provider table so TOML parses it as a top-level key", () => {
     const toml = buildCodexConfigToml({
-      modelProvider: "openrouter",
+      modelProvider: "vllm",
       modelProviders: {
-        openrouter: { name: "OpenRouter", envKey: "OPENROUTER_API_KEY" },
+        vllm: { name: "vLLM", envKey: "VLLM_API_KEY" },
       },
     })!;
 
     const providerSelect = toml.indexOf("model_provider =");
-    const providerTable = toml.indexOf("[model_providers.openrouter]");
+    const providerTable = toml.indexOf("[model_providers.vllm]");
     expect(providerSelect).toBeGreaterThanOrEqual(0);
     expect(providerTable).toBeGreaterThanOrEqual(0);
     expect(providerSelect).toBeLessThan(providerTable);
+  });
+
+  it("does not auto-register OpenRouter from env for Codex", () => {
+    const opts = {
+      env: { OPENROUTER_API_KEY: "sk-or-test" },
+    } as unknown as Parameters<typeof resolveCodexModelProviders>[0];
+
+    const { modelProviders, modelProvider } = resolveCodexModelProviders(opts);
+
+    expect(modelProviders.openrouter).toBeUndefined();
+    expect(modelProvider).toBeUndefined();
   });
 
   it("serializes headers and params as inline tables with quoted keys", () => {
@@ -640,11 +742,12 @@ describe("codex model providers config", () => {
     expect(toml).toContain('name = "vllm"');
   });
 
-  it("synthesizes a non-reserved provider id for custom headers on OpenAI (codex rejects [model_providers.openai])", () => {
+  it("does not synthesize an OpenAI provider just to carry custom headers", () => {
     // Repro: a codex run on an OpenAI model with per-task custom headers
     // (e.g. x-litellm-tags) and no explicit provider. Codex reserves the
-    // built-in `openai` id and refuses any [model_providers.openai] override,
-    // so we must register the synthesized block under a distinct id.
+    // built-in `openai` id and refuses any [model_providers.openai] override.
+    // Synthesizing a replacement provider changes the active provider identity
+    // and breaks spawn_agent model resolution, so headers are ignored here.
     const opts = {
       env: { OPENAI_API_KEY: "sk-test" },
       customHeaders: { "x-litellm-tags": "task:abc" },
@@ -653,16 +756,11 @@ describe("codex model providers config", () => {
     const { modelProviders, modelProvider } = resolveCodexModelProviders(opts);
 
     expect(modelProviders.openai).toBeUndefined();
-    expect(modelProvider).toBe("openai-custom");
-    expect(modelProviders["openai-custom"]).toMatchObject({
-      envKey: "OPENAI_API_KEY",
-      wireApi: "responses",
-      httpHeaders: { "x-litellm-tags": "task:abc" },
-    });
+    expect(modelProviders["openai-custom"]).toBeUndefined();
+    expect(modelProvider).toBeUndefined();
 
-    const toml = buildCodexConfigToml({ modelProvider, modelProviders })!;
-    expect(toml).toContain('model_provider = "openai-custom"');
-    expect(toml).toContain("[model_providers.openai-custom]");
+    const toml = buildCodexConfigToml({ modelProvider, modelProviders }) ?? "";
+    expect(toml).not.toContain("openai-custom");
     expect(toml).not.toContain("[model_providers.openai]");
   });
 
@@ -676,5 +774,20 @@ describe("codex model providers config", () => {
 
   it("returns undefined when no providers or other config are set", () => {
     expect(buildCodexConfigToml({})).toBeUndefined();
+  });
+
+  it("writes a top-level model before any table header", () => {
+    const toml = buildCodexConfigToml({
+      model: "gpt-5.1-codex",
+      modelProvider: "vllm",
+      modelProviders: { vllm: { name: "vLLM", envKey: "VLLM_API_KEY" } },
+    })!;
+
+    expect(toml).toContain('model = "gpt-5.1-codex"');
+    const modelKey = toml.indexOf("model =");
+    const firstTable = toml.indexOf("[");
+    expect(modelKey).toBeGreaterThanOrEqual(0);
+    expect(firstTable).toBeGreaterThanOrEqual(0);
+    expect(modelKey).toBeLessThan(firstTable);
   });
 });
