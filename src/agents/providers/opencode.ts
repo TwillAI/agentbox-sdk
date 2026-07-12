@@ -469,7 +469,10 @@ export function buildOpenCodeConfig(
     agent: {
       agentbox: baseAgent,
       ...reasoningVariants,
-      ...buildOpenCodeSubagentConfig(options.subAgents),
+      ...buildOpenCodeSubagentConfig(
+        options.subAgents,
+        buildOpenCodePermissionConfig(interactiveApproval),
+      ),
     },
   };
 }
@@ -1366,11 +1369,17 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
             if (eventType === "permission.asked") {
               const properties = (payload as Record<string, unknown>)
                 .properties as Record<string, unknown> | undefined;
-              if (
-                properties &&
-                typeof properties.sessionID === "string" &&
-                properties.sessionID === sessionId
-              ) {
+              // Answer asks from ANY session on this server, not just the
+              // main one: sub-agents spawned via the `task` tool run in
+              // child sessions and (since opencode 1.17.2) raise their own
+              // permission events under the child sessionID. Dropping those
+              // blocks the sub-agent's tool call forever — the run then
+              // hangs emitting nothing but heartbeats. Every session on the
+              // server belongs to this run, so replying is always safe. The
+              // reply must go to the ASKING session's endpoint; opencode
+              // resolves permissions per session.
+              if (properties && typeof properties.sessionID === "string") {
+                const askingSessionId = properties.sessionID;
                 const permissionEvent = createOpenCodePermissionEvent(
                   request,
                   raw,
@@ -1384,7 +1393,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                     };
 
                 await fetchJson<boolean>(
-                  `${runtime.baseUrl}/session/${sessionId}/permissions/${permissionEvent.requestId}`,
+                  `${runtime.baseUrl}/session/${askingSessionId}/permissions/${permissionEvent.requestId}`,
                   {
                     method: "POST",
                     headers: {

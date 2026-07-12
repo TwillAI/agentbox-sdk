@@ -66,6 +66,15 @@ function mapOpenCodeTools(
 
 export function buildOpenCodeSubagentConfig(
   subAgents: AgentSubAgentConfig[] | undefined,
+  /**
+   * Per-agent permission block, normally the same one the primary agent
+   * gets. Since opencode 1.17.2 sub-agents use their own configured
+   * permissions instead of inheriting the parent's; an entry without a
+   * `permission` block falls back to opencode's defaults (e.g.
+   * `external_directory: "ask"`), and a sub-agent's ask raised from its
+   * child session blocks the run.
+   */
+  permission?: Record<string, unknown>,
 ): Record<string, unknown> {
   return Object.fromEntries(
     (subAgents ?? []).map((subAgent) => [
@@ -74,6 +83,7 @@ export function buildOpenCodeSubagentConfig(
         mode: "subagent",
         description: subAgent.description,
         prompt: subAgent.instructions,
+        ...(permission ? { permission } : {}),
         // opencode reads a per-agent `model` as a "<providerID>/<modelID>"
         // string (e.g. "openrouter/deepseek/deepseek-v4-flash"). Without it,
         // the sub-agent silently inherits the orchestrator's model instead of

@@ -19,7 +19,9 @@ import {
   buildOpenCodeSubagentConfig,
 } from "../src/agents/config/subagents";
 import { resolveCodexModelProviders } from "../src/agents/providers/codex";
+import { buildOpenCodeConfig } from "../src/agents/providers/opencode";
 import type { SetupLayout } from "../src/agents/config/types";
+import type { AgentOptions } from "../src/agents/types";
 
 describe("agent options config", () => {
   it("constructs an agent with shared runtime option fields", () => {
@@ -658,6 +660,83 @@ describe("config compilers", () => {
     ]);
 
     expect(config.explorer).not.toHaveProperty("model");
+  });
+
+  it("attaches the provided permission block to every opencode sub-agent", () => {
+    const permission = { external_directory: "allow", bash: "allow" };
+    const config = buildOpenCodeSubagentConfig(
+      [
+        {
+          name: "code-reviewer",
+          description: "Reviews code",
+          instructions: "Review the diff.",
+        },
+        {
+          name: "explorer",
+          description: "Explore the codebase",
+          instructions: "Find where things live.",
+        },
+      ],
+      permission,
+    );
+
+    expect(
+      (config["code-reviewer"] as Record<string, unknown>).permission,
+    ).toEqual(permission);
+    expect((config.explorer as Record<string, unknown>).permission).toEqual(
+      permission,
+    );
+  });
+
+  it("omits the permission key when none is provided", () => {
+    const config = buildOpenCodeSubagentConfig([
+      {
+        name: "explorer",
+        description: "Explore the codebase",
+        instructions: "Find where things live.",
+      },
+    ]);
+
+    expect(config.explorer).not.toHaveProperty("permission");
+  });
+
+  // Regression: since opencode 1.17.2 sub-agents use their own configured
+  // permissions instead of inheriting the parent's. A sub-agent entry
+  // without a permission block falls back to opencode's default
+  // `external_directory: "ask"`, and the ask (raised from the sub-agent's
+  // child session) was never answered — the run hung forever on the blocked
+  // `task` tool call.
+  it("gives opencode sub-agents the primary agent's permission config", () => {
+    const options = {
+      subAgents: [
+        {
+          name: "code-reviewer",
+          description: "Reviews code",
+          instructions: "Review the diff.",
+        },
+      ],
+    } as AgentOptions<"open-code">;
+
+    const autoConfig = buildOpenCodeConfig(options, false);
+    const autoAgents = autoConfig.agent as Record<
+      string,
+      Record<string, unknown>
+    >;
+    expect(autoAgents["code-reviewer"]!.permission).toEqual(
+      autoAgents.agentbox!.permission,
+    );
+    expect(autoAgents["code-reviewer"]!.permission).toMatchObject({
+      external_directory: "allow",
+    });
+
+    const interactiveConfig = buildOpenCodeConfig(options, true);
+    const interactiveAgents = interactiveConfig.agent as Record<
+      string,
+      Record<string, unknown>
+    >;
+    expect(interactiveAgents["code-reviewer"]!.permission).toMatchObject({
+      external_directory: "ask",
+    });
   });
 });
 

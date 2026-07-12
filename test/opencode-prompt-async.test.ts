@@ -17,6 +17,11 @@ type SseFrame = { event: string; data: unknown; id?: string };
 interface FakeOpenCodeServer {
   baseUrl: string;
   promptAsyncRequests: Array<{ body: unknown; sessionId: string }>;
+  permissionResponses: Array<{
+    sessionId: string;
+    permissionId: string;
+    body: unknown;
+  }>;
   pushEvent(frame: SseFrame): void;
   close(): Promise<void>;
   /** Set this to make the next prompt_async call respond with the given status. */
@@ -27,6 +32,7 @@ interface FakeOpenCodeServer {
 
 async function startFakeOpenCodeServer(): Promise<FakeOpenCodeServer> {
   const promptAsyncRequests: FakeOpenCodeServer["promptAsyncRequests"] = [];
+  const permissionResponses: FakeOpenCodeServer["permissionResponses"] = [];
   const eventClients: Array<NodeJS.WritableStream & { end?: () => void }> = [];
   const queuedFrames: SseFrame[] = [];
 
@@ -41,6 +47,7 @@ async function startFakeOpenCodeServer(): Promise<FakeOpenCodeServer> {
   const fake: FakeOpenCodeServer = {
     baseUrl: "",
     promptAsyncRequests,
+    permissionResponses,
     pushEvent(frame) {
       queuedFrames.push(frame);
       for (const client of eventClients) {
@@ -97,6 +104,21 @@ async function startFakeOpenCodeServer(): Promise<FakeOpenCodeServer> {
     }
 
     if (method === "POST" && /^\/session\/[^/]+\/abort$/.test(url)) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("true");
+      return;
+    }
+
+    const permissionMatch = url.match(
+      /^\/session\/([^/]+)\/permissions\/([^/]+)$/,
+    );
+    if (method === "POST" && permissionMatch) {
+      const body = await readJson(req).catch(() => ({}));
+      permissionResponses.push({
+        sessionId: decodeURIComponent(permissionMatch[1] ?? ""),
+        permissionId: decodeURIComponent(permissionMatch[2] ?? ""),
+        body,
+      });
       res.writeHead(200, { "content-type": "application/json" });
       res.end("true");
       return;
@@ -283,6 +305,81 @@ describe("opencode prompt_async + SSE", () => {
     const eventTypes = events.map((e) => e.type);
     expect(eventTypes).toContain("text.delta");
     expect(eventTypes).toContain("run.completed");
+  });
+
+  // Regression: sub-agents spawned via the `task` tool run in child sessions
+  // and (since opencode 1.17.2) raise their own permission.asked events under
+  // the child sessionID. The adapter used to only answer asks from the main
+  // session, so a sub-agent's ask was dropped and the run hung forever on the
+  // blocked tool call, emitting nothing but heartbeats.
+  it("answers permission.asked from a sub-agent child session at that session's endpoint", async () => {
+    fake = await startFakeOpenCodeServer();
+    const adapter = new OpenCodeAgentAdapter();
+    const { sink, finished } = makeCapturingSink();
+
+    const request = makeRequest({
+      options: {
+        cwd: "/tmp",
+        approvalMode: "auto",
+        sandbox: makeFakeSandbox(fake.baseUrl),
+      },
+    });
+
+    const executePromise = adapter.execute(request, sink);
+    await new Promise((r) => setTimeout(r, 100));
+
+    // A permission ask from the MAIN session (pre-existing behavior).
+    fake.pushEvent({
+      event: "permission.asked",
+      data: {
+        type: "permission.asked",
+        properties: {
+          id: "per_main",
+          sessionID: "ses_test",
+          permission: "external_directory",
+          patterns: ["/tmp/*"],
+        },
+      },
+    });
+    // A permission ask from a sub-agent CHILD session (the hang case).
+    fake.pushEvent({
+      event: "permission.asked",
+      data: {
+        type: "permission.asked",
+        properties: {
+          id: "per_child",
+          sessionID: "ses_child",
+          permission: "external_directory",
+          patterns: ["/tmp/*"],
+          metadata: { filepath: "/tmp/full.diff" },
+        },
+      },
+    });
+
+    // Give the adapter time to POST both permission responses.
+    await new Promise((r) => setTimeout(r, 200));
+
+    fake.pushEvent({
+      event: "session.idle",
+      data: { type: "session.idle", properties: { sessionID: "ses_test" } },
+    });
+
+    const result = await finished;
+    await executePromise;
+    expect(result.kind).toBe("complete");
+
+    const bySession = Object.fromEntries(
+      fake.permissionResponses.map((p) => [p.sessionId, p]),
+    );
+    expect(bySession.ses_test).toMatchObject({
+      permissionId: "per_main",
+      body: { response: "once" },
+    });
+    // The child-session ask must be answered at the CHILD session's endpoint.
+    expect(bySession.ses_child).toMatchObject({
+      permissionId: "per_child",
+      body: { response: "once" },
+    });
   });
 
   it("emits message.completed per assistant message and resolves to the LAST message text", async () => {
