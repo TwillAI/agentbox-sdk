@@ -469,7 +469,10 @@ export function buildOpenCodeConfig(
     agent: {
       agentbox: baseAgent,
       ...reasoningVariants,
-      ...buildOpenCodeSubagentConfig(options.subAgents),
+      ...buildOpenCodeSubagentConfig(
+        options.subAgents,
+        buildOpenCodePermissionConfig(interactiveApproval),
+      ),
     },
   };
 }
@@ -1266,6 +1269,49 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
       // since assistant deltas can arrive before that message's own
       // `message.updated` notification reaches us.
       const foreignMessageIds = new Set<string>();
+      // Sessions belonging to THIS run: the main session plus every child
+      // session spawned under it (sub-agents via the `task` tool, nested
+      // arbitrarily). Grown from `session.created` events whose parent is
+      // already in the set. The `/event` stream is server-wide, so
+      // permission asks from unrelated concurrent runs must never be
+      // answered by this listener — only asks within this tree are.
+      const runSessionIds = new Set<string>([sessionId]);
+      // Fallback for asks from sessions whose `session.created` frame this
+      // listener missed (e.g. across an SSE reconnect): resolve the asking
+      // session's ancestry once via `GET /session` and cache the lineage.
+      // Any failure means "not ours" — same as the pre-existing behavior of
+      // ignoring unknown sessions.
+      const resolveRunSession = async (candidate: string): Promise<boolean> => {
+        if (runSessionIds.has(candidate)) return true;
+        try {
+          const sessions = await fetchJson<
+            Array<{ id?: string; parentID?: string }>
+          >(`${runtime.baseUrl}/session`, {
+            headers: runtime.previewHeaders,
+          });
+          if (!Array.isArray(sessions)) return false;
+          const parentById = new Map<string, string>();
+          for (const session of sessions) {
+            if (
+              typeof session?.id === "string" &&
+              typeof session?.parentID === "string"
+            ) {
+              parentById.set(session.id, session.parentID);
+            }
+          }
+          const lineage: string[] = [];
+          let cursor: string | undefined = candidate;
+          while (cursor && !runSessionIds.has(cursor) && lineage.length < 16) {
+            lineage.push(cursor);
+            cursor = parentById.get(cursor);
+          }
+          if (!cursor || !runSessionIds.has(cursor)) return false;
+          for (const id of lineage) runSessionIds.add(id);
+          return true;
+        } catch {
+          return false;
+        }
+      };
       sseTask = (async () => {
         try {
           for await (const event of streamSseResilient(
@@ -1309,6 +1355,29 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
               typeof (payload as Record<string, unknown>)?.type === "string"
                 ? String((payload as Record<string, unknown>).type)
                 : event.event;
+
+            // Track child sessions spawned under this run (the `task` tool
+            // creates one per sub-agent) so permission handling below can
+            // tell this run's sessions apart from unrelated concurrent runs
+            // sharing the server-wide event bus.
+            if (
+              eventType === "session.created" ||
+              eventType === "session.updated"
+            ) {
+              const properties = (payload as Record<string, unknown>)
+                .properties as Record<string, unknown> | undefined;
+              const info = properties?.info as
+                | Record<string, unknown>
+                | undefined;
+              if (
+                info &&
+                typeof info.id === "string" &&
+                typeof info.parentID === "string" &&
+                runSessionIds.has(info.parentID)
+              ) {
+                runSessionIds.add(info.id);
+              }
+            }
 
             // Surface each user message id as a `message.started` event so
             // callers can correlate user bubbles with provider message ids.
@@ -1366,11 +1435,22 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
             if (eventType === "permission.asked") {
               const properties = (payload as Record<string, unknown>)
                 .properties as Record<string, unknown> | undefined;
+              // Answer asks from any session in THIS run's session tree, not
+              // just the main one: sub-agents spawned via the `task` tool run
+              // in child sessions and (since opencode 1.17.2) raise their own
+              // permission events under the child sessionID. Dropping those
+              // blocks the sub-agent's tool call forever — the run then hangs
+              // emitting nothing but heartbeats. Sessions outside the tree
+              // belong to other runs on the shared server-wide event bus and
+              // are left to their own listeners. The reply must go to the
+              // ASKING session's endpoint; opencode resolves permissions per
+              // session.
               if (
                 properties &&
                 typeof properties.sessionID === "string" &&
-                properties.sessionID === sessionId
+                (await resolveRunSession(properties.sessionID))
               ) {
+                const askingSessionId = properties.sessionID;
                 const permissionEvent = createOpenCodePermissionEvent(
                   request,
                   raw,
@@ -1384,7 +1464,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                     };
 
                 await fetchJson<boolean>(
-                  `${runtime.baseUrl}/session/${sessionId}/permissions/${permissionEvent.requestId}`,
+                  `${runtime.baseUrl}/session/${askingSessionId}/permissions/${permissionEvent.requestId}`,
                   {
                     method: "POST",
                     headers: {
