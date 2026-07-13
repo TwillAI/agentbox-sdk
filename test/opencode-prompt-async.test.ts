@@ -22,6 +22,8 @@ interface FakeOpenCodeServer {
     permissionId: string;
     body: unknown;
   }>;
+  /** Sessions returned by `GET /session` (id + parentID lineage). */
+  sessions: Array<{ id: string; parentID?: string }>;
   pushEvent(frame: SseFrame): void;
   close(): Promise<void>;
   /** Set this to make the next prompt_async call respond with the given status. */
@@ -33,6 +35,7 @@ interface FakeOpenCodeServer {
 async function startFakeOpenCodeServer(): Promise<FakeOpenCodeServer> {
   const promptAsyncRequests: FakeOpenCodeServer["promptAsyncRequests"] = [];
   const permissionResponses: FakeOpenCodeServer["permissionResponses"] = [];
+  const sessions: FakeOpenCodeServer["sessions"] = [];
   const eventClients: Array<NodeJS.WritableStream & { end?: () => void }> = [];
   const queuedFrames: SseFrame[] = [];
 
@@ -48,6 +51,7 @@ async function startFakeOpenCodeServer(): Promise<FakeOpenCodeServer> {
     baseUrl: "",
     promptAsyncRequests,
     permissionResponses,
+    sessions,
     pushEvent(frame) {
       queuedFrames.push(frame);
       for (const client of eventClients) {
@@ -86,6 +90,12 @@ async function startFakeOpenCodeServer(): Promise<FakeOpenCodeServer> {
     if (method === "POST" && url === "/session") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ id: "ses_test" }));
+      return;
+    }
+
+    if (method === "GET" && url === "/session") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(sessions));
       return;
     }
 
@@ -311,11 +321,24 @@ describe("opencode prompt_async + SSE", () => {
   // and (since opencode 1.17.2) raise their own permission.asked events under
   // the child sessionID. The adapter used to only answer asks from the main
   // session, so a sub-agent's ask was dropped and the run hung forever on the
-  // blocked tool call, emitting nothing but heartbeats.
-  it("answers permission.asked from a sub-agent child session at that session's endpoint", async () => {
+  // blocked tool call, emitting nothing but heartbeats. The /event bus is
+  // server-wide, though, so asks from sessions OUTSIDE this run's tree must
+  // stay unanswered — they belong to other runs' listeners.
+  it("answers permission.asked from this run's session tree only, at the asking session's endpoint", async () => {
     fake = await startFakeOpenCodeServer();
     const adapter = new OpenCodeAgentAdapter();
     const { sink, finished } = makeCapturingSink();
+
+    // `GET /session` lineage: ses_lostchild is ours (its session.created
+    // frame is never streamed, simulating an SSE reconnect gap); ses_foreign
+    // belongs to a different run's root session.
+    fake.sessions.push(
+      { id: "ses_test" },
+      { id: "ses_child", parentID: "ses_test" },
+      { id: "ses_lostchild", parentID: "ses_test" },
+      { id: "ses_other" },
+      { id: "ses_foreign", parentID: "ses_other" },
+    );
 
     const request = makeRequest({
       options: {
@@ -328,6 +351,16 @@ describe("opencode prompt_async + SSE", () => {
     const executePromise = adapter.execute(request, sink);
     await new Promise((r) => setTimeout(r, 100));
 
+    // The `task` tool spawns the sub-agent's child session.
+    fake.pushEvent({
+      event: "session.created",
+      data: {
+        type: "session.created",
+        properties: {
+          info: { id: "ses_child", parentID: "ses_test" },
+        },
+      },
+    });
     // A permission ask from the MAIN session (pre-existing behavior).
     fake.pushEvent({
       event: "permission.asked",
@@ -355,9 +388,36 @@ describe("opencode prompt_async + SSE", () => {
         },
       },
     });
+    // A child whose session.created frame was missed: resolved via
+    // `GET /session` lineage instead.
+    fake.pushEvent({
+      event: "permission.asked",
+      data: {
+        type: "permission.asked",
+        properties: {
+          id: "per_lost",
+          sessionID: "ses_lostchild",
+          permission: "external_directory",
+          patterns: ["/tmp/*"],
+        },
+      },
+    });
+    // Another run's session on the shared bus: must NOT be answered.
+    fake.pushEvent({
+      event: "permission.asked",
+      data: {
+        type: "permission.asked",
+        properties: {
+          id: "per_foreign",
+          sessionID: "ses_foreign",
+          permission: "external_directory",
+          patterns: ["/tmp/*"],
+        },
+      },
+    });
 
-    // Give the adapter time to POST both permission responses.
-    await new Promise((r) => setTimeout(r, 200));
+    // Give the adapter time to POST the permission responses.
+    await new Promise((r) => setTimeout(r, 300));
 
     fake.pushEvent({
       event: "session.idle",
@@ -380,6 +440,11 @@ describe("opencode prompt_async + SSE", () => {
       permissionId: "per_child",
       body: { response: "once" },
     });
+    expect(bySession.ses_lostchild).toMatchObject({
+      permissionId: "per_lost",
+      body: { response: "once" },
+    });
+    expect(bySession).not.toHaveProperty("ses_foreign");
   });
 
   it("emits message.completed per assistant message and resolves to the LAST message text", async () => {
