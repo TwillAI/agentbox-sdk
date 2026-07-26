@@ -59,6 +59,7 @@
   },
   "dependencies": {
     "@daytonaio/sdk": "^0.171.0",
+    "@tenkicloud/sandbox": "^0.4.0",
     "@types/debug": "^4.1.13",
     "@vercel/sandbox": "2.0.0-beta.13",
     "debug": "^4.4.3",
@@ -97,6 +98,7 @@
     "daytona",
     "docker",
     "vercel",
+    "tenki",
     "typescript",
     "bun"
   ]
