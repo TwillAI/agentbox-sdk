@@ -2,6 +2,7 @@ import { DaytonaSandboxAdapter } from "./providers/daytona";
 import { E2bSandboxAdapter } from "./providers/e2b";
 import { LocalDockerSandboxAdapter } from "./providers/local-docker";
 import { ModalSandboxAdapter } from "./providers/modal";
+import { TenkiSandboxAdapter } from "./providers/tenki";
 import { VercelSandboxAdapter } from "./providers/vercel";
 import {
   SandboxProvider,
@@ -50,6 +51,10 @@ function createSandboxAdapter<P extends SandboxProviderName>(
     case SandboxProvider.E2B:
       return new E2bSandboxAdapter(
         options as SandboxOptions<"e2b">,
+      ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
+    case SandboxProvider.Tenki:
+      return new TenkiSandboxAdapter(
+        options as SandboxOptions<"tenki">,
       ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
     default:
       throw new UnsupportedProviderError("sandbox", provider);
