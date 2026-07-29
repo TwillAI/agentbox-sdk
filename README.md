@@ -203,7 +203,7 @@ Studio support; chat-only backends need a responses→chat proxy.
 
 ## Sandboxes
 
-Five sandbox providers are supported. Each gives you an isolated environment with the same interface:
+Six sandbox providers are supported. Each gives you an isolated environment with the same interface:
 
 | Provider       | What it is             | Auth                                                    |
 | -------------- | ---------------------- | ------------------------------------------------------- |
@@ -212,6 +212,7 @@ Five sandbox providers are supported. Each gives you an isolated environment wit
 | `modal`        | Cloud container        | `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET`                 |
 | `daytona`      | Cloud dev environment  | `DAYTONA_API_KEY`                                       |
 | `vercel`       | Ephemeral cloud VM     | `VERCEL_TOKEN` + `VERCEL_TEAM_ID` + `VERCEL_PROJECT_ID` |
+| `tenki`        | Cloud micro-VM         | `TENKI_API_KEY` (or `TENKI_AUTH_TOKEN`)                 |
 
 Every sandbox supports: `findOrProvision()`, `run()`, `runAsync()`, `gitClone()`, `uploadAndRun()`, `openPort()`, `getPreviewLink()`, `snapshot()`, `stop()`, `delete()`.
 
@@ -243,6 +244,31 @@ const sandbox = new Sandbox("vercel", {
   },
 });
 ```
+
+### Tenki
+
+[Tenki](https://tenki.cloud) sandboxes are Linux micro-VMs created via [`@tenkicloud/sandbox`](https://www.npmjs.com/package/@tenkicloud/sandbox). Authenticate with a workspace API key (prefixed `tk_`), passed via `provider.apiKey` or the `TENKI_API_KEY` / `TENKI_AUTH_TOKEN` environment variables:
+
+```ts
+const sandbox = new Sandbox("tenki", {
+  workingDir: "/workspace", // created automatically; defaults to /home/tenki
+  resources: { cpu: 2, memoryMiB: 4096 },
+  provider: {
+    apiKey: process.env.TENKI_API_KEY, // optional when the env var is set
+    allowInbound: true, // default; required for getPreviewLink()
+    allowOutbound: true, // default
+  },
+});
+```
+
+`TenkiProviderOptions` also supports `baseUrl`, `workspaceId`, `name`, `cpuCores` / `memoryMb` (override `resources`), `sshAuthorizedKeys`, `snapshotId` (restore from a snapshot), `previewTtlMs` (expiry for preview URLs), and `createParams` — an escape hatch spread into the SDK's `createAndWait()` for fields not surfaced here (e.g. `volumes`, `diskSizeGb`, `enableOpenCode`).
+
+Notes:
+
+- Sessions are found and reused by `tags` (stored in Tenki session metadata); `stop()` pauses the micro-VM and a later `findOrProvision()` resumes it. Sessions are billed resources — call `delete()` when done.
+- `options.image` accepts a Tenki registry ref; `snapshot()` returns a snapshot id usable via `provider.snapshotId`.
+- Ports are exposed dynamically — `openPort()` / `getPreviewLink()` work at runtime, no up-front declaration needed.
+- Command timeouts are enforced client-side, and `kill()` signals the spawned shell (not descendants of compound commands) — both are platform limitations of the current Tenki API.
 
 ## Skills
 

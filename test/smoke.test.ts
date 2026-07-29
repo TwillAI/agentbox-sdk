@@ -72,6 +72,21 @@ describe.skipIf(!smokeEnabled)("optional provider smoke tests", () => {
     expect(Array.isArray(sandboxes)).toBe(true);
   });
 
+  it("can list Tenki sandboxes when credentials are present", async () => {
+    if (!process.env.TENKI_API_KEY && !process.env.TENKI_AUTH_TOKEN) {
+      return;
+    }
+
+    const sandbox = new Sandbox(SandboxProvider.Tenki, {
+      provider: {
+        apiKey: process.env.TENKI_API_KEY ?? process.env.TENKI_AUTH_TOKEN,
+      },
+    });
+
+    const sandboxes = await sandbox.list();
+    expect(Array.isArray(sandboxes)).toBe(true);
+  });
+
   it("can list E2B sandboxes when credentials are present", async () => {
     if (!process.env.E2B_API_KEY) {
       return;
