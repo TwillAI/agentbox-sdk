@@ -169,7 +169,6 @@ export interface TenkiProviderOptions {
   authToken?: string;
   baseUrl?: string;
   workspaceId?: string;
-  projectId?: string;
   name?: string;
   cpuCores?: number;
   memoryMb?: number;

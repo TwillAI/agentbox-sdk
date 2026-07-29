@@ -76,7 +76,6 @@ export class TenkiSandboxAdapter extends SandboxAdapter<
   private readonly client: TenkiClient;
   private session?: Session;
   private clientClosed = false;
-  private projectContext?: { workspaceId?: string; projectId?: string };
   private readonly previewLinks = new Map<number, string>();
 
   constructor(options: TenkiSandboxOptions) {
@@ -169,12 +168,8 @@ export class TenkiSandboxAdapter extends SandboxAdapter<
       createOptions.maxDurationMs = this.options.autoStopMs;
     }
 
-    const context = await this.resolveProjectContext();
-    if (context.workspaceId !== undefined) {
-      createOptions.workspaceId = context.workspaceId;
-    }
-    if (context.projectId !== undefined) {
-      createOptions.projectId = context.projectId;
+    if (provider?.workspaceId !== undefined) {
+      createOptions.workspaceId = provider.workspaceId;
     }
 
     const session = await this.client.createAndWait(createOptions);
@@ -197,41 +192,6 @@ export class TenkiSandboxAdapter extends SandboxAdapter<
         );
       }
     }
-  }
-
-  private async resolveProjectContext(): Promise<{
-    workspaceId?: string;
-    projectId?: string;
-  }> {
-    const provider = this.options.provider;
-    if (provider?.projectId) {
-      return {
-        workspaceId: provider.workspaceId,
-        projectId: provider.projectId,
-      };
-    }
-    if (this.projectContext) {
-      return this.projectContext;
-    }
-
-    const identity = await this.client.whoAmI();
-    const workspace =
-      (provider?.workspaceId
-        ? identity.workspaces.find((w) => w.id === provider.workspaceId)
-        : undefined) ?? identity.workspaces[0];
-    const project = workspace?.projects[0];
-    if (!workspace || !project) {
-      throw new Error(
-        "Tenki: could not resolve a default project. " +
-          "Set `provider.projectId` (and optionally `provider.workspaceId`).",
-      );
-    }
-
-    this.projectContext = {
-      workspaceId: workspace.id,
-      projectId: project.id,
-    };
-    return this.projectContext;
   }
 
   async run(
