@@ -2,8 +2,6 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 import {
-  isTerminal,
-  isReady,
   TenkiSandbox as TenkiClient,
   type CreateOptions,
   type ProcessRunHandle,
@@ -23,7 +21,6 @@ import {
   type TenkiSandboxOptions,
 } from "../types";
 import { AsyncQueue } from "../../shared/async-queue";
-import { debugSandbox } from "../../shared/debug";
 import { asError, suppressUnhandledRejection } from "../../shared/errors";
 import { pipeReadableStream } from "../../shared/streams";
 import { shellQuote, toShellCommand } from "../../shared/shell";
@@ -59,6 +56,25 @@ function bytesToStream(data: Uint8Array): ReadableStream<Uint8Array> {
   });
 }
 
+const SESSION_GONE_ERRORS = new Set([
+  "SessionNotFoundError",
+  "SessionExpiredError",
+  "SessionTerminatedError",
+]);
+
+const WARM_REUSABLE_STATES = new Set<string>([
+  "RUNNING",
+  "PAUSED",
+  "CREATING",
+  "RESUMING",
+]);
+
+const PREVIEW_EXPIRY_MARGIN_MS = 5_000;
+
+function isSessionGone(error: unknown): boolean {
+  return error instanceof Error && SESSION_GONE_ERRORS.has(error.name);
+}
+
 function matchesAllTags(
   candidate: Record<string, string> | undefined,
   required: Record<string, string>,
@@ -76,7 +92,10 @@ export class TenkiSandboxAdapter extends SandboxAdapter<
   private readonly client: TenkiClient;
   private session?: Session;
   private clientClosed = false;
-  private readonly previewLinks = new Map<number, string>();
+  private readonly previewLinks = new Map<
+    number,
+    { url: string; expiresAtMs?: number }
+  >();
 
   constructor(options: TenkiSandboxOptions) {
     super(options);
@@ -120,8 +139,10 @@ export class TenkiSandboxAdapter extends SandboxAdapter<
     if (existing) {
       this.session = existing;
       this.isWarmFlag = true;
-      if (!isReady(existing.state)) {
+      if (existing.state === "PAUSED") {
         await existing.resume();
+      } else if (existing.state !== "RUNNING") {
+        await existing.waitReady();
       }
       return;
     }
@@ -176,20 +197,26 @@ export class TenkiSandboxAdapter extends SandboxAdapter<
     this.session = session;
 
     if (this.workingDir !== TENKI_FS_ROOT) {
-      const dir = shellQuote(this.workingDir);
-      const result = await session.run(
-        [
-          "/bin/sh",
-          "-c",
-          `mkdir -p ${dir} && chown --reference=${TENKI_FS_ROOT} ${dir}`,
-        ],
-        { privileged: true },
-      );
-      if (result.exitCode !== 0) {
-        throw new Error(
-          `Failed to create Tenki working directory ${this.workingDir} ` +
-            `(exit ${result.exitCode}): ${decoder.decode(result.stderr).trim()}`,
+      try {
+        const dir = shellQuote(this.workingDir);
+        const result = await session.run(
+          [
+            "/bin/sh",
+            "-c",
+            `mkdir -p ${dir} && chown --reference=${TENKI_FS_ROOT} ${dir}`,
+          ],
+          { privileged: true },
         );
+        if (result.exitCode !== 0) {
+          throw new Error(
+            `Failed to create Tenki working directory ${this.workingDir} ` +
+              `(exit ${result.exitCode}): ${decoder.decode(result.stderr).trim()}`,
+          );
+        }
+      } catch (error) {
+        this.session = undefined;
+        await session.close().catch(() => undefined);
+        throw asError(error);
       }
     }
   }
@@ -308,11 +335,34 @@ export class TenkiSandboxAdapter extends SandboxAdapter<
     suppressUnhandledRejection(completion);
 
     let killedResolve: ((result: CommandResult) => void) | undefined;
-    const killedResult = new Promise<CommandResult>((resolve) => {
+    let timeoutReject: ((error: Error) => void) | undefined;
+    const settledEarly = new Promise<CommandResult>((resolve, reject) => {
       killedResolve = resolve;
+      timeoutReject = reject;
     });
-    const settled = Promise.race([completion, killedResult]);
+    const settled = Promise.race([completion, settledEarly]);
     suppressUnhandledRejection(settled);
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const clearTimer = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+    };
+    void completion.then(clearTimer, clearTimer);
+
+    const timeoutMs = options?.timeoutMs;
+    if (timeoutMs && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        void handle.kill().catch(() => undefined);
+        const error = new Error(
+          `Tenki command timed out after ${timeoutMs}ms: ${toShellCommand(command)}`,
+        );
+        queue.fail(error);
+        timeoutReject?.(error);
+      }, timeoutMs);
+    }
 
     let stdinWriter: WritableStreamDefaultWriter<Uint8Array> | undefined;
 
@@ -327,6 +377,7 @@ export class TenkiSandboxAdapter extends SandboxAdapter<
       },
       wait: () => settled,
       kill: async () => {
+        clearTimer();
         await handle.kill().catch(() => undefined);
         queue.push({
           type: "exit",
@@ -439,54 +490,62 @@ export class TenkiSandboxAdapter extends SandboxAdapter<
 
   async delete(): Promise<void> {
     const session = this.session;
-    this.session = undefined;
-    this.previewLinks.clear();
     if (session) {
-      await session.close().catch(() => undefined);
+      try {
+        await session.close();
+      } catch (error) {
+        if (!isSessionGone(error)) {
+          throw asError(error);
+        }
+      }
+      this.session = undefined;
+      this.previewLinks.clear();
     }
     this.closeClient();
   }
 
   async openPort(port: number): Promise<void> {
     this.requireProvisioned();
-    const session = this.requireSession();
-    const exposed = await session.exposePort(port, this.previewPortOptions());
-    this.previewLinks.set(port, exposed.previewUrl);
+    await this.exposePreviewLink(port);
   }
 
   async getPreviewLink(port: number): Promise<string> {
     this.requireProvisioned();
     const cached = this.previewLinks.get(port);
-    if (cached) {
-      return cached;
+    if (
+      cached &&
+      (cached.expiresAtMs === undefined ||
+        cached.expiresAtMs - PREVIEW_EXPIRY_MARGIN_MS > Date.now())
+    ) {
+      return cached.url;
     }
-    const session = this.requireSession();
-    const exposed = await session.exposePort(port, this.previewPortOptions());
-    this.previewLinks.set(port, exposed.previewUrl);
-    return exposed.previewUrl;
+    return this.exposePreviewLink(port);
   }
 
-  private previewPortOptions(): { ttlMs: number } | undefined {
+  private async exposePreviewLink(port: number): Promise<string> {
+    const session = this.requireSession();
     const ttlMs = this.options.provider?.previewTtlMs;
-    return ttlMs ? { ttlMs } : undefined;
+    const exposed = await session.exposePort(
+      port,
+      ttlMs ? { ttlMs } : undefined,
+    );
+    const expiresAtMs =
+      exposed.expiresAt?.getTime() ?? (ttlMs ? Date.now() + ttlMs : undefined);
+    this.previewLinks.set(port, { url: exposed.previewUrl, expiresAtMs });
+    return exposed.previewUrl;
   }
 
   private async findMatchingSession(
     desiredTags: Record<string, string>,
   ): Promise<Session | undefined> {
-    try {
-      const sessions = await this.client.list({
-        tags: [this.providerMarker()],
-      });
-      return sessions.find(
-        (session) =>
-          !isTerminal(session.state) &&
-          matchesAllTags(session.metadata, desiredTags),
-      );
-    } catch (error) {
-      debugSandbox("tenki warm-reuse lookup failed: %o", error);
-      return undefined;
-    }
+    const sessions = await this.client.list({
+      tags: [this.providerMarker()],
+    });
+    return sessions.find(
+      (session) =>
+        WARM_REUSABLE_STATES.has(session.state) &&
+        matchesAllTags(session.metadata, desiredTags),
+    );
   }
 
   private getTags(): Record<string, string> {
