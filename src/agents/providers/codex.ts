@@ -666,33 +666,37 @@ async function materializeCodexImage(
     return part.source.url;
   }
 
-  // Per-turn image attachments live alongside the codex layout root,
-  // not inside `<codexDir>` itself, so codex doesn't try to load them
-  // as discoverable config artifacts.
+  const data = Buffer.from(part.source.data, "base64");
+  if (data.length === 0) {
+    throw new Error("Cannot attach an empty image to Codex.");
+  }
+
   const root = agentboxRoot(AgentProvider.Codex, Boolean(options.sandbox));
   const imagePath = path.join(
     root,
     "inputs",
-    `codex-image-${index}${codexImageExtension(part.mediaType)}`,
+    `codex-image-${index}-${crypto.randomUUID()}${codexImageExtension(part.mediaType)}`,
   );
 
   if (options.sandbox) {
-    const encodedPath = `${imagePath}.b64`;
-    await options.sandbox.uploadAndRun(
-      [{ path: encodedPath, content: part.source.data }],
-      [
-        `mkdir -p ${shellQuote(path.posix.dirname(imagePath))}`,
-        `(base64 --decode < ${shellQuote(encodedPath)} > ${shellQuote(imagePath)} || base64 -D < ${shellQuote(encodedPath)} > ${shellQuote(imagePath)})`,
-        `rm -f ${shellQuote(encodedPath)}`,
-      ].join(" && "),
+    const result = await options.sandbox.uploadAndRun(
+      [{ path: imagePath, content: data }],
+      `test "$(wc -c < ${shellQuote(imagePath)})" -eq ${data.length}`,
       { cwd: options.cwd, env: options.env },
     );
+
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `Failed to upload image attachment to Codex (exit ${result.exitCode}): the file could not be written or its size did not match.`,
+      );
+    }
+
     return imagePath;
   }
 
   const fs = await import("node:fs/promises");
   await fs.mkdir(path.dirname(imagePath), { recursive: true });
-  await fs.writeFile(imagePath, Buffer.from(part.source.data, "base64"));
+  await fs.writeFile(imagePath, data);
   return imagePath;
 }
 
