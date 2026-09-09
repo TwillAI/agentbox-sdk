@@ -62,8 +62,7 @@ export interface AgentRunConfig {
    * Provider mapping:
    * - claude-code: `query({ resume, resumeSessionAt, forkSession: true })`
    * - opencode: `POST /session/:forkSessionId/fork { messageID }`
-   * - codex: emulated via `thread/fork` + `thread/rollback` (no native
-   *   message-level fork in the codex app-server)
+   * - codex: `thread/fork { threadId, lastTurnId: forkAtMessageId }`
    */
   forkSessionId?: string;
   /**

@@ -229,26 +229,28 @@ function buildResumeParams(
     approvalPolicy: isInteractiveApproval(options) ? "untrusted" : "never",
     sandbox: buildCodexSandboxMode(options),
     developerInstructions: request.run.systemPrompt ?? null,
+    // We only need the thread id back; we never read `thread.turns`.
+    // Without this Codex hydrates the full history into the response and
+    // emits a `deprecationNotice` ("Full-history hydration is deprecated
+    // for paginated threads").
+    excludeTurns: true,
   };
 }
 
 /**
- * Codex has no native message-level fork: `thread/fork` only accepts a
- * `threadId` and copies the entire history. We emulate the fork-at-message
- * primitive by:
+ * Fork-at-message maps onto Codex's native `thread/fork`:
  *
- *   1. `thread/fork({ threadId: forkSessionId })` — clones the source
- *      thread into a new id. The response carries the cloned `thread.turns`
- *      list so we don't need a separate `thread/resume` round-trip.
- *   2. Locating `forkAtMessageId` (a turn id captured from a prior run)
- *      in `thread.turns` and computing how many turns follow it.
- *   3. `thread/rollback({ threadId, numTurns })` to drop those trailing
- *      turns. No-op when the fork point is already the last turn.
+ *   - `threadId: forkSessionId` clones the source thread into a new id.
+ *   - `lastTurnId: forkAtMessageId` (a turn id captured from a prior run)
+ *     tells Codex to fork through that turn inclusive and drop everything
+ *     after it, so no follow-up `thread/rollback` is needed. Codex rejects
+ *     the request if the turn id is unknown or still in progress.
+ *   - `excludeTurns: true` keeps `thread.turns` out of the response; we
+ *     don't read it, and hydrating it triggers a `deprecationNotice`.
  *
  * Schema source of truth:
  *   - codex-rs/app-server-protocol/schema/typescript/v2/ThreadForkParams.ts
- *   - codex-rs/app-server-protocol/schema/typescript/v2/ThreadRollbackParams.ts
- *   - Turn.ts (Turn.id is the message id we match against).
+ *   - Turn.ts (Turn.id is the message id we fork through).
  */
 function buildForkParams(
   cwd: string,
@@ -257,11 +259,13 @@ function buildForkParams(
 ) {
   return {
     threadId: request.run.forkSessionId,
+    lastTurnId: request.run.forkAtMessageId ?? null,
     cwd,
     model: request.run.model ?? null,
     approvalPolicy: isInteractiveApproval(options) ? "untrusted" : "never",
     sandbox: buildCodexSandboxMode(options),
     developerInstructions: request.run.systemPrompt ?? null,
+    excludeTurns: true,
   };
 }
 
@@ -1594,9 +1598,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       }
 
       const cwd = request.options.cwd ?? process.cwd();
-      type CodexThreadResponse = {
-        thread: { id: string; turns?: Array<{ id: string }> };
-      };
+      type CodexThreadResponse = { thread: { id: string } };
       let threadResponse: CodexThreadResponse;
       let threadResultEventName: string;
       if (request.run.forkSessionId) {
@@ -1627,32 +1629,6 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       sink.emitRaw(
         toRawEvent(request.runId, threadResponse, threadResultEventName),
       );
-
-      if (request.run.forkSessionId) {
-        const targetTurnId = request.run.forkAtMessageId;
-        const turns = threadResponse.thread.turns ?? [];
-        const targetIndex = turns.findIndex((turn) => turn.id === targetTurnId);
-        if (targetIndex < 0) {
-          throw new Error(
-            `Codex fork: turn id ${String(targetTurnId)} not found in source thread ${request.run.forkSessionId}.`,
-          );
-        }
-        const numTurns = turns.length - 1 - targetIndex;
-        if (numTurns > 0) {
-          const rollbackResponse = await client.request<CodexThreadResponse>(
-            "thread/rollback",
-            { threadId: rootThreadId, numTurns },
-          );
-          rawPayloads.push(rollbackResponse);
-          sink.emitRaw(
-            toRawEvent(
-              request.runId,
-              rollbackResponse,
-              "thread/rollback:result",
-            ),
-          );
-        }
-      }
 
       await client.request<{ turn?: { id?: string } }>(
         "turn/start",
