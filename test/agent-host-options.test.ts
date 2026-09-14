@@ -27,7 +27,7 @@ describe("host execution configuration", () => {
     expect(params).not.toHaveProperty("sandboxPolicy");
     expect(params).not.toHaveProperty("approvalPolicy");
     expect(() => new Agent("codex", { configuration: "native", enableRtk: true })).toThrow(/harness's own/);
-    expect(() => new Agent("codex", { configuration: "native", sandbox: new Sandbox("daytona", {}) })).toThrow(/host execution/);
+    expect(() => new Agent("codex", { configuration: "native", sandbox: new Sandbox("daytona", { provider: { apiKey: "test" } }) })).toThrow(/host execution/);
   });
   it("isolates persistent state by environment and provider", () => {
     expect(agentboxRoot("codex", false, "/work/first")).toBe("/work/first/codex");
@@ -37,7 +37,7 @@ describe("host execution configuration", () => {
   });
   it("rejects relative host directories and host settings on cloud agents", () => {
     expect(() => new Agent("codex", { stateDirectory: "relative" })).toThrow(/absolute/);
-    expect(() => new Agent("codex", { sandbox: new Sandbox("daytona", {}), stateDirectory: "/work" })).toThrow(/host execution/);
+    expect(() => new Agent("codex", { sandbox: new Sandbox("daytona", { provider: { apiKey: "test" } }), stateDirectory: "/work" })).toThrow(/host execution/);
   });
   it("keeps native Codex read-only unless a caller explicitly enables writes", () => {
     expect(buildCodexSandboxMode({ cwd: "/work" })).toBe("read-only");
