@@ -73,6 +73,10 @@ export interface AgentRunConfig {
    */
   forkAtMessageId?: string;
   reasoning?: AgentReasoningEffort;
+  /** Native collaboration mode; independent of tool permissions. */
+  mode?: "plan" | "default";
+  /** Native goal objective. Unsupported harnesses reject it. */
+  goal?: string;
 }
 
 export type AgentApprovalMode = "auto" | "interactive";
@@ -83,18 +87,51 @@ export type AgentPermissionKind =
   | "tool"
   | "network"
   | "file-change"
+  | "question"
+  | "plan"
   | "unknown";
 
 export type AgentPermissionDecision = "allow" | "deny";
+
+export interface AgentUserQuestion {
+  id: string;
+  question: string;
+  header?: string;
+  options: Array<{ label: string; description?: string }>;
+  multiple: boolean;
+  allowCustom: boolean;
+}
+
+export interface AgentUserAnswer {
+  questionId: string;
+  values: string[];
+}
 
 export interface AgentPermissionResponse {
   requestId: string;
   decision: AgentPermissionDecision;
   remember?: boolean;
+  /** Required when allowing a question request. Never changes tool arguments. */
+  answers?: AgentUserAnswer[];
 }
 
 export interface AgentOptionsBase {
   sandbox?: Sandbox;
+  /** Use the host harness's own settings and built-in prompt without generating
+   * AgentBox configuration, skills, hooks, plugins, or MCP definitions.
+   * Available only for host execution. The default remains "managed".
+   */
+  configuration?: "managed" | "native";
+  /** Private, persistent host directory for generated configuration and sessions.
+   * Use one directory per execution environment. Must be absolute; unavailable
+   * for sandbox-backed agents, whose state belongs inside the sandbox.
+   */
+  stateDirectory?: string;
+  /** Host process ownership. Use "inherited" only when the caller supervises
+   * an existing POSIX process group and will terminate its descendants.
+   * The default "owned" gives each native runtime its own process group.
+   */
+  processGroup?: "owned" | "inherited";
   cwd?: string;
   env?: Record<string, string>;
   /**
@@ -127,6 +164,10 @@ export interface AgentOptionsBase {
    */
   customHeaders?: Record<string, string>;
   approvalMode?: AgentApprovalMode;
+  /** Route questions and plan approvals to the caller even with automatic tool approval. */
+  interactiveQuestions?: boolean;
+  /** Explicitly bypass the harness tool sandbox; does not answer user questions. */
+  fullAccess?: boolean;
   mcps?: AgentMcpConfig[];
   skills?: AgentSkillConfig[];
   subAgents?: AgentSubAgentConfig[];
@@ -134,6 +175,12 @@ export interface AgentOptionsBase {
 }
 
 export interface CodexProviderOptions {
+  /** Managed host execution defaults to read-only; native configuration uses the CLI's settings. */
+  sandboxMode?: "read-only" | "workspace-write" | "danger-full-access";
+  /** Additional task worktrees permitted by native Codex's write sandbox. */
+  writableRoots?: string[];
+  /** Network access for an explicit host workspace-write policy; defaults to false. */
+  networkAccess?: boolean;
   binary?: string;
   env?: Record<string, string>;
   brokerEndpoint?: string;

@@ -1,6 +1,6 @@
 {
   "name": "agentbox-sdk",
-  "version": "0.1.503",
+  "version": "0.1.508",
   "description": "Swappable coding agents and sandbox providers for Bun and TypeScript.",
   "license": "MIT",
   "repository": {
@@ -42,6 +42,7 @@
   "scripts": {
     "dev": "tsup src/index.ts src/enums.ts src/agents/index.ts src/sandboxes/index.ts src/events/index.ts src/cli.ts --format esm --dts --clean --watch",
     "build": "tsup src/index.ts src/enums.ts src/agents/index.ts src/sandboxes/index.ts src/events/index.ts src/cli.ts --format esm --dts --clean",
+    "prepack": "npm run build",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings=0",
     "lint:fix": "eslint . --fix",
@@ -58,6 +59,7 @@
     "bun": ">=1.1.0"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.2.141",
     "@daytonaio/sdk": "^0.171.0",
     "@types/debug": "^4.1.13",
     "@vercel/sandbox": "2.0.0-beta.13",
@@ -67,10 +69,10 @@
     "eventsource-parser": "^3.0.6",
     "modal": "^0.7.4",
     "tar-stream": "^3.1.8",
-    "ws": "^8.20.0"
+    "ws": "^8.20.0",
+    "zod": "4.3.6"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.123",
     "@eslint/js": "^10.0.1",
     "@types/dockerode": "^3.3.42",
     "@types/node": "^25.5.2",

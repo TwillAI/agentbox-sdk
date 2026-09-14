@@ -504,6 +504,77 @@ AGENTBOX_RUN_MATRIX_E2E=1 npm run test:e2e:matrix     # provider matrix
 
 Live test suites are opt-in because they provision real infrastructure.
 
+## Host execution settings
+
+Use `configuration: "native"` to run a host harness with its own configuration,
+built-in prompt, credentials, and repository instructions. AgentBox does not
+generate settings, skills, commands, subagents, hooks, plugins, or MCP definitions
+in this mode. It cannot be combined with a sandbox or AgentBox-managed skills,
+MCPs, commands, subagents, or RTK. Omit `systemPrompt` when starting a turn to keep
+the harness's built-in instructions unchanged.
+
+```ts
+const agent = new Agent("codex", {
+  cwd: "/absolute/path/to/project",
+  configuration: "native",
+  approvalMode: "interactive",
+});
+await agent.setup();
+```
+
+Start a turn with `agent.stream({ input })`, consume its async event iterator,
+and answer permission requests with `run.respondToPermission()`. Await
+`run.finished` for the result and call `agent.killServer()` to release the runtime.
+
+The default `configuration: "managed"` retains AgentBox-generated configuration
+for host and sandbox execution.
+
+`stateDirectory` selects a private, persistent directory for generated agent
+configuration and session state on the host. It must be an absolute path and
+cannot be combined with `sandbox`. Use a different directory for each execution
+environment to prevent unrelated local jobs from overwriting configuration.
+This setting does not copy credentials from the user's account.
+
+With native configuration, Codex uses the user's sandbox and approval settings.
+Managed host execution defaults to read-only. An explicit
+`provider: { sandboxMode: "workspace-write" }` enables a host write policy;
+`writableRoots` adds allowed directories and `networkAccess` enables network
+access for that policy (disabled by default). The shared
+`approvalMode: "interactive"` routes permission requests to the caller; it does
+not itself change the native harness's policy. Cloud sandbox defaults are unchanged.
+
+Host Claude runs the Anthropic SDK with the SDK-matched CLI by default.
+`provider.binary` explicitly selects another compatible CLI. Sign-in and session
+storage remain CLI-owned. Managed configuration loads generated skills, commands,
+and subagents as a private local plugin. Native configuration loads user, project,
+and local settings instead. Neither mode copies the CLI's credentials.
+
+Each host OpenCode Agent owns an authenticated loopback server on an ephemeral
+port. Managed configuration uses an isolated configuration directory; native
+configuration preserves the user's configuration paths. `killServer()` stops
+only that Agent's process. It never discovers or kills another server by port number.
+
+All three providers normalize interactive questions into `permission.requested`
+events with `kind: "question"`. Respond with `decision: "allow"` and an `answers`
+array containing each `questionId` and its selected or custom `values`, or use
+`decision: "deny"` to skip. Invalid answers leave the request pending for correction.
+Question answers cannot modify unrelated tool arguments. Ordinary tool requests
+use the same API without `answers`.
+
+Native runtimes own a POSIX process group by default. Termination is bounded and
+escalates to SIGKILL if the process ignores SIGTERM. A supervisor that launches
+each run in its own process group can set `processGroup: "inherited"`; that
+supervisor is then responsible for stopping the complete group before reporting
+that a run has stopped. This option is unavailable for cloud sandboxes.
+
+## Packaging
+
+`npm pack` builds the package from maintained TypeScript source before creating
+the archive. Host execution includes the pinned Anthropic SDK and its Zod peer
+as runtime dependencies; consumers do not need package-manager extensions.
+Run `npm run check` before publishing. Provider integration tests use fake local
+CLIs and SDK mocks; live tests remain opt-in.
+
 ## License
 
 MIT

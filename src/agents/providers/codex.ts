@@ -19,7 +19,8 @@ import {
   type UserContent,
 } from "../types";
 import { SandboxProvider } from "../../sandboxes/types";
-import { isInteractiveApproval } from "../approval";
+import { isInteractiveApproval, hasInteractiveQuestions } from "../approval";
+import { normalizeUserQuestions, questionReply } from "../questions";
 import {
   joinTextParts,
   mapToCodexPromptParts,
@@ -87,7 +88,7 @@ type CodexRpcClient = {
  */
 function codexConfigDir(options: AgentOptions<"codex">): string {
   return path.join(
-    agentboxRoot(AgentProvider.Codex, Boolean(options.sandbox)),
+    agentboxRoot(AgentProvider.Codex, Boolean(options.sandbox), options.stateDirectory),
     ".codex",
   );
 }
@@ -192,10 +193,10 @@ function compactEnv(
   ) as Record<string, string>;
 }
 
-function buildCodexSandboxMode(
+export function buildCodexSandboxMode(
   options: AgentExecutionRequest<"codex">["options"],
 ) {
-  return options.sandbox ? "workspace-write" : "read-only";
+  return options.fullAccess ? "danger-full-access" : options.provider?.sandboxMode ?? (options.configuration === "native" ? undefined : options.sandbox ? "workspace-write" : "read-only");
 }
 
 function buildThreadParams(
@@ -206,14 +207,14 @@ function buildThreadParams(
   return {
     cwd,
     model: request.run.model ?? null,
-    approvalPolicy: isInteractiveApproval(options) ? "untrusted" : "never",
+    ...(options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
     sandbox: buildCodexSandboxMode(options),
     serviceName: "agentbox",
     // Persist the rollout on disk so follow-up runs can call `thread/resume`.
     // `ephemeral: true` threads have no rollout file and resume fails with
     // "no rollout found for thread id ...".
     experimentalRawEvents: true,
-    developerInstructions: request.run.systemPrompt ?? null,
+    ...(request.run.systemPrompt ? { developerInstructions: request.run.systemPrompt } : options.configuration === "native" ? {} : { developerInstructions: null }),
   };
 }
 
@@ -226,9 +227,9 @@ function buildResumeParams(
     threadId: request.run.resumeSessionId,
     cwd,
     model: request.run.model ?? null,
-    approvalPolicy: isInteractiveApproval(options) ? "untrusted" : "never",
+    ...(options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
     sandbox: buildCodexSandboxMode(options),
-    developerInstructions: request.run.systemPrompt ?? null,
+    ...(request.run.systemPrompt ? { developerInstructions: request.run.systemPrompt } : options.configuration === "native" ? {} : { developerInstructions: null }),
     // We only need the thread id back; we never read `thread.turns`.
     // Without this Codex hydrates the full history into the response and
     // emits a `deprecationNotice` ("Full-history hydration is deprecated
@@ -262,9 +263,9 @@ function buildForkParams(
     lastTurnId: request.run.forkAtMessageId ?? null,
     cwd,
     model: request.run.model ?? null,
-    approvalPolicy: isInteractiveApproval(options) ? "untrusted" : "never",
+    ...(options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
     sandbox: buildCodexSandboxMode(options),
-    developerInstructions: request.run.systemPrompt ?? null,
+    ...(request.run.systemPrompt ? { developerInstructions: request.run.systemPrompt } : options.configuration === "native" ? {} : { developerInstructions: null }),
     excludeTurns: true,
   };
 }
@@ -275,14 +276,25 @@ function buildTurnSandboxPolicy(
   | {
       type: "workspaceWrite";
       networkAccess: boolean;
+      writableRoots?: string[];
     }
   | {
       type: "externalSandbox";
       networkAccess: "enabled" | "restricted";
     }
+  | { type: "dangerFullAccess" }
   | undefined {
+  if (options.fullAccess || options.provider?.sandboxMode === "danger-full-access") return { type: "dangerFullAccess" };
   if (!options.sandbox) {
-    return undefined;
+    if (buildCodexSandboxMode(options) === undefined) return undefined;
+    if (buildCodexSandboxMode(options) === "read-only") return undefined;
+    return {
+      type: "workspaceWrite",
+      networkAccess: options.provider?.networkAccess ?? false,
+      ...(options.provider?.writableRoots?.length
+        ? { writableRoots: options.provider.writableRoots }
+        : {}),
+    };
   }
 
   if (options.sandbox.provider === SandboxProvider.LocalDocker) {
@@ -308,12 +320,16 @@ export function buildCodexTurnStartParams(params: {
   return {
     threadId,
     input: inputItems,
-    approvalPolicy: isInteractiveApproval(request.options)
-      ? "untrusted"
-      : "never",
+    ...(request.options.configuration === "native" && !request.options.fullAccess ? {} : {
+      approvalPolicy: !request.options.fullAccess && isInteractiveApproval(request.options) ? "untrusted" : "never",
+    }),
     ...(sandboxPolicy ? { sandboxPolicy } : {}),
     model: request.run.model ?? null,
     effort: request.run.reasoning ?? null,
+    ...(request.run.mode ? { collaborationMode: {
+      mode: request.run.mode,
+      settings: { model: request.run.model, reasoning_effort: request.run.reasoning ?? null, developer_instructions: null },
+    } } : {}),
     outputSchema: null,
   };
 }
@@ -360,7 +376,7 @@ function buildCodexCommandArgs(
     overrides.push(["supports_websockets", "false"]);
   }
   const overrideArgs = overrides.flatMap(([k, v]) => ["-c", `${k}=${v}`]);
-  return ["-u", "XDG_CONFIG_HOME", binary, ...overrideArgs, ...args];
+  return [...(options?.configuration === "native" ? [] : ["-u", "XDG_CONFIG_HOME"]), binary, ...overrideArgs, ...args];
 }
 
 function toNormalizedCodexEvents(
@@ -509,6 +525,7 @@ function toNormalizedCodexEvents(
 function createCodexPermissionEvent(
   request: AgentExecutionRequest<"codex">,
   notification: CodexNotification,
+  fileChanges?: unknown[],
 ): PermissionRequestedEvent | null {
   const raw = toRawEvent(request.runId, notification, notification.method);
   const params = notification.params;
@@ -571,7 +588,7 @@ function createCodexPermissionEvent(
           typeof params.reason === "string"
             ? params.reason
             : "Codex wants to modify files.",
-        input: params,
+        input: fileChanges ? { ...params, changes: fileChanges } : params,
         canRemember: availableDecisions.includes("acceptForSession"),
       },
     ) as PermissionRequestedEvent;
@@ -675,7 +692,7 @@ async function materializeCodexImage(
     throw new Error("Cannot attach an empty image to Codex.");
   }
 
-  const root = agentboxRoot(AgentProvider.Codex, Boolean(options.sandbox));
+  const root = agentboxRoot(AgentProvider.Codex, Boolean(options.sandbox), options.stateDirectory);
   const imagePath = path.join(
     root,
     "inputs",
@@ -933,6 +950,7 @@ async function connectRemoteCodexAppServer(
  */
 async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
   const options = request.options;
+  if (options.configuration === "native") return;
   const provider = request.provider;
   const hooks = assertHooksSupported(provider, options);
   assertCommandsSupported(provider, options.commands);
@@ -1186,13 +1204,13 @@ async function createRuntime(
   const codexDir = codexConfigDir(options);
   const env = compactEnv({
     ...(options.env ?? {}),
-    CODEX_HOME: codexDir,
+    ...(options.configuration === "native" ? {} : { CODEX_HOME: codexDir }),
     ...(options.provider?.env ?? {}),
   });
   // The codex daemon launches with cwd=<root>. The thread it runs
   // operates on whatever cwd the per-thread `thread/start` params
   // specify, which is `options.cwd` set by the caller.
-  const runtimeCwd = path.dirname(codexDir);
+  const runtimeCwd = options.configuration === "native" ? options.cwd : path.dirname(codexDir);
   const inputItems = await buildCodexInputItems(options, inputParts);
 
   const usesRemoteWebSocket =
@@ -1275,6 +1293,7 @@ async function createRuntime(
   }
 
   const processHandle = spawnCommand({
+    processGroup: options.processGroup !== "inherited",
     command: "env",
     args: codexArgs,
     cwd: runtimeCwd,
@@ -1284,6 +1303,7 @@ async function createRuntime(
     },
   });
 
+  processHandle.child.stderr.resume();
   return {
     source: linesFromNodeStream(processHandle.child.stdout),
     writeLine: async (line: string) => {
@@ -1484,6 +1504,13 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
     sink.onMessage(sendTurn);
 
     const rawPayloads: Array<Record<string, unknown>> = [];
+    // File approval frames only contain an item ID; the preceding item event
+    // carries paths and diffs. Keep a bounded, thread/turn-scoped preview for
+    // human review without changing the approval decision sent to Codex.
+    const pendingFileChanges = new Map<string, unknown[]>();
+    const fileItemKey = (params: Record<string, unknown> | undefined, itemId: unknown) =>
+      typeof params?.threadId === "string" && typeof params.turnId === "string" && typeof itemId === "string"
+        ? `${params.threadId}:${params.turnId}:${itemId}` : undefined;
     let streamedText = "";
     const completion = new Promise<{
       text?: string;
@@ -1506,19 +1533,37 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
           rawPayloads.push(message);
           sink.emitRaw(raw);
 
-          if (
-            message.method === "tool/requestUserInput" &&
-            message.id !== undefined
-          ) {
-            reject(
-              new Error(
-                "Codex tool/requestUserInput approvals are not yet supported by AgentBox.",
-              ),
-            );
-            return;
+          const item = message.params?.item as Record<string, unknown> | undefined;
+          const itemKey = fileItemKey(message.params, item?.id);
+          if (itemKey && item?.type === "fileChange") {
+            if (message.method === "item/completed") pendingFileChanges.delete(itemKey);
+            else if (message.method === "item/started" && Array.isArray(item.changes)) {
+              if (pendingFileChanges.size >= 128) pendingFileChanges.delete(pendingFileChanges.keys().next().value!);
+              pendingFileChanges.set(itemKey, item.changes);
+            }
           }
 
-          const permissionEvent = createCodexPermissionEvent(request, message);
+          if (
+            (message.method === "item/tool/requestUserInput" || message.method === "tool/requestUserInput") &&
+            message.id !== undefined
+          ) {
+            const questions = normalizeUserQuestions("codex", message.params);
+            const response = hasInteractiveQuestions(request.options)
+              ? await sink.requestPermission(createNormalizedEvent("permission.requested", {
+                  provider: request.provider, runId: request.runId, raw,
+                }, {
+                  requestId: String(message.id), kind: "question", toolName: "request_user_input",
+                  title: "Your input is needed", input: message.params, questions, canRemember: false,
+                }) as PermissionRequestedEvent)
+              : undefined;
+            await client.respond(message.id, { answers: response?.decision === "allow"
+              ? questionReply("codex", message.params, response.answers ?? []) : {} });
+            continue;
+          }
+
+          const approvalKey = fileItemKey(message.params, message.params?.itemId);
+          const permissionEvent = createCodexPermissionEvent(request, message,
+            approvalKey ? pendingFileChanges.get(approvalKey) : undefined);
           if (permissionEvent && message.id !== undefined) {
             const response = interactiveApproval
               ? await sink.requestPermission(permissionEvent)
@@ -1529,9 +1574,16 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
             await client.respond(message.id, {
               decision: toCodexApprovalDecision(message, response),
             });
+            if (approvalKey) pendingFileChanges.delete(approvalKey);
             continue;
           }
 
+          if (message.method === "item/completed") {
+            const item = message.params?.item as { type?: string; text?: string } | undefined;
+            if (item?.type === "plan" && typeof item.text === "string") {
+              sink.emitEvent(createNormalizedEvent("plan.completed", { provider: request.provider, runId: request.runId }, { text: item.text }));
+            }
+          }
           for (const event of toNormalizedCodexEvents(request.runId, message)) {
             sink.emitEvent(event);
             if (event.type === "text.delta") {
@@ -1630,6 +1682,13 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
         toRawEvent(request.runId, threadResponse, threadResultEventName),
       );
 
+      if (request.run.mode) {
+        const modes = await client.request<{ data: Array<{ mode: string }> }>("collaborationMode/list", {});
+        if (!modes.data.some((mode) => mode.mode === request.run.mode)) throw new Error("This Codex installation does not support the requested planning mode.");
+      }
+      if (request.run.goal) {
+        await client.request("thread/goal/set", { threadId: threadResponse.thread.id, objective: request.run.goal, status: "active" });
+      }
       await client.request<{ turn?: { id?: string } }>(
         "turn/start",
         buildCodexTurnStartParams({

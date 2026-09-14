@@ -102,8 +102,9 @@ Provisioning is **explicit**: `new Sandbox(...)` only stores config; the live sa
 - Fork-at-message is run-scoped and uses `forkSessionId` + `forkAtMessageId`.
   The message id comes from the unified `messageId` field on `message.started`
   events (claude-code: assistant message UUID; opencode: message info id;
-  codex: turn id). Codex has no native message-level fork — the adapter
-  emulates it via `thread/fork` + `thread/rollback`.
+  codex: turn id). Codex forks through `thread/fork` with `lastTurnId`
+  (inclusive), so no `thread/rollback` follows. Forks pass a pre-minted
+  `sessionId` to claude-code so the surfaced session id is the forked one.
 
 ## Repo Map
 

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 
 import {
   createNormalizedEvent,
@@ -30,6 +31,7 @@ import {
   type AgentCostData,
 } from "./types";
 import { normalizeUserInput } from "./input";
+import { validateUserAnswers } from "./questions";
 import type { Sandbox } from "../sandboxes";
 
 function buildAgentOptionsSystemAppendix(
@@ -122,6 +124,17 @@ function prepareAgentOptions<P extends AgentProviderName>(
   // `collectAllAgentReservedPorts()` from `agentbox-sdk` are exported for
   // exactly this purpose. Eliminating this loop removes one Modal RPC per
   // run.
+  if (options.stateDirectory !== undefined) {
+    if (options.sandbox) throw new Error("stateDirectory is only supported for host execution.");
+    if (!path.isAbsolute(options.stateDirectory)) throw new Error("stateDirectory must be an absolute path.");
+  }
+  if (options.sandbox && options.processGroup !== undefined) throw new Error("processGroup is only supported for host execution.");
+  if (options.configuration === "native") {
+    if (options.sandbox) throw new Error("Native configuration is only supported for host execution.");
+    if (options.mcps?.length || options.skills?.length || options.subAgents?.length || options.commands?.length || options.enableRtk) {
+      throw new Error("Native configuration uses the harness's own skills, MCPs, commands, and hooks.");
+    }
+  }
   return options;
 }
 
@@ -291,12 +304,17 @@ class AgentRunController implements AgentRun, AgentRunSink {
       );
     }
 
+    const answers = pending.event.kind === "question" && response.decision === "allow"
+      ? validateUserAnswers(pending.event.questions, response.answers)
+      : undefined;
+    if (response.answers && !answers) throw new Error("Answers are only accepted for an allowed question request");
     this.pendingPermissions.delete(response.requestId);
     const remember = pending.event.canRemember ? response.remember : undefined;
     const resolvedResponse: AgentPermissionResponse = {
       requestId: response.requestId,
       decision: response.decision,
       ...(remember !== undefined ? { remember } : {}),
+      ...(answers ? { answers } : {}),
     };
 
     this.pushEvent(
@@ -310,6 +328,7 @@ class AgentRunController implements AgentRun, AgentRunSink {
           requestId: response.requestId,
           decision: response.decision,
           ...(remember !== undefined ? { remember } : {}),
+          ...(answers ? { answers } : {}),
         },
       ),
     );
@@ -416,6 +435,7 @@ class AgentRunController implements AgentRun, AgentRunSink {
       return;
     }
 
+    if (this.abortRequested) { this.cancel(); return; }
     const normalizedError = asError(error);
     this.clearPendingPermissions(normalizedError);
     this.emitEvent(
@@ -451,6 +471,7 @@ class AgentRunController implements AgentRun, AgentRunSink {
 
   async abort(): Promise<void> {
     this.abortRequested = true;
+    this.clearPendingPermissions(new Error("Agent run cancelled"));
     await this.abortHandler();
   }
 

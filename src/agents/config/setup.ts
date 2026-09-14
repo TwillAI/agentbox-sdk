@@ -28,7 +28,13 @@ function shortLabel(command: string): string {
 export function agentboxRoot(
   provider: AgentProviderName,
   hasSandbox: boolean = true,
+  stateDirectory?: string,
 ): string {
+  if (stateDirectory !== undefined) {
+    if (hasSandbox) throw new Error("stateDirectory is only supported for host execution.");
+    if (!path.isAbsolute(stateDirectory)) throw new Error("stateDirectory must be an absolute path.");
+    return path.join(stateDirectory, provider);
+  }
   return hasSandbox
     ? `/tmp/agentbox/${provider}`
     : path.join(os.tmpdir(), `agentbox-${provider}`);
@@ -110,10 +116,10 @@ class HostSetupTarget implements SetupTarget {
       async () => {
         await Promise.all(
           files.map(async (entry) => {
-            await mkdir(path.dirname(entry.path), { recursive: true });
+            await mkdir(path.dirname(entry.path), { recursive: true, mode: 0o700 });
             const content =
               typeof entry.content === "string" ? entry.content : entry.content;
-            await writeFile(entry.path, content);
+            await writeFile(entry.path, content, { mode: entry.mode ?? 0o600 });
             if (entry.mode && (entry.mode & 0o111) !== 0) {
               await chmod(entry.path, entry.mode);
             }
@@ -336,7 +342,7 @@ export async function createSetupTarget<P extends AgentProviderName>(
     void setupId;
 
     const layout = getAgentLayout(
-      agentboxRoot(provider, Boolean(options.sandbox)),
+      agentboxRoot(provider, Boolean(options.sandbox), options.stateDirectory),
     );
 
     if (options.sandbox) {
@@ -348,7 +354,8 @@ export async function createSetupTarget<P extends AgentProviderName>(
 
     // Host: ensure the deterministic layout exists on disk so the
     // upload-and-run path can drop files straight into it.
-    await mkdir(layout.homeDir, { recursive: true });
+    await mkdir(layout.homeDir, { recursive: true, mode: 0o700 });
+    await chmod(layout.homeDir, 0o700);
     await mkdir(layout.xdgConfigHome, { recursive: true });
     await mkdir(layout.agentsDir, { recursive: true });
     await mkdir(layout.claudeDir, { recursive: true });

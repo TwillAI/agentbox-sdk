@@ -2,9 +2,12 @@ import type { RawAgentEvent } from "./raw";
 import type {
   AgentPermissionDecision,
   AgentPermissionKind,
+  AgentUserQuestion,
+  AgentUserAnswer,
 } from "../agents/types";
 
 export type NormalizedAgentEventType =
+  | "plan.completed"
   | "run.started"
   | "message.started"
   | "message.injected"
@@ -91,6 +94,8 @@ export interface PermissionRequestedEvent extends NormalizedAgentEventBase {
   type: "permission.requested";
   requestId: string;
   kind: AgentPermissionKind;
+  toolName?: string;
+  questions?: AgentUserQuestion[];
   title?: string;
   message?: string;
   input?: unknown;
@@ -102,6 +107,7 @@ export interface PermissionResolvedEvent extends NormalizedAgentEventBase {
   requestId: string;
   decision: AgentPermissionDecision;
   remember?: boolean;
+  answers?: AgentUserAnswer[];
 }
 
 export interface MessageCompletedEvent extends NormalizedAgentEventBase {
@@ -130,7 +136,13 @@ export interface RunErrorEvent extends NormalizedAgentEventBase {
   error: string;
 }
 
+export interface NativePlanEvent extends NormalizedAgentEventBase {
+  type: "plan.completed";
+  text: string;
+}
+
 export type NormalizedAgentEvent =
+  | NativePlanEvent
   | RunStartedEvent
   | MessageStartedEvent
   | MessageInjectedEvent

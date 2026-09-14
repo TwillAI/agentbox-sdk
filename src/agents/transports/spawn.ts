@@ -8,6 +8,9 @@ export interface SpawnCommandOptions {
   args?: string[];
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  /** Own the POSIX process group, including tool subprocesses. */
+  processGroup?: boolean;
+  terminationTimeoutMs?: number;
 }
 
 export interface SpawnedProcess {
@@ -23,6 +26,7 @@ export function spawnCommand(options: SpawnCommandOptions): SpawnedProcess {
     stdio: "pipe",
     shell: process.platform === "win32",
     windowsHide: true,
+    detached: options.processGroup === true && process.platform !== "win32",
   });
 
   const exitPromise = new Promise<number>((resolve, reject) => {
@@ -30,13 +34,40 @@ export function spawnCommand(options: SpawnCommandOptions): SpawnedProcess {
     child.once("close", (code) => resolve(code ?? 0));
   });
 
+  void exitPromise.catch(() => undefined);
+  let killPromise: Promise<void> | undefined;
+  const signalProcess = (signal: NodeJS.Signals) => {
+    try {
+      if (options.processGroup && process.platform !== "win32" && child.pid) process.kill(-child.pid, signal);
+      else child.kill(signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+  };
+  const waitForExit = async (timeoutMs: number): Promise<boolean> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        exitPromise.then(() => true, () => true),
+        new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+      ]);
+    } finally { if (timer) clearTimeout(timer); }
+  };
+
   return {
     child,
     wait: () => exitPromise,
-    kill: async (signal = "SIGTERM") => {
-      child.kill(signal);
-      await exitPromise.catch(() => undefined);
-    },
+    kill: (signal = "SIGTERM") => killPromise ??= (async () => {
+      signalProcess(signal);
+      if (await waitForExit(options.terminationTimeoutMs ?? 3000)) {
+        // A tool can ignore SIGTERM and close its inherited stdio before the
+        // CLI exits. Terminate any remaining members of our own group too.
+        if (options.processGroup && process.platform !== "win32") signalProcess("SIGKILL");
+        return;
+      }
+      signalProcess("SIGKILL");
+      if (!await waitForExit(3000)) throw new Error("The owned agent process did not stop");
+    })(),
   };
 }
 

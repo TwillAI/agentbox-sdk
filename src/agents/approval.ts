@@ -6,6 +6,10 @@ export function getApprovalMode(
   return options.approvalMode ?? "auto";
 }
 
+export function hasInteractiveQuestions(options: Pick<AgentOptionsBase, "interactiveQuestions" | "approvalMode">): boolean {
+  return options.interactiveQuestions ?? isInteractiveApproval(options);
+}
+
 export function isInteractiveApproval(
   options: Pick<AgentOptionsBase, "approvalMode">,
 ): boolean {

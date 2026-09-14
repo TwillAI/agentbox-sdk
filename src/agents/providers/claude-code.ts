@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { AsyncQueue } from "../../shared/async-queue";
+import { spawnCommand, type SpawnedProcess } from "../transports/spawn";
 import path from "node:path";
 
 import type {
   Options as SdkQueryOptions,
+  Query,
   PermissionMode,
   SDKAssistantMessage,
   SDKHookResponseMessage,
@@ -28,7 +31,8 @@ import {
   type AgentSetupRequest,
   type UserContent,
 } from "../types";
-import { shouldAutoApproveClaudeTools } from "../approval";
+import { shouldAutoApproveClaudeTools, hasInteractiveQuestions } from "../approval";
+import { normalizeUserQuestions, questionReply } from "../questions";
 import { mapToClaudeUserContent, validateProviderUserInput } from "../input";
 import {
   assertCommandsSupported,
@@ -68,7 +72,7 @@ import type { Sandbox } from "../../sandboxes";
 // capability token on every route except `/__version`. The version bump
 // forces warm (unauthenticated) daemons on existing sandboxes to respawn
 // with the auth-enabled build.
-const DAEMON_PROTOCOL_VERSION = "3";
+const DAEMON_PROTOCOL_VERSION = "4";
 const DAEMON_PORT = 43180;
 const DAEMON_PATH = "/tmp/agentbox/claude-code/daemon.mjs";
 const DAEMON_LOG_PATH = "/tmp/agentbox/claude-code/daemon.log";
@@ -92,7 +96,7 @@ const DAEMON_READY_POLL_INTERVAL_MS = 250;
  */
 function claudeConfigDir(options: AgentOptions<"claude-code">): string {
   return path.join(
-    agentboxRoot(AgentProvider.ClaudeCode, Boolean(options.sandbox)),
+    agentboxRoot(AgentProvider.ClaudeCode, Boolean(options.sandbox), options.stateDirectory),
     ".claude",
   );
 }
@@ -108,8 +112,8 @@ function claudeConfigDir(options: AgentOptions<"claude-code">): string {
  */
 export function buildClaudeQueryOptions(params: {
   request: AgentExecutionRequest<"claude-code">;
-  settingsPath: string;
-  mcpConfigPath: string;
+  settingsPath?: string;
+  mcpConfigPath?: string;
   cwd?: string;
   env: Record<string, string>;
 }): SdkQueryOptions & { autoApproveTools?: boolean } {
@@ -117,7 +121,7 @@ export function buildClaudeQueryOptions(params: {
   const run = params.request.run;
 
   const extraArgs: Record<string, string | null> = {
-    "mcp-config": params.mcpConfigPath,
+    ...(params.mcpConfigPath ? { "mcp-config": params.mcpConfigPath } : {}),
   };
   for (const arg of provider?.args ?? []) {
     if (typeof arg !== "string") continue;
@@ -142,7 +146,11 @@ export function buildClaudeQueryOptions(params: {
     cwd: params.cwd ?? params.request.options.cwd,
     env: params.env,
     pathToClaudeCodeExecutable: provider?.binary ?? "claude",
-    settings: params.settingsPath,
+    ...(params.settingsPath ? { settings: params.settingsPath } : {}),
+    ...(params.request.options.configuration === "native" ? {
+      settingSources: ["user", "project", "local"] as const,
+      systemPrompt: { type: "preset" as const, preset: "claude_code" as const },
+    } : {}),
     extraArgs,
     includePartialMessages: true,
     forwardSubagentText: true,
@@ -153,10 +161,11 @@ export function buildClaudeQueryOptions(params: {
       : {}),
     ...(run.model ? { model: run.model } : {}),
     ...(effort ? { effort } : {}),
-    ...(provider?.permissionMode
-      ? { permissionMode: provider.permissionMode as PermissionMode }
-      : {}),
-    ...(provider?.permissionMode === "bypassPermissions"
+    ...(run.mode === "plan" ? { permissionMode: "plan" as const }
+      : params.request.options.fullAccess ? { permissionMode: "bypassPermissions" as const }
+      : run.mode === "default" ? { permissionMode: "default" as const }
+      : provider?.permissionMode ? { permissionMode: provider.permissionMode as PermissionMode } : {}),
+    ...((params.request.options.fullAccess || provider?.permissionMode === "bypassPermissions")
       ? { allowDangerouslySkipPermissions: true }
       : {}),
     ...(provider?.allowedTools?.length
@@ -250,7 +259,7 @@ function extractStreamDeltas(
  * line. Multiple concurrent runs are isolated by runId — each spawns
  * its own `claude` subprocess via the SDK's default spawn.
  */
-function createClaudeCodeDaemonScript(): string {
+export function createClaudeCodeDaemonScript(): string {
   const version = JSON.stringify(DAEMON_PROTOCOL_VERSION);
   return `import http from "node:http";
 import { execSync } from "node:child_process";
@@ -345,8 +354,14 @@ function readJsonBody(req) {
   });
 }
 
-function autoApproveCanUseTool(_toolName, input) {
-  return { behavior: "allow", updatedInput: input };
+async function handlePermission(req, res, runId) {
+  const run = liveRuns.get(runId);
+  const body = await readJsonBody(req);
+  const resolve = run?.permissions.get(body.requestId);
+  if (!resolve) { res.writeHead(409); res.end("Request is no longer pending"); return; }
+  run.permissions.delete(body.requestId);
+  resolve(body.response);
+  res.writeHead(204); res.end();
 }
 
 async function handleStart(req, res, runId) {
@@ -386,6 +401,25 @@ async function handleStart(req, res, runId) {
   const opts = { ...(options || {}) };
   const autoApprove = !!opts.autoApproveTools;
   delete opts.autoApproveTools;
+  const interactiveQuestions = !!opts.interactiveQuestions;
+  delete opts.interactiveQuestions;
+  let planning = opts.permissionMode === "plan";
+  const permissions = new Map();
+  const clearPermissions = () => { for (const resolve of permissions.values()) resolve({ behavior: "deny", message: "Run ended", interrupt: true }); permissions.clear(); };
+  const canUseTool = async (toolName, input, context) => {
+    const isQuestion = toolName === "AskUserQuestion";
+    const isPlan = toolName === "ExitPlanMode";
+    if (context.signal.aborted) return { behavior: "deny", message: "Run cancelled", interrupt: true };
+    if ((isQuestion || isPlan) && !interactiveQuestions) return { behavior: "deny", message: "No interactive user is available." };
+    if (!isQuestion && !isPlan && planning && toolName !== "EnterPlanMode") return { behavior: "deny", message: "Finish planning before requesting write access." };
+    if (!isQuestion && !isPlan && autoApprove) return { behavior: "allow", updatedInput: input };
+    return new Promise((resolve) => {
+      const abort = () => { permissions.delete(context.toolUseID); resolve({ behavior: "deny", message: "Run cancelled", interrupt: true }); };
+      permissions.set(context.toolUseID, (response) => { context.signal.removeEventListener("abort", abort); if (isPlan && response.behavior === "allow") planning = false; resolve(response); });
+      context.signal.addEventListener("abort", abort, { once: true });
+      res.write(JSON.stringify({ _permission: { requestId: context.toolUseID, toolName, input, title: context.title } }) + "\\n");
+    });
+  };
   opts.pathToClaudeCodeExecutable = resolveClaudeBinary(
     opts.pathToClaudeCodeExecutable,
   );
@@ -426,7 +460,12 @@ async function handleStart(req, res, runId) {
       prompt: promptStream,
       options: {
         ...opts,
-        ...(autoApprove ? { canUseTool: autoApproveCanUseTool } : {}),
+        canUseTool,
+        hooks: { PreToolUse: [{ hooks: [async (input) => {
+          planning = input.permission_mode === "plan";
+          return interactiveQuestions && ["AskUserQuestion", "ExitPlanMode"].includes(input.tool_name)
+            ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask" } } : {};
+        }] }] },
       },
     });
   } catch (e) {
@@ -436,11 +475,12 @@ async function handleStart(req, res, runId) {
     return;
   }
 
-  liveRuns.set(runId, { query: queryHandle, prompt: promptStream });
+  liveRuns.set(runId, { query: queryHandle, prompt: promptStream, permissions });
 
   // Client disconnected (e.g. host process killed) → tear down.
   req.on("close", () => {
     clearInterval(heartbeat);
+    clearPermissions();
     if (!liveRuns.has(runId)) return;
     liveRuns.delete(runId);
     promptStream.end();
@@ -456,6 +496,7 @@ async function handleStart(req, res, runId) {
     res.write(JSON.stringify({ _error: String(e?.message ?? e) }) + "\\n");
   } finally {
     clearInterval(heartbeat);
+    clearPermissions();
     liveRuns.delete(runId);
     promptStream.end();
     res.end();
@@ -523,6 +564,11 @@ const server = http.createServer((req, res) => {
     return;
   }
   const url = req.url ?? "";
+  const permissionRoute = url.match(/^\\/runs\\/([^/]+)\\/permission$/);
+  if (req.method === "POST" && permissionRoute) {
+    handlePermission(req, res, decodeURIComponent(permissionRoute[1])).catch(() => { if (!res.headersSent) res.writeHead(400); res.end(); });
+    return;
+  }
   let m;
   if (req.method === "POST" && (m = url.match(/^\\/runs\\/([^/]+)\\/start$/))) {
     handleStart(req, res, decodeURIComponent(m[1]));
@@ -857,15 +903,11 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
   }
 
   async setup(request: AgentSetupRequest<"claude-code">): Promise<void> {
+    if (request.options.configuration === "native") return;
     await time(debugClaude, "claude-code setup()", async () => {
       const options = request.options;
       const provider = request.provider;
       const sandbox = options.sandbox;
-      if (!sandbox) {
-        throw new Error(
-          "claude-code requires a sandbox (the SDK transport runs as a daemon inside the sandbox).",
-        );
-      }
 
       const target = await createSetupTarget(provider, "shared-setup", options);
       const settingsPath = path.join(target.layout.claudeDir, "settings.json");
@@ -896,6 +938,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         JSON.stringify({ mcpServers: {} }, null, 2);
 
       const artifacts = [
+        ...(!sandbox ? [{ path: path.join(target.layout.claudeDir, ".claude-plugin", "plugin.json"), content: JSON.stringify({ name: "agentbox", version: "1.0.0" }) }] : []),
         ...skillArtifacts,
         ...buildClaudeCommandArtifacts(options.commands, target.layout),
         ...buildClaudeSubagentArtifacts(options.subAgents, target.layout),
@@ -907,11 +950,11 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       ];
 
       const enableRtk = options.enableRtk === true;
-      const daemonInfo = {
+      const daemonInfo = sandbox ? {
         port: DAEMON_PORT,
         healthPath: "/__version",
         expectedVersionMatch: DAEMON_PROTOCOL_VERSION,
-      };
+      } : undefined;
       const setupId = computeSetupId({
         artifacts,
         installCommands,
@@ -928,7 +971,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         time(debugClaude, "applyDifferentialSetup", () =>
           applyDifferentialSetup(target, artifacts, installCommands),
         ),
-        ensureClaudeCodeDaemon(options, env),
+        ...(sandbox ? [ensureClaudeCodeDaemon(options, env)] : []),
       ]);
 
       // Run after applyDifferentialSetup so the agentbox-managed
@@ -949,11 +992,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     debugClaude("execute() start runId=%s", request.runId);
 
     const sandbox = request.options.sandbox;
-    if (!sandbox) {
-      throw new Error(
-        "claude-code requires a sandbox (the SDK transport runs as a daemon inside the sandbox).",
-      );
-    }
+    if (!sandbox) return executeNativeClaude(request, sink);
 
     const claudeDir = claudeConfigDir(request.options);
     const settingsPath = path.join(claudeDir, "settings.json");
@@ -1026,6 +1065,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         // fresh runs.
         ...(request.run.resumeSessionId ? {} : { sessionId: presetSessionId }),
         autoApproveTools,
+        interactiveQuestions: hasInteractiveQuestions(request.options),
       },
     };
 
@@ -1098,12 +1138,101 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       ),
     );
 
+    const permissionMessages = async function* () {
+      for await (const item of parseNdjsonStream(response.body!)) {
+        const control = item as { _permission?: { requestId: string; toolName: string; input: Record<string, unknown>; title?: string } };
+        if (!control._permission) { yield item; continue; }
+        const ask = control._permission;
+        const isQuestion = ask.toolName === "AskUserQuestion";
+        const isPlan = ask.toolName === "ExitPlanMode";
+        const answer = await sink.requestPermission({ type: "permission.requested", provider: request.provider, runId: request.runId, timestamp: new Date().toISOString(), requestId: ask.requestId, kind: isQuestion ? "question" : isPlan ? "plan" : "tool", toolName: ask.toolName, title: isQuestion ? "Your input is needed" : isPlan ? "Review the plan" : ask.title ?? `Allow ${ask.toolName}?`, input: ask.input, ...(isQuestion ? { questions: normalizeUserQuestions("claude-code", ask.input) } : {}) });
+        const reply = await fetch(`${baseUrl}/runs/${encodeURIComponent(request.runId)}/permission`, { method: "POST", headers: { "content-type": "application/json", ...authHeaders }, signal: fetchAbort.signal, body: JSON.stringify({ requestId: ask.requestId, response: answer.decision === "allow" ? { behavior: "allow", updatedInput: isQuestion ? { ...ask.input, answers: questionReply("claude-code", ask.input, answer.answers ?? []) } : ask.input } : { behavior: "deny", message: "The user declined this request." } }) });
+        if (!reply.ok) throw new Error(`Claude permission response failed: ${reply.status}`);
+      }
+    };
+    await consumeClaudeMessages(request, sink, permissionMessages(), executeStartedAt, cleanup);
+
+    return async () => undefined;
+  }
+
+  /**
+   * Stateless abort. POSTs to the in-sandbox daemon's
+   * `/runs/<id>/abort`. The daemon calls `query.interrupt()` on the
+   * matching live run; the originating instance's NDJSON read loop
+   * sees the run unwind via a non-success `result` (or stream close).
+   */
+  async attachAbort(request: AgentAttachRequest<"claude-code">): Promise<void> {
+    const baseUrl = await daemonBaseUrl(request.sandbox);
+    const authHeaders = await daemonAuthHeaders(request.sandbox);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3_000);
+    try {
+      await fetch(
+        `${baseUrl}/runs/${encodeURIComponent(request.runId)}/abort`,
+        {
+          method: "POST",
+          signal: controller.signal,
+          headers: authHeaders,
+        },
+      ).catch((error) => {
+        debugClaude("attachAbort POST failed: %o", error);
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * Stateless message injection. POSTs `{ content }` to the daemon's
+   * `/runs/<id>/sendMessage`. The daemon pushes the message into the
+   * matching run's prompt iterable, which the SDK forwards to claude
+   * as a fresh user turn.
+   */
+  async attachSendMessage(
+    request: AgentAttachRequest<"claude-code">,
+    content: UserContent,
+  ): Promise<void> {
+    const baseUrl = await daemonBaseUrl(request.sandbox);
+    const authHeaders = await daemonAuthHeaders(request.sandbox);
+    const inputParts = await validateProviderUserInput(
+      AgentProvider.ClaudeCode,
+      content,
+    );
+    const mapped = mapToClaudeUserContent(inputParts);
+    const response = await fetch(
+      `${baseUrl}/runs/${encodeURIComponent(request.runId)}/sendMessage`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...authHeaders,
+        },
+        body: JSON.stringify({ content: mapped }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(
+        `claude-code attachSendMessage failed: ${response.status} ${await response.text().catch(() => "")}`,
+      );
+    }
+  }
+}
+
+async function consumeClaudeMessages(
+  request: AgentExecutionRequest<"claude-code">,
+  sink: AgentRunSink,
+  messages: AsyncIterable<unknown>,
+  executeStartedAt: number,
+  cleanup: () => Promise<void>,
+  wasCancelled: () => boolean = () => false,
+): Promise<void> {
     let accumulatedText = "";
     // Thinking chars streamed via thinking_delta for the current main-agent
     // message; used to avoid re-emitting the full thinking block carried by
     // the per-block assistant message.
     let streamedThinkingChars = 0;
     let pendingMessages = 1;
+    let sawResult = false;
     let firstStreamEventLogged = false;
     let firstTextDeltaLogged = false;
     let lastTerminalReason: string | undefined;
@@ -1111,7 +1240,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     const rawPayloads: Array<Record<string, unknown>> = [];
 
     try {
-      for await (const item of parseNdjsonStream(response.body)) {
+      for await (const item of messages) {
         if (item && typeof item === "object") {
           const ctrl = item as Record<string, unknown>;
           if ("_error" in ctrl) {
@@ -1152,6 +1281,10 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
             // Session id is already set on the sink (pre-minted before
             // POSTing /start). The init message arrives confirming what
             // claude assigned — should match `presetSessionId`.
+            if (request.run.goal && !sys.slash_commands.some((command) => command.replace(/^\//, "") === "goal")) {
+              await cleanup();
+              throw new Error("This Claude Code installation does not expose the native /goal command.");
+            }
             if (sys.session_id) {
               debugClaude(
                 "★ session.init session_id=%s (%dms)",
@@ -1278,6 +1411,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         }
 
         if (message.type === "result") {
+          sawResult = true;
           const result = message as SDKResultMessage;
           lastTerminalReason = result.terminal_reason;
           lastIsError = result.is_error;
@@ -1292,8 +1426,10 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         }
       }
 
+      await cleanup();
+      if (!sawResult && !wasCancelled()) throw new Error("Claude Code closed before reporting a result");
       const finalText = accumulatedText;
-      const isCancelled =
+      const isCancelled = wasCancelled() ||
         lastTerminalReason === "aborted_streaming" ||
         lastTerminalReason === "aborted_tools";
       // is_error is the authoritative error signal — it covers both
@@ -1343,73 +1479,115 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         });
       }
     } finally {
-      // Daemon's `req.on('close')` handler will tear down its
-      // run-side state when this connection closes.
-      fetchAbort.abort();
+      await cleanup();
     }
 
-    return async () => undefined;
-  }
+}
 
-  /**
-   * Stateless abort. POSTs to the in-sandbox daemon's
-   * `/runs/<id>/abort`. The daemon calls `query.interrupt()` on the
-   * matching live run; the originating instance's NDJSON read loop
-   * sees the run unwind via a non-success `result` (or stream close).
-   */
-  async attachAbort(request: AgentAttachRequest<"claude-code">): Promise<void> {
-    const baseUrl = await daemonBaseUrl(request.sandbox);
-    const authHeaders = await daemonAuthHeaders(request.sandbox);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3_000);
-    try {
-      await fetch(
-        `${baseUrl}/runs/${encodeURIComponent(request.runId)}/abort`,
-        {
-          method: "POST",
-          signal: controller.signal,
-          headers: authHeaders,
-        },
-      ).catch((error) => {
-        debugClaude("attachAbort POST failed: %o", error);
-      });
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
 
-  /**
-   * Stateless message injection. POSTs `{ content }` to the daemon's
-   * `/runs/<id>/sendMessage`. The daemon pushes the message into the
-   * matching run's prompt iterable, which the SDK forwards to claude
-   * as a fresh user turn.
-   */
-  async attachSendMessage(
-    request: AgentAttachRequest<"claude-code">,
-    content: UserContent,
-  ): Promise<void> {
-    const baseUrl = await daemonBaseUrl(request.sandbox);
-    const authHeaders = await daemonAuthHeaders(request.sandbox);
-    const inputParts = await validateProviderUserInput(
-      AgentProvider.ClaudeCode,
-      content,
-    );
-    const mapped = mapToClaudeUserContent(inputParts);
-    const response = await fetch(
-      `${baseUrl}/runs/${encodeURIComponent(request.runId)}/sendMessage`,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...authHeaders,
-        },
-        body: JSON.stringify({ content: mapped }),
+/** Native transport owns its CLI process and uses the CLI's local sign-in. */
+export async function executeNativeClaude(
+  request: AgentExecutionRequest<"claude-code">,
+  sink: AgentRunSink,
+): Promise<() => Promise<void>> {
+  const { query } = await import("@anthropic-ai/claude-agent-sdk");
+  const claudeDir = claudeConfigDir(request.options);
+  const input = await validateProviderUserInput(request.provider, request.run.input);
+  const prompt = new AsyncQueue<SDKUserMessage>();
+  const sessionId = request.run.resumeSessionId ?? randomUUID();
+  const controller = new AbortController();
+  let handle: Query | undefined;
+  let processHandle: SpawnedProcess | undefined;
+  let stopped: Promise<void> | undefined;
+  let cancelled = false;
+  const stop = () => stopped ??= (async () => {
+    prompt.finish();
+    handle?.close();
+    controller.abort();
+    if (processHandle) await processHandle.kill();
+  })();
+  sink.setAbort(async () => { cancelled = true; await stop(); });
+  sink.setSessionId(sessionId);
+  const messageId = randomUUID();
+  prompt.push({ type: "user", uuid: messageId, message: { role: "user", content: mapToClaudeUserContent(input) as SDKUserMessage["message"]["content"] }, parent_tool_use_id: null });
+  const hostEnv = Object.fromEntries(Object.entries({ ...process.env, ...request.options.env }).filter((entry): entry is [string, string] => entry[1] !== undefined));
+  if (request.options.customHeaders) {
+    const headers = Object.entries(request.options.customHeaders).map(([name, value]) => `${name}: ${value}`).join("\n");
+    hostEnv.ANTHROPIC_CUSTOM_HEADERS = [hostEnv.ANTHROPIC_CUSTOM_HEADERS, headers].filter(Boolean).join("\n");
+  }
+  const options = buildClaudeQueryOptions({
+    request,
+    ...(request.options.configuration === "native" ? {} : {
+      settingsPath: path.join(claudeDir, "settings.json"),
+      mcpConfigPath: path.join(claudeDir, "agentbox-mcp.json"),
+    }),
+    // Auth is deliberately CLI-owned. Never copy the user's credential files
+    // into the generated configuration directory or a task artifact.
+    env: hostEnv,
+  });
+  const autoApprove = shouldAutoApproveClaudeTools(request.options);
+  const interactiveQuestions = hasInteractiveQuestions(request.options);
+  let planning = options.permissionMode === "plan";
+  try {
+    handle = query({ prompt, options: {
+      ...options,
+      // Use the SDK-matched CLI by default; an installed CLI is an explicit override.
+      pathToClaudeCodeExecutable: request.options.provider?.binary,
+      abortController: controller,
+      // `sessionId` is rejected alongside `resume` unless `forkSession` is
+      // set, where it names the forked session. Stamping it on forks keeps
+      // the pre-minted id reported via `sink.setSessionId` truthful, so a
+      // later run can resume the fork.
+      ...(request.run.resumeSessionId ? {} : { sessionId }),
+      ...(request.options.configuration === "native" ? {} : { plugins: [{ type: "local" as const, path: claudeDir }] }),
+      spawnClaudeCodeProcess(spawnOptions) {
+        if (cancelled || controller.signal.aborted) throw new Error("Local run was cancelled before startup");
+        processHandle = spawnCommand({ ...spawnOptions, processGroup: request.options.processGroup !== "inherited" });
+        return processHandle.child;
       },
-    );
-    if (!response.ok) {
-      throw new Error(
-        `claude-code attachSendMessage failed: ${response.status} ${await response.text().catch(() => "")}`,
-      );
-    }
+      hooks: { ...options.hooks, PreToolUse: [...(options.hooks?.PreToolUse ?? []), { hooks: [async (input) => {
+        if (input.hook_event_name !== "PreToolUse") return {};
+        planning = input.permission_mode === "plan";
+        return interactiveQuestions && ["AskUserQuestion", "ExitPlanMode"].includes(input.tool_name)
+          ? { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask" as const } } : {};
+      }] }] },
+      async canUseTool(toolName, input, context) {
+        if (cancelled || context.signal.aborted) return { behavior: "deny", message: "Run cancelled", interrupt: true };
+        const isQuestion = toolName === "AskUserQuestion";
+        const isPlan = toolName === "ExitPlanMode";
+        if ((isQuestion || isPlan) && !interactiveQuestions) return { behavior: "deny", message: "No interactive user is available." };
+        if (!isQuestion && !isPlan && planning && toolName !== "EnterPlanMode") return { behavior: "deny", message: "Finish planning before requesting write access." };
+        if (!isQuestion && !isPlan && autoApprove) return { behavior: "allow", updatedInput: input };
+        try {
+          const response = await sink.requestPermission({
+            type: "permission.requested", provider: request.provider, runId: request.runId,
+            timestamp: new Date().toISOString(), requestId: context.toolUseID,
+            kind: isQuestion ? "question" : isPlan ? "plan" : "tool", toolName,
+            ...(isQuestion ? { questions: normalizeUserQuestions("claude-code", input) } : {}),
+            title: isQuestion ? "Your input is needed" : isPlan ? "Review the plan" : context.title ?? `Allow ${toolName}?`,
+            message: context.description ?? context.decisionReason, input, canRemember: false,
+          });
+          if (isPlan && response.decision === "allow") planning = false;
+          if (!cancelled && !context.signal.aborted && response.decision === "allow") return {
+            behavior: "allow",
+            updatedInput: isQuestion ? { ...input, answers: questionReply("claude-code", input, response.answers ?? []) } : input,
+          };
+          return { behavior: "deny", message: "The user denied this action" };
+        } catch {
+          return { behavior: "deny", message: "Run cancelled", interrupt: true };
+        }
+      },
+    } });
+    sink.setRaw({ query: handle, claudeDir, runId: request.runId });
+    sink.emitEvent(createNormalizedEvent("run.started", { provider: request.provider, runId: request.runId }));
+    sink.emitEvent(createNormalizedEvent("message.started", { provider: request.provider, runId: request.runId }, { messageId }));
+    await consumeClaudeMessages(request, sink, handle, Date.now(), stop, () => cancelled);
+  } catch (error) {
+    await stop();
+    if (cancelled) sink.cancel();
+    else throw error;
+  } finally {
+    await stop();
   }
+  return stop;
 }

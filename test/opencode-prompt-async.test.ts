@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -22,6 +22,7 @@ interface FakeOpenCodeServer {
     permissionId: string;
     body: unknown;
   }>;
+  questionResponses: Array<{ id: string; action: string; body: unknown }>;
   /** Sessions returned by `GET /session` (id + parentID lineage). */
   sessions: Array<{ id: string; parentID?: string }>;
   pushEvent(frame: SseFrame): void;
@@ -35,6 +36,7 @@ interface FakeOpenCodeServer {
 async function startFakeOpenCodeServer(): Promise<FakeOpenCodeServer> {
   const promptAsyncRequests: FakeOpenCodeServer["promptAsyncRequests"] = [];
   const permissionResponses: FakeOpenCodeServer["permissionResponses"] = [];
+  const questionResponses: FakeOpenCodeServer["questionResponses"] = [];
   const sessions: FakeOpenCodeServer["sessions"] = [];
   const eventClients: Array<NodeJS.WritableStream & { end?: () => void }> = [];
   const queuedFrames: SseFrame[] = [];
@@ -51,6 +53,7 @@ async function startFakeOpenCodeServer(): Promise<FakeOpenCodeServer> {
     baseUrl: "",
     promptAsyncRequests,
     permissionResponses,
+    questionResponses,
     sessions,
     pushEvent(frame) {
       queuedFrames.push(frame);
@@ -129,6 +132,14 @@ async function startFakeOpenCodeServer(): Promise<FakeOpenCodeServer> {
         permissionId: decodeURIComponent(permissionMatch[2] ?? ""),
         body,
       });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("true");
+      return;
+    }
+
+    const questionMatch = url.match(/^\/question\/([^/]+)\/(reply|reject)$/);
+    if (method === "POST" && questionMatch) {
+      questionResponses.push({ id: questionMatch[1]!, action: questionMatch[2]!, body: await readJson(req) });
       res.writeHead(200, { "content-type": "application/json" });
       res.end("true");
       return;
@@ -244,6 +255,29 @@ function makeRequest(
 }
 
 describe("opencode prompt_async + SSE", () => {
+  it("answers questions from this session tree and rejects skipped questions", async () => {
+    fake = await startFakeOpenCodeServer();
+    fake.sessions.push({ id: "ses_child", parentID: "ses_test" }, { id: "ses_foreign" });
+    const { sink, finished } = makeCapturingSink();
+    sink.requestPermission = vi.fn<AgentRunSink["requestPermission"]>(async (event) => event.requestId === "ask_skip"
+      ? { requestId: event.requestId, decision: "deny" }
+      : { requestId: event.requestId, decision: "allow", answers: [{ questionId: "0", values: ["JSON"] }] });
+    const executing = new OpenCodeAgentAdapter().execute(makeRequest({ options: { cwd: "/tmp", approvalMode: "interactive", sandbox: makeFakeSandbox(fake.baseUrl) } }), sink);
+    await vi.waitFor(() => expect(fake!.promptAsyncRequests).toHaveLength(1));
+    for (const [id, sessionID] of [["ask_child", "ses_child"], ["ask_skip", "ses_test"], ["ask_foreign", "ses_foreign"]]) {
+      fake.pushEvent({ event: "question.asked", data: { type: "question.asked", properties: { id, sessionID, questions: [{ question: "Which format?", header: "Format", options: [{ label: "JSON" }, { label: "Text" }], custom: false }] } } });
+    }
+    await vi.waitFor(() => expect(fake!.questionResponses).toHaveLength(2));
+    fake.pushEvent({ event: "session.idle", data: { type: "session.idle", properties: { sessionID: "ses_test" } } });
+    expect((await finished).kind).toBe("complete");
+    await executing;
+    expect(fake.questionResponses).toEqual([
+      { id: "ask_child", action: "reply", body: { answers: [["JSON"]] } },
+      { id: "ask_skip", action: "reject", body: {} },
+    ]);
+    expect(sink.requestPermission).toHaveBeenCalledTimes(2);
+  });
+
   let fake: FakeOpenCodeServer | undefined;
 
   afterEach(async () => {

@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import os from "node:os";
 import path from "node:path";
 
 import {
@@ -17,7 +18,8 @@ import {
   type AgentSetupRequest,
   type UserContent,
 } from "../types";
-import { isInteractiveApproval } from "../approval";
+import { isInteractiveApproval, hasInteractiveQuestions } from "../approval";
+import { normalizeUserQuestions, questionReply } from "../questions";
 import {
   mapToOpenCodeParts,
   validateProviderUserInput,
@@ -44,8 +46,8 @@ import {
 } from "../config/setup-manifest";
 import { buildOpenCodeSubagentConfig } from "../config/subagents";
 import { fetchJson, streamSseResilient } from "../transports/app-server";
-import { spawnCommand, waitForHttpReady } from "../transports/spawn";
-import { sleep, waitFor } from "../../shared/network";
+import { spawnCommand, type SpawnedProcess } from "../transports/spawn";
+import { sleep, waitFor, getAvailablePort } from "../../shared/network";
 import { shellQuote } from "../../shared/shell";
 import { extractOpenCodeCostData } from "../cost";
 import { debugOpencode, time } from "../../shared/debug";
@@ -67,7 +69,6 @@ type OpenCodeRuntime = {
 };
 
 const SANDBOX_OPENCODE_PORT = 4096;
-const LOCAL_OPENCODE_PORT = 4096;
 const SANDBOX_OPENCODE_READY_TIMEOUT_MS = 90_000;
 const LOCAL_OPENCODE_READY_TIMEOUT_MS = 20_000;
 const SHARED_OPENCODE_TARGET_ID = "shared-opencode-server";
@@ -186,42 +187,24 @@ function hashLlmApiKeys(env: Record<string, string> | undefined): string {
   return hasher.digest("hex");
 }
 
-/**
- * Stop a local `opencode serve` listening on {@link LOCAL_OPENCODE_PORT}
- * and wait until the port is actually released, so the cold path that
- * follows binds a fresh server (and its readiness probe can't get a false
- * positive from the lingering old process).
- *
- * Best-effort + unix-only: kills by port via `lsof`. Local opencode mode
- * already relies on unix-only spawn behaviour elsewhere, so this is an
- * acceptable platform constraint.
- */
-async function killLocalOpenCodeServer(): Promise<void> {
-  await time(debugOpencode, "kill local opencode server", async () => {
-    const killer = spawnCommand({
-      command: "sh",
-      args: [
-        "-c",
-        `lsof -ti tcp:${LOCAL_OPENCODE_PORT} | xargs kill 2>/dev/null || true`,
-      ],
-    });
-    await killer.wait().catch(() => undefined);
-    // Wait for the health endpoint to stop responding — the port is then
-    // free for the fresh spawn below.
-    await waitFor(
-      async () => {
-        try {
-          const res = await fetch(
-            `http://127.0.0.1:${LOCAL_OPENCODE_PORT}/global/health`,
-          );
-          return !res.ok;
-        } catch {
-          return true;
-        }
-      },
-      { timeoutMs: 5_000, intervalMs: 200 },
-    ).catch(() => undefined);
-  });
+
+interface LocalOpenCodeServer {
+  baseUrl: string;
+  headers: Record<string, string>;
+  process: SpawnedProcess;
+}
+
+// A local server belongs to this Agent instance. Never discover or kill a
+// developer's server by a public port number, or reuse a different Agent's
+// configuration/credentials just because its health endpoint responds.
+const localOpenCodeServers = new WeakMap<AgentOptions<"open-code">, Promise<LocalOpenCodeServer>>();
+
+async function killLocalOpenCodeServer(options: AgentOptions<"open-code">): Promise<void> {
+  const pending = localOpenCodeServers.get(options);
+  if (!pending) return;
+  const server = await pending;
+  await server.process.kill();
+  localOpenCodeServers.delete(options);
 }
 
 /**
@@ -333,6 +316,7 @@ function createOpenCodePermissionEvent(
     },
     {
       requestId: String(properties.id ?? ""),
+      toolName: permission,
       kind:
         permission === "bash"
           ? "bash"
@@ -407,6 +391,7 @@ export function buildOpenCodeConfig(
     prompt: options.systemPrompt || FALLBACK_OPEN_CODE_AGENT_PROMPT,
     permission: buildOpenCodePermissionConfig(interactiveApproval),
     tools: {
+      question: hasInteractiveQuestions(options),
       write: true,
       edit: true,
       bash: true,
@@ -504,7 +489,7 @@ async function ensureSandboxOpenCodeServer(
 
     const plugins = assertHooksSupported(request.provider, options);
     assertCommandsSupported(request.provider, options.commands);
-    const interactiveApproval = isInteractiveApproval(options);
+    const interactiveApproval = !options.fullAccess && isInteractiveApproval(options);
 
     const target = await createSetupTarget(
       request.provider,
@@ -606,6 +591,7 @@ async function ensureSandboxOpenCodeServer(
       OPENCODE_CONFIG: configPath,
       OPENCODE_CONFIG_DIR: target.layout.opencodeDir,
       OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
+      OPENCODE_ENABLE_QUESTION_TOOL: hasInteractiveQuestions(options) ? "true" : "false",
     };
 
     await applyDifferentialSetup(target, allArtifacts, installCommands);
@@ -820,131 +806,82 @@ async function ensureSandboxOpenCodeServer(
   });
 }
 
-/**
- * Host-side preparation for opencode (local mode). Idempotent:
- *
- *   1. Compute the setupId over the artifact set, daemon expectation,
- *      and an `options.env` fingerprint, then `preflightSetup`: if the
- *      `setup.id` marker matches AND the server answers
- *      `127.0.0.1:LOCAL_OPENCODE_PORT/global/health`, reuse it.
- *   2. Drift/cold path: stop any stale server still on the port (its env
- *      or config no longer matches), re-apply the on-disk config, spawn a
- *      fresh `opencode serve`, wait for ready.
- *
- * The spawned process is left running across runs — `execute` doesn't
- * own its lifecycle, the process is the property of the host that
- * invoked `setup()`. A drifting `setup()` (changed credentials/config)
- * restarts the shared server so the new settings take effect.
- */
-async function ensureLocalOpenCodeServer(
-  request: AgentSetupRequest<"open-code">,
-): Promise<void> {
-  const options = request.options;
 
-  const plugins = assertHooksSupported(request.provider, options);
-  assertCommandsSupported(request.provider, options.commands);
-  const interactiveApproval = isInteractiveApproval(options);
-
-  const target = await createSetupTarget(
-    request.provider,
-    "shared-setup",
-    options,
-  );
-
-  const { artifacts: skillArtifacts, installCommands } =
-    await prepareSkillArtifacts(
-      request.provider,
-      options.skills,
-      target.layout,
-    );
-  const pluginArtifacts = buildOpenCodePluginArtifacts(
-    plugins,
-    target.layout.opencodeDir,
-  );
-
-  const configPath = path.join(target.layout.opencodeDir, "agentbox.json");
-  const openCodeConfig = buildOpenCodeConfig(options, interactiveApproval);
-  const commonEnv = {
-    OPENCODE_CONFIG: configPath,
-    OPENCODE_CONFIG_DIR: target.layout.opencodeDir,
-    OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
+/** A private config directory, ephemeral loopback port, and owned process. */
+async function startLocalOpenCodeServer(request: AgentSetupRequest<"open-code">): Promise<LocalOpenCodeServer> {
+  const originalOptions = request.options;
+  const options = {
+    ...originalOptions,
+    stateDirectory: path.join(originalOptions.stateDirectory ?? path.join(os.tmpdir(), "agentbox-native"), "instances", randomUUID()),
   };
-
-  const allArtifacts = [
-    ...skillArtifacts,
-    ...pluginArtifacts,
-    {
-      path: configPath,
-      content: JSON.stringify(openCodeConfig, null, 2),
-    },
-  ];
-  // The setupId encodes the artifact set AND a fingerprint of the LLM
-  // provider API keys in `options.env`; the daemon probe adds liveness. A
-  // reuse therefore requires both that nothing drifted and that the server
-  // is up — and the marker lives on disk under the shared target, so a fresh
-  // process / new Agent carrying a different OPENROUTER_API_KEY sees the
-  // mismatch.
-  const daemonInfo = {
-    port: LOCAL_OPENCODE_PORT,
-    healthPath: "/global/health",
-  };
-  const setupId = computeSetupId({
-    artifacts: allArtifacts,
-    installCommands,
-    daemon: daemonInfo,
-    extras: [`apiKeys:${hashLlmApiKeys(options.env)}`],
-  });
-  if (await preflightSetup(target, setupId, daemonInfo)) {
-    debugOpencode("local opencode server up-to-date — reusing");
-    return;
+  let generatedEnv: Record<string, string> = {};
+  if (options.configuration !== "native") {
+    const plugins = assertHooksSupported(request.provider, options);
+    assertCommandsSupported(request.provider, options.commands);
+    const target = await createSetupTarget(request.provider, "shared-setup", options);
+    const { artifacts: skillArtifacts, installCommands } = await prepareSkillArtifacts(request.provider, options.skills, target.layout);
+    const configPath = path.join(target.layout.opencodeDir, "agentbox.json");
+    const artifacts = [
+      ...skillArtifacts,
+      ...buildOpenCodePluginArtifacts(plugins, target.layout.opencodeDir),
+      { path: configPath, content: JSON.stringify(buildOpenCodeConfig(options, isInteractiveApproval(options)), null, 2) },
+    ];
+    await applyDifferentialSetup(target, artifacts, installCommands);
+    generatedEnv = {
+      OPENCODE_CONFIG: configPath, OPENCODE_CONFIG_DIR: target.layout.opencodeDir,
+      OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
+      OPENCODE_ENABLE_QUESTION_TOOL: hasInteractiveQuestions(options) ? "true" : "false",
+    };
   }
-
-  // Preflight missed: either no server is up, or one IS up but the desired
-  // config/credentials drifted. We never auto-kill a running server to apply
-  // that drift (it is shared across runs on a static port); restarts are the
-  // developer's explicit call via `agent.killServer()`. Reuse a healthy
-  // server untouched — the staged config takes effect on the next cold start.
-  if (await isLocalOpenCodeServerHealthy()) {
-    debugOpencode(
-      "local opencode server already running but setup drifted — reusing it " +
-        "without restart; call agent.killServer() to apply the new config",
-    );
-    return;
-  }
-  debugOpencode("local opencode server absent — spawning");
-
-  await applyDifferentialSetup(target, allArtifacts, installCommands);
-
-  // No healthy server is up (the health check above returned early when one
-  // was), so this is a genuine cold start. Reap any stale/dead process still
-  // bound to the port so the spawn below binds fresh and its readiness probe
-  // can't get a false positive from a dying one. No-op when nothing is there.
-  await killLocalOpenCodeServer();
-
-  spawnCommand({
+  const port = await getAvailablePort();
+  const password = randomBytes(32).toString("base64url");
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const headers = { Authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}` };
+  const processHandle = spawnCommand({
     command: options.provider?.binary ?? "opencode",
-    args: [
-      "serve",
-      "--hostname",
-      "127.0.0.1",
-      "--port",
-      String(LOCAL_OPENCODE_PORT),
-      ...(options.provider?.args ?? []),
-    ],
+    args: ["serve", ...(options.provider?.args ?? []), "--hostname", "127.0.0.1", "--port", String(port)],
     cwd: options.cwd,
+    processGroup: options.processGroup !== "inherited",
     env: {
-      ...process.env,
-      ...(options.env ?? {}),
-      ...commonEnv,
+      ...process.env, ...options.env,
+      ...generatedEnv,
+      ...(options.fullAccess ? { OPENCODE_PERMISSION: JSON.stringify({ "*": "allow", question: "ask" }) } : {}),
+      ...(options.interactiveQuestions === true ? { OPENCODE_ENABLE_QUESTION_TOOL: "true" } : {}),
+      OPENCODE_SERVER_USERNAME: "opencode", OPENCODE_SERVER_PASSWORD: password,
     },
   });
+  // OpenCode is a long-lived server. Drain both pipes so verbose output cannot
+  // fill an OS pipe and freeze the agent; output can contain local secrets.
+  processHandle.child.stdout.resume();
+  processHandle.child.stderr.resume();
+  try {
+    let startupError: Error | undefined;
+    void processHandle.wait().then(
+      (code) => { startupError = new Error(`Local OpenCode server exited before startup (${code})`); },
+      (error: unknown) => { startupError = error instanceof Error ? error : new Error(String(error)); },
+    );
+    await waitFor(async () => {
+      if (startupError) throw startupError;
+      try { return (await fetch(`${baseUrl}/global/health`, { headers, signal: AbortSignal.timeout(1000) })).ok; }
+      catch { return false; }
+    }, { timeoutMs: LOCAL_OPENCODE_READY_TIMEOUT_MS });
+    const unauthenticated = await fetch(`${baseUrl}/global/health`, { signal: AbortSignal.timeout(3000) });
+    if (unauthenticated.status !== 401) throw new Error("This OpenCode version does not enforce local server authentication. Upgrade OpenCode before running it through AgentBox.");
+    return { baseUrl, headers, process: processHandle };
+  } catch (error) {
+    await processHandle.kill();
+    throw error;
+  }
+}
 
-  await waitForHttpReady(
-    `http://127.0.0.1:${LOCAL_OPENCODE_PORT}/global/health`,
-    { timeoutMs: LOCAL_OPENCODE_READY_TIMEOUT_MS },
-  );
-
-  await markSetupComplete(target, setupId);
+async function ensureLocalOpenCodeServer(request: AgentSetupRequest<"open-code">): Promise<void> {
+  let pending = localOpenCodeServers.get(request.options);
+  if (!pending) {
+    pending = startLocalOpenCodeServer(request);
+    localOpenCodeServers.set(request.options, pending);
+  }
+  try { await pending; }
+  catch (error) { localOpenCodeServers.delete(request.options); throw error; }
 }
 
 async function setupOpenCode(
@@ -972,18 +909,6 @@ async function isSandboxOpenCodeServerHealthy(
     .run(opencodeHealthCurl(port), { cwd, timeoutMs: 5_000 })
     .catch(() => undefined);
   return probe?.exitCode === 0;
-}
-
-/** Host-side counterpart of {@link isSandboxOpenCodeServerHealthy}. */
-async function isLocalOpenCodeServerHealthy(): Promise<boolean> {
-  try {
-    const res = await fetch(
-      `http://127.0.0.1:${LOCAL_OPENCODE_PORT}/global/health`,
-    );
-    return res.ok;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -1015,7 +940,7 @@ async function killOpenCodeServer(
     );
     return;
   }
-  await killLocalOpenCodeServer();
+  await killLocalOpenCodeServer(options);
 }
 
 /**
@@ -1039,12 +964,10 @@ async function buildOpenCodeRuntime(
     };
   }
 
-  const baseUrl = `http://127.0.0.1:${LOCAL_OPENCODE_PORT}`;
-  return {
-    baseUrl,
-    previewHeaders: {},
-    raw: { baseUrl, port: LOCAL_OPENCODE_PORT },
-  };
+  const pending = localOpenCodeServers.get(options);
+  if (!pending) throw new Error("Local OpenCode server has not been set up by this Agent instance");
+  const server = await pending;
+  return { baseUrl: server.baseUrl, previewHeaders: server.headers, raw: { baseUrl: server.baseUrl } };
 }
 
 export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
@@ -1130,7 +1053,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
 
     // No setup → execute data channel: rebuild the runtime from
     // deterministic constants (preview link for sandbox, fixed
-    // 127.0.0.1:LOCAL_OPENCODE_PORT for local). The opencode server
+    // the owned loopback port for local). The opencode server
     // itself was already started by `setup()`.
     const runtime = await time(debugOpencode, "buildOpenCodeRuntime", () =>
       buildOpenCodeRuntime(request.options),
@@ -1209,7 +1132,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
     });
 
     try {
-      const interactiveApproval = isInteractiveApproval(request.options);
+      const interactiveApproval = !request.options.fullAccess && isInteractiveApproval(request.options);
       // Three branches around session resolution:
       // 1. resumeSessionId — reuse the session id directly, no HTTP call.
       // 2. forkSessionId   — POST /session/:id/fork { messageID } to slice
@@ -1432,6 +1355,28 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                 }
               }
             }
+            if (eventType === "question.asked") {
+              const properties = (payload as Record<string, unknown>).properties as Record<string, unknown> | undefined;
+              if (properties && typeof properties.id === "string" && typeof properties.sessionID === "string" && await resolveRunSession(properties.sessionID)) {
+                const questions = normalizeUserQuestions("open-code", properties);
+                const response = hasInteractiveQuestions(request.options)
+                  ? await sink.requestPermission(createNormalizedEvent("permission.requested", {
+                      provider: request.provider, runId: request.runId, raw,
+                    }, {
+                      requestId: properties.id, kind: "question", toolName: "question",
+                      title: "Your input is needed", input: properties, questions, canRemember: false,
+                    }) as PermissionRequestedEvent)
+                  : undefined;
+                const allowed = response?.decision === "allow";
+                await fetchJson<boolean>(`${runtime.baseUrl}/question/${encodeURIComponent(properties.id)}/${allowed ? "reply" : "reject"}`, {
+                  method: "POST",
+                  headers: { "content-type": "application/json", ...runtime.previewHeaders },
+                  body: JSON.stringify(allowed ? { answers: questionReply("open-code", properties, response.answers ?? []) } : {}),
+                });
+              }
+              continue;
+            }
+
             if (eventType === "permission.asked") {
               const properties = (payload as Record<string, unknown>)
                 .properties as Record<string, unknown> | undefined;
@@ -1720,6 +1665,12 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
       // turn. That design was the unique source of `fetch failed`
       // errors when sandbox networks dropped multi-minute connections;
       // prompt_async eliminates that whole class of failure.
+      if (request.run.goal) throw new Error("Native goals are not supported by OpenCode.");
+      if (request.run.mode) {
+        const agents = await fetchJson<Array<{ name: string; mode?: string }>>(`${runtime.baseUrl}/agent`, { headers: runtime.previewHeaders });
+        const name = request.run.mode === "plan" ? "plan" : "build";
+        if (!agents.some((agent) => agent.name === name)) throw new Error(`This OpenCode installation does not expose the ${name} agent.`);
+      }
       const dispatchPrompt = async (
         parts: OpenCodePromptPart[],
       ): Promise<void> => {
@@ -1741,7 +1692,10 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
           ...(request.run.systemPrompt
             ? { system: request.run.systemPrompt }
             : {}),
-          agent: agentSlug,
+          ...(request.options.configuration === "native"
+            ? (request.run.reasoning ? { variant: request.run.reasoning } : {})
+            : { agent: agentSlug }),
+          ...(request.run.mode ? { agent: request.run.mode === "plan" ? "plan" : "build" } : {}),
           parts,
         });
         const url = `${runtime.baseUrl}/session/${sessionId}/prompt_async`;
