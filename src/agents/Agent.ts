@@ -591,6 +591,10 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
   }
 
   stream(runConfig: AgentRunConfig): AgentRun {
+    if (this.provider !== AgentProvider.Codex &&
+        (runConfig.reasoning === "max" || runConfig.reasoning === "ultra")) {
+      throw new Error(`Reasoning effort "${runConfig.reasoning}" is only supported by Codex.`);
+    }
     if (runConfig.resumeSessionId && runConfig.forkSessionId) {
       throw new Error(
         "AgentRunConfig.resumeSessionId and forkSessionId are mutually exclusive.",

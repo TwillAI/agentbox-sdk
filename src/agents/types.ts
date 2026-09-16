@@ -45,7 +45,8 @@ export type UserContentPart = TextPart | ImagePart | FilePart;
 
 export type UserContent = string | UserContentPart[];
 
-export type AgentReasoningEffort = "low" | "medium" | "high" | "xhigh";
+/** `max` and `ultra` are Codex-only and require a supporting model/runtime. */
+export type AgentReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export interface AgentRunConfig {
   input: UserContent;
@@ -173,6 +174,12 @@ export interface AgentOptionsBase {
    * work); `Infinity` waits forever. On expiry the tasks are stopped
    * best-effort and the run completes with the last turn's text. Progress
    * is reported through `background.tasks` events.
+   * For Codex, only gaps between active native goal turns use this budget
+   * (also bounded by the idle grace). Ordinary turns finish on turn/completed,
+   * regardless of live shell processes. No synthetic command-result turn is
+   * injected, and goal-wait expiry does not terminate remote shell processes.
+   * Inactive goals settle after their final turn; clearing a goal while idle
+   * settles immediately.
    */
   backgroundTaskTimeoutMs?: number;
   approvalMode?: AgentApprovalMode;

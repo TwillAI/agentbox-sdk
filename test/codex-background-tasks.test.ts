@@ -20,6 +20,10 @@ import type { NormalizedAgentEvent } from "../src/events";
 const command = "/bin/zsh -lc 'sleep 30; echo CODEX_BG_DONE'";
 
 type FixtureOptions = {
+  /** Script run before the first answer and turn completion. */
+  duringFirstTurn?: string;
+  /** Whether the first turn starts a shell command. */
+  startCommand?: boolean;
   /** Script run right after the first turn completed. */
   afterFirstTurn?: string;
   /** Script run at the start of every later turn, before its answer. */
@@ -54,6 +58,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const message = JSON.parse(line);
   if (message.method === 'initialize') send({ id: message.id, result: {} });
   else if (message.method === 'thread/start') send({ id: message.id, result: { thread: { id: threadId } } });
+  else if (message.method === 'thread/goal/set') send({ id: message.id, result: {} });
   else if (message.method === 'turn/interrupt') setTimeout(() => send({ id: message.id, result: {} }), ${options.interruptDelayMs ?? 0});
   else if (message.method === 'thread/backgroundTerminals/list') { record(message); send({ id: message.id, result: { data: [{ itemId: 'exec-1', processId: '85638', command: exec.command, cwd: exec.cwd }], nextCursor: null } }); }
   else if (message.method === 'thread/backgroundTerminals/terminate') { record(message); send({ id: message.id, result: { terminated: true } }); }
@@ -63,7 +68,8 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     send({ id: message.id, result: { turn: { id: turnId } } });
     send({ method: 'turn/started', params: { threadId, turn: { id: turnId, status: 'inProgress' } } });
     if (turns === 1) {
-      send({ method: 'item/started', params: { threadId, turnId, item: exec } });
+      if (${options.startCommand ?? true}) send({ method: 'item/started', params: { threadId, turnId, item: exec } });
+      ${options.duringFirstTurn ?? ""}
       agentMessage(turnId, 'msg-1', 'STARTED');
       completeTurn(turnId);
       ${options.afterFirstTurn ?? ""}
@@ -137,136 +143,383 @@ const ofType = <T extends NormalizedAgentEvent["type"]>(
       event.type === type,
   );
 
-it("wakes Codex with the result of a command that outlived its turn and settles on the follow-up turn", async () => {
-  const { directory, agent, requests } = await setup("follow-up", {
-    afterFirstTurn: finishCommandAfter(150),
+// Shapes from the app-server protocol and the staging incident: `complete`
+// (not `completed`) and `blocked` stop native goal continuation.
+const goalUpdate = (
+  status: string,
+  threadId = "thread-test",
+  turnId: string | null = "turn-1",
+) =>
+  `send({ method: 'thread/goal/updated', params: { threadId: ${JSON.stringify(threadId)}, turnId: ${JSON.stringify(turnId)}, goal: { threadId: ${JSON.stringify(threadId)}, status: ${JSON.stringify(status)} } } });`;
+
+it.each(["complete", "blocked", undefined])(
+  "settles a remote turn (goal: %s) without waiting for or terminating leftover processes",
+  async (status) => {
+    const recorded: Recorded[] = [];
+    const server = new WebSocketServer({ port: 0 });
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    let closed!: () => void;
+    const disconnected = new Promise<void>((resolve) => {
+      closed = resolve;
+    });
+    server.on("connection", (socket) => {
+      socket.on("close", closed);
+      socket.on("message", (data) => {
+        const message = JSON.parse(String(data)) as Recorded & { id?: number };
+        if (message.id === undefined) return;
+        recorded.push(message);
+        const send = (value: unknown) => socket.send(JSON.stringify(value));
+        const reply = (result: unknown) => send({ id: message.id, result });
+        if (message.method === "thread/start")
+          reply({ thread: { id: "root" } });
+        else if (message.method === "turn/start") {
+          reply({ turn: { id: "turn-final" } });
+          send({
+            method: "turn/started",
+            params: {
+              threadId: "root",
+              turn: { id: "turn-final", status: "inProgress" },
+            },
+          });
+          for (const command of [
+            "/bin/sh -lc 'python3 -m http.server 3000 --bind 0.0.0.0 --directory /tmp/twill-scroll-preview'",
+            "pnpm run dev",
+            "sleep 60; echo DONE",
+            "node scripts/custom-worker.js",
+            "next dev",
+            "Xvfb :99",
+            "openbox",
+            "twill-desktop",
+          ]) {
+            send({
+              method: "item/started",
+              params: {
+                threadId: "root",
+                turnId: "turn-final",
+                item: {
+                  type: "commandExecution",
+                  id: command,
+                  command,
+                  status: "inProgress",
+                },
+              },
+            });
+          }
+          if (status) send({
+            method: "thread/goal/updated",
+            params: {
+              threadId: "root",
+              turnId: "turn-final",
+              goal: { threadId: "root", status },
+            },
+          });
+          // A terminal goal is not enough on its own: the final answer must
+          // still be collected before the remote transport is disconnected.
+          setTimeout(() => {
+            const text =
+              status === "blocked"
+                ? "Implemented; macOS verification needs runner access."
+                : "Implemented and verified.";
+            send({
+              method: "item/completed",
+              params: {
+                threadId: "root",
+                turnId: "turn-final",
+                item: {
+                  type: "agentMessage",
+                  id: "answer",
+                  text,
+                  phase: "final_answer",
+                },
+              },
+            });
+            send({
+              method: "turn/completed",
+              params: {
+                threadId: "root",
+                turn: { id: "turn-final", status: "completed" },
+              },
+            });
+          }, 50);
+        } else reply({});
+      });
+    });
+    const port = (server.address() as { port: number }).port;
+    const sandbox = {
+      provider: "e2b",
+      previewHeaders: {},
+      getPreviewLink: async () => `http://127.0.0.1:${port}`,
+      run: async () => ({
+        exitCode: 0,
+        stdout: "test-token\n",
+        stderr: "",
+        combinedOutput: "test-token\n",
+      }),
+    } as unknown as Sandbox;
+    let run: AgentRun | undefined;
+    try {
+      run = new Agent("codex", {
+        sandbox,
+        cwd: "/work",
+        backgroundTaskTimeoutMs: 200,
+      }).stream({
+        input: "Implement the preview",
+        ...(status ? { goal: "Implement the preview" } : {}),
+      });
+      const result = await collect(run);
+      await disconnected;
+      expect(result.error).toBeUndefined();
+      expect(result.isCancelled).toBe(false);
+      expect(result.text).toBe(
+        status === "blocked"
+          ? "Implemented; macOS verification needs runner access."
+          : "Implemented and verified.",
+      );
+      expect(backgroundEvents(result.events)).toEqual([]);
+      expect(ofType(result.events, "run.completed")).toHaveLength(1);
+      expect(recorded.map((request) => request.method)).toEqual([
+        "initialize",
+        "thread/start",
+        ...(status ? ["thread/goal/set"] : []),
+        "turn/start",
+      ]);
+      expect(
+        result.rawEvents.some(
+          (event) =>
+            event.type === "thread/goal/updated" &&
+            JSON.stringify(event.payload).includes(status ?? ""),
+        ),
+      ).toBe(Boolean(status));
+      run = undefined;
+    } finally {
+      await run?.abort();
+      for (const client of server.clients) client.terminate();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  },
+);
+
+it.each([true, false])(
+  "keeps an active goal open for native continuation (live command: %s)",
+  async (startCommand) => {
+    const { directory, agent, requests } = await setup("goal-continuation", {
+      startCommand,
+      // The requested goal is active even before its first status event.
+      afterFirstTurn: `setTimeout(() => {
+      send({ method: 'turn/started', params: { threadId, turn: { id: 'turn-2', status: 'inProgress' } } });
+      ${goalUpdate("blocked", "thread-test", "turn-2")}
+      agentMessage('turn-2', 'msg-2', 'DONE; needs external verification');
+      completeTurn('turn-2');
+    }, 100);`,
+    });
+    try {
+      const result = await collect(
+        agent({ backgroundTaskTimeoutMs: 500 }).stream({
+          input: "Implement the preview",
+          goal: "Implement the preview",
+        }),
+      );
+      expect(result.text).toBe("DONE; needs external verification");
+      expect(result.error).toBeUndefined();
+      expect(result.isCancelled).toBe(false);
+      expect(
+        ofType(result.events, "message.started").map(
+          (event) => event.messageId,
+        ),
+      ).toEqual(["turn-1", "turn-2"]);
+      expect(ofType(result.events, "run.completed")).toHaveLength(1);
+      expect(backgroundEvents(result.events)[0]).toEqual({
+        waiting: true,
+        ids: [],
+      });
+      expect(backgroundEvents(result.events).at(-1)).toEqual({
+        waiting: false,
+        ids: [],
+      });
+      expect(ofType(result.events, "message.injected")).toEqual([]);
+      expect((await requests()).map((request) => request.method)).toEqual([
+        "turn/start",
+      ]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+it("does not inject a command-result turn while Codex is continuing an active goal", async () => {
+  const { directory, agent, requests } = await setup("goal-command-finished", {
+    duringFirstTurn: goalUpdate("active"),
+    afterFirstTurn: `setTimeout(() => {
+      finishCommand();
+      send({ method: 'turn/started', params: { threadId, turn: { id: 'turn-native', status: 'inProgress' } } });
+      ${goalUpdate("complete", "thread-test", "turn-native")}
+      agentMessage('turn-native', 'msg-native', 'NATIVE DONE');
+      completeTurn('turn-native');
+    }, 100);`,
   });
   try {
     const result = await collect(
-      agent().stream({ input: "Start the build in the background" }),
+      agent({ backgroundTaskTimeoutMs: 500 }).stream({
+        input: "Finish the goal",
+      }),
     );
-    expect(result.isCancelled).toBe(false);
-    expect(result.text).toBe("DONE");
-    const starts = (await requests()).filter(
-      (request) => request.method === "turn/start",
-    );
-    expect(starts).toHaveLength(2);
-    const input = starts[1]?.params.input as
-      | Array<{ type: string; text: string }>
-      | undefined;
-    expect(input).toHaveLength(1);
-    const text = String(input?.[0]?.text);
-    expect(input?.[0]?.type).toBe("text");
-    expect(text).toMatch(
-      /^Background command finished while you were idle\.\n\n/,
-    );
-    expect(text).toContain(
-      `\`${command}\` exited with code 0 after 30s.\nOutput (last 4000 chars):\n\`\`\`\nCODEX_BG_DONE\n\`\`\``,
-    );
-    expect(text).toMatch(
-      /\nContinue from here: verify the outcome and finish the task\. Do not restart the command\.$/,
-    );
-    // Same params builder as sendMessage: thread id and policies come along.
-    expect(starts[1]?.params).toMatchObject({
-      threadId: "thread-test",
-      approvalPolicy: starts[0]?.params.approvalPolicy,
-    });
-    // Membership changes are reported while waiting; the empty set stays
-    // `waiting` until the follow-up turn actually starts.
+    expect(result.text).toBe("NATIVE DONE");
+    expect(ofType(result.events, "message.injected")).toEqual([]);
+    expect((await requests()).map((request) => request.method)).toEqual([
+      "turn/start",
+    ]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it.each([
+  ["child goal", goalUpdate("complete", "child")],
+  ["old turn", goalUpdate("blocked", "thread-test", "turn-old")],
+])("ignores a %s when waiting for native goal continuation", async (_name, staleUpdate) => {
+  const { directory, agent, requests } = await setup("goal-ignore", {
+    duringFirstTurn: `${goalUpdate("active")} ${staleUpdate}`,
+    afterFirstTurn: `setTimeout(() => {
+      send({ method: 'turn/started', params: { threadId, turn: { id: 'turn-native', status: 'inProgress' } } });
+      ${goalUpdate("complete", "thread-test", "turn-native")}
+      agentMessage('turn-native', 'msg-native', 'NATIVE DONE');
+      completeTurn('turn-native');
+    }, 50);`,
+  });
+  try {
+    const result = await collect(agent({ backgroundTaskTimeoutMs: 500 }).stream({ input: "Finish the goal" }));
+    expect(result.text).toBe("NATIVE DONE");
     expect(backgroundEvents(result.events)).toEqual([
-      { waiting: true, ids: ["exec-1"] },
       { waiting: true, ids: [] },
       { waiting: false, ids: [] },
     ]);
-    expect(ofType(result.events, "message.injected")).toEqual([
-      expect.objectContaining({ content: text, messageId: "turn-2" }),
-    ]);
-    expect(
-      ofType(result.events, "message.started").map((event) => event.messageId),
-    ).toEqual(["turn-1", "turn-2"]);
     expect(ofType(result.events, "run.completed")).toHaveLength(1);
-    const indexOf = (type: NormalizedAgentEvent["type"]) =>
-      result.events.findIndex((event) => event.type === type);
-    expect(indexOf("message.injected")).toBeGreaterThan(
-      indexOf("background.tasks"),
-    );
+    expect((await requests()).map((request) => request.method)).toEqual(["turn/start"]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-it("keeps the legacy settle-at-first-turn behaviour when backgroundTaskTimeoutMs is 0", async () => {
-  const { directory, agent, requests } = await setup("legacy", {
-    afterFirstTurn: finishCommandAfter(150),
+it("ignores child turn completion and keeps root goal updates scoped to the root turn", async () => {
+  const { directory, agent } = await setup("child-turn", {
+    duringFirstTurn: `
+      ${goalUpdate("active")}
+      send({ method: 'turn/started', params: { threadId: 'child', turn: { id: 'child-turn', status: 'inProgress' } } });
+      send({ method: 'turn/completed', params: { threadId: 'child', turn: { id: 'child-turn', status: 'completed' } } });
+      ${goalUpdate("blocked")}
+    `,
   });
   try {
-    const result = await collect(
-      agent({ backgroundTaskTimeoutMs: 0 }).stream({
-        input: "Start the build in the background",
-      }),
-    );
-    expect(result.isCancelled).toBe(false);
+    const result = await collect(agent({ backgroundTaskTimeoutMs: 500 }).stream({ input: "Finish the goal" }));
     expect(result.text).toBe("STARTED");
-    expect(
-      (await requests()).filter((request) => request.method === "turn/start"),
-    ).toHaveLength(1);
+    expect(backgroundEvents(result.events)).toEqual([]);
+    expect(ofType(result.events, "run.completed")).toHaveLength(1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it.each([
+  ["complete", goalUpdate("complete")],
+  ["blocked", goalUpdate("blocked")],
+  ["cleared", "send({ method: 'thread/goal/cleared', params: { threadId } });"],
+])("settles when an idle active goal becomes %s", async (_name, update) => {
+  const { directory, agent, requests } = await setup("goal-after-turn", {
+    duringFirstTurn: goalUpdate("active"),
+    afterFirstTurn: `setTimeout(() => { ${update} }, 50);`,
+  });
+  try {
+    const result = await collect(agent({ backgroundTaskTimeoutMs: 500 }).stream({ input: "Implement the preview" }));
+    expect(result.text).toBe("STARTED");
+    expect(backgroundEvents(result.events)).toEqual([
+      { waiting: true, ids: [] },
+      { waiting: false, ids: [] },
+    ]);
+    expect(ofType(result.events, "run.completed")).toHaveLength(1);
+    expect((await requests()).map((request) => request.method)).toEqual(["turn/start"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it.each([0, 500, Infinity])("finishes an ordinary turn with a live command regardless of the wait ceiling (%s)", async (backgroundTaskTimeoutMs) => {
+  const { directory, agent, requests } = await setup("ordinary-turn", {
+    afterFirstTurn: finishCommandAfter(100),
+  });
+  try {
+    const result = await collect(agent({ backgroundTaskTimeoutMs }).stream({ input: "Start a command" }));
+    expect(result.isCancelled).toBe(false);
+    expect(result.error).toBeUndefined();
+    expect(result.text).toBe("STARTED");
     expect(backgroundEvents(result.events)).toEqual([]);
     expect(ofType(result.events, "message.injected")).toEqual([]);
     expect(ofType(result.events, "run.completed")).toHaveLength(1);
+    expect((await requests()).map((request) => request.method)).toEqual(["turn/start"]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-it("terminates leftover commands and completes with the last turn's text when the ceiling expires", async () => {
-  const { directory, agent, requests } = await setup("ceiling");
+it("preserves command completion events observed within the model's own turn", async () => {
+  const { directory, agent, requests } = await setup("native-command-wait", {
+    duringFirstTurn: "finishCommand();",
+  });
   try {
-    const startedAt = Date.now();
-    const result = await collect(
-      agent({ backgroundTaskTimeoutMs: 200 }).stream({
-        input: "Start the build in the background",
-      }),
-    );
-    expect(Date.now() - startedAt).toBeLessThan(10_000);
+    const result = await collect(agent().stream({ input: "Wait for the command and answer" }));
+    expect(result.text).toBe("STARTED");
+    expect(ofType(result.events, "tool.call.completed")).toHaveLength(1);
+    expect(backgroundEvents(result.events)).toEqual([]);
+    expect(ofType(result.events, "message.injected")).toEqual([]);
+    expect((await requests()).map((request) => request.method)).toEqual(["turn/start"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it("settles at the first turn for a cleared goal or a disabled goal wait", async () => {
+  for (const backgroundTaskTimeoutMs of [0, 500]) {
+    const { directory, agent } = await setup("goal-no-wait", {
+      duringFirstTurn: `${goalUpdate("active")} ${backgroundTaskTimeoutMs === 0 ? "" : "send({ method: 'thread/goal/cleared', params: { threadId } });"}`,
+    });
+    try {
+      const result = await collect(agent({ backgroundTaskTimeoutMs }).stream({ input: "Finish the goal" }));
+      expect(result.text).toBe("STARTED");
+      expect(backgroundEvents(result.events)).toEqual([]);
+      expect(ofType(result.events, "run.completed")).toHaveLength(1);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+it("bounds an idle native goal wait without stopping shell processes or injecting turns", async () => {
+  const { directory, agent, requests } = await setup("goal-ceiling", {
+    duringFirstTurn: goalUpdate("active"),
+  });
+  try {
+    const result = await collect(agent({ backgroundTaskTimeoutMs: 100 }).stream({ input: "Finish the goal" }));
     expect(result.isCancelled).toBe(false);
     expect(result.text).toBe("STARTED");
-    const recorded = await requests();
-    expect(
-      recorded.filter((request) => request.method === "turn/start"),
-    ).toHaveLength(1);
-    // The app-server's own list drives the terminate pass: it also covers
-    // commands whose item/started carried no processId.
-    expect(
-      recorded
-        .filter((request) =>
-          request.method.startsWith("thread/backgroundTerminals/"),
-        )
-        .map((request) => [request.method, request.params]),
-    ).toEqual([
-      ["thread/backgroundTerminals/list", { threadId: "thread-test" }],
-      [
-        "thread/backgroundTerminals/terminate",
-        { threadId: "thread-test", processId: "85638" },
-      ],
-    ]);
+    expect((await requests()).map((request) => request.method)).toEqual(["turn/start"]);
     expect(backgroundEvents(result.events)).toEqual([
-      { waiting: true, ids: ["exec-1"] },
+      { waiting: true, ids: [] },
       { waiting: false, ids: [] },
     ]);
-    expect(
-      ofType(result.events, "run.completed").map((event) => event.text),
-    ).toEqual(["STARTED"]);
+    expect(ofType(result.events, "run.completed").map((event) => event.text)).toEqual(["STARTED"]);
     expect(ofType(result.events, "message.injected")).toEqual([]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-it("cancels the run when it is aborted while waiting on background work", async () => {
-  const { directory, agent, requests } = await setup("abort");
+it.each([0, 300])("cancels during a native goal wait even if its ceiling fires during abort (interrupt delay: %s)", async (interruptDelayMs) => {
+  const { directory, agent, requests } = await setup("goal-abort", {
+    duringFirstTurn: goalUpdate("active"),
+    interruptDelayMs,
+  });
   let active: AgentRun | undefined;
   try {
-    active = agent().stream({ input: "Start the build in the background" });
+    active = agent({ backgroundTaskTimeoutMs: 100 }).stream({ input: "Finish the goal" });
     const run = active;
     const result = await collect(run, async (event) => {
       if (event.type === "background.tasks" && event.waiting) await run.abort();
@@ -275,14 +528,11 @@ it("cancels the run when it is aborted while waiting on background work", async 
     expect(result.text).toBe("STARTED");
     expect(ofType(result.events, "run.cancelled")).toHaveLength(1);
     expect(ofType(result.events, "run.completed")).toEqual([]);
-    // Every settle, a cancel included, ends with nothing pending.
     expect(backgroundEvents(result.events)).toEqual([
-      { waiting: true, ids: ["exec-1"] },
+      { waiting: true, ids: [] },
       { waiting: false, ids: [] },
     ]);
-    expect(
-      (await requests()).filter((request) => request.method === "turn/start"),
-    ).toHaveLength(1);
+    expect((await requests()).map((request) => request.method)).toEqual(["turn/start"]);
     active = undefined;
   } finally {
     await active?.abort();
@@ -290,50 +540,13 @@ it("cancels the run when it is aborted while waiting on background work", async 
   }
 });
 
-it("never settles a run whose abort is in progress when the ceiling fires meanwhile", async () => {
-  // turn/interrupt answers after the ceiling: the expiry lands inside the
-  // abort handler's window.
-  const { directory, agent, requests } = await setup("abort-ceiling", {
-    interruptDelayMs: 600,
+it("allows a user message during a native goal wait without injecting SDK follow-ups", async () => {
+  const { directory, agent, requests } = await setup("goal-send-message", {
+    duringFirstTurn: goalUpdate("active"),
+    duringLaterTurn: goalUpdate("complete", "thread-test", "turn-2"),
   });
-  let active: AgentRun | undefined;
   try {
-    active = agent({ backgroundTaskTimeoutMs: 200 }).stream({
-      input: "Start the build in the background",
-    });
-    const run = active;
-    const result = await collect(run, async (event) => {
-      if (event.type === "background.tasks" && event.waiting) await run.abort();
-    });
-    expect(result.isCancelled).toBe(true);
-    expect(ofType(result.events, "run.completed")).toEqual([]);
-    expect(ofType(result.events, "run.cancelled")).toHaveLength(1);
-    expect(backgroundEvents(result.events).at(-1)).toEqual({
-      waiting: false,
-      ids: [],
-    });
-    const recorded = await requests();
-    expect(
-      recorded.filter((request) => request.method === "turn/start"),
-    ).toHaveLength(1);
-    expect(
-      recorded.filter((request) =>
-        request.method.startsWith("thread/backgroundTerminals/"),
-      ),
-    ).toEqual([]);
-    active = undefined;
-  } finally {
-    await active?.abort();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-it("runs a user message sent while waiting as a real turn and re-checks the in-flight set at its end", async () => {
-  const { directory, agent, requests } = await setup("send-message");
-  try {
-    const run = agent({ backgroundTaskTimeoutMs: 300 }).stream({
-      input: "Start the build in the background",
-    });
+    const run = agent({ backgroundTaskTimeoutMs: 500 }).stream({ input: "Finish the goal" });
     let sent = false;
     const result = await collect(run, async (event) => {
       if (event.type === "background.tasks" && event.waiting && !sent) {
@@ -343,96 +556,43 @@ it("runs a user message sent while waiting as a real turn and re-checks the in-f
     });
     expect(result.isCancelled).toBe(false);
     expect(result.text).toBe("DONE");
-    const starts = (await requests()).filter(
-      (request) => request.method === "turn/start",
-    );
+    const starts = (await requests()).filter((request) => request.method === "turn/start");
     expect(starts).toHaveLength(2);
-    expect(starts[1]?.params.input).toEqual([
-      expect.objectContaining({ text: "Any news?" }),
-    ]);
-    // The command is still running when the user's turn ends: the wait
-    // resumes with what is left of the budget, and the ceiling ends it.
+    expect(starts[1]?.params.input).toEqual([expect.objectContaining({ text: "Any news?" })]);
     expect(backgroundEvents(result.events)).toEqual([
-      { waiting: true, ids: ["exec-1"] },
-      { waiting: false, ids: ["exec-1"] },
-      { waiting: true, ids: ["exec-1"] },
+      { waiting: true, ids: [] },
       { waiting: false, ids: [] },
     ]);
-    expect(
-      ofType(result.events, "message.injected").map((event) => event.content),
-    ).toEqual(["Any news?"]);
-    expect(
-      ofType(result.events, "run.completed").map((event) => event.text),
-    ).toEqual(["DONE"]);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-it("leaves a command that finishes during a user-sent turn to the model instead of reporting it as idle work", async () => {
-  const { directory, agent, requests } = await setup("finish-in-turn", {
-    duringLaterTurn: "finishCommand();",
-  });
-  try {
-    const run = agent().stream({ input: "Start the build in the background" });
-    let sent = false;
-    const result = await collect(run, async (event) => {
-      if (event.type === "background.tasks" && event.waiting && !sent) {
-        sent = true;
-        await run.sendMessage("Any news?");
-      }
-    });
-    expect(result.isCancelled).toBe(false);
-    // The model could read the output with write_stdin: its answer stands.
-    expect(result.text).toBe("DONE");
-    expect(
-      (await requests()).filter((request) => request.method === "turn/start"),
-    ).toHaveLength(2);
-    expect(
-      ofType(result.events, "message.injected").map((event) => event.content),
-    ).toEqual(["Any news?"]);
-    expect(backgroundEvents(result.events)).toEqual([
-      { waiting: true, ids: ["exec-1"] },
-      { waiting: false, ids: ["exec-1"] },
-      { waiting: false, ids: [] },
-    ]);
-    // The turn's own run.completed, not a settle: one, and no message.injected
-    // beyond the user's.
+    expect(ofType(result.events, "message.injected").map((event) => event.content)).toEqual(["Any news?"]);
     expect(ofType(result.events, "run.completed")).toHaveLength(1);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-it("cancels when an interrupted turn lands while waiting (the stateless abort marker)", async () => {
-  const { directory, agent, requests } = await setup("external-cancel", {
-    afterFirstTurn: interruptedTurnAfter(150),
+it("cancels when an interrupted turn lands during a native goal wait", async () => {
+  const { directory, agent } = await setup("goal-external-cancel", {
+    duringFirstTurn: goalUpdate("active"),
+    afterFirstTurn: interruptedTurnAfter(50),
   });
   try {
-    const result = await collect(
-      agent().stream({ input: "Start the build in the background" }),
-    );
+    const result = await collect(agent().stream({ input: "Finish the goal" }));
     expect(result.isCancelled).toBe(true);
     expect(result.text).toBe("STARTED");
     expect(ofType(result.events, "run.cancelled")).toHaveLength(1);
     expect(ofType(result.events, "run.completed")).toEqual([]);
     expect(backgroundEvents(result.events)).toEqual([
-      { waiting: true, ids: ["exec-1"] },
-      { waiting: false, ids: ["exec-1"] },
+      { waiting: true, ids: [] },
       { waiting: false, ids: [] },
     ]);
-    // No follow-up turn: the interrupted turn ended the run.
-    expect(
-      (await requests()).filter((request) => request.method === "turn/start"),
-    ).toHaveLength(1);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
 
 // A remote app-server as attachAbort sees it: `turn/interrupt` on an idle
-// thread is invalid_request, exactly what codex answers during a background
-// wait; a busy thread accepts it.
+// thread is invalid_request, exactly what codex answers between native goal
+// turns; a busy thread accepts it.
 async function fakeRemoteAppServer() {
   const recorded: Recorded[] = [];
   const server = new WebSocketServer({ port: 0 });
@@ -472,6 +632,12 @@ async function fakeRemoteAppServer() {
                 itemId: "exec-1",
                 processId: "85638",
                 command,
+                cwd: "/tmp/work",
+              },
+              {
+                itemId: "preview",
+                processId: "11021",
+                command: "python3 -m http.server 3000",
                 cwd: "/tmp/work",
               },
             ],
@@ -523,6 +689,7 @@ it("attachAbort starts a turn only to interrupt it when the thread is idle, then
       "turn/interrupt",
       "thread/backgroundTerminals/list",
       "thread/backgroundTerminals/terminate",
+      "thread/backgroundTerminals/terminate",
     ]);
     expect(fake.recorded[1]?.params).toEqual({
       threadId: "thread-test",
@@ -540,6 +707,11 @@ it("attachAbort starts a turn only to interrupt it when the thread is idle, then
     expect(fake.recorded[5]?.params).toEqual({
       threadId: "thread-test",
       processId: "85638",
+    });
+    // Explicit cancellation stops all terminals, including preview servers.
+    expect(fake.recorded[6]?.params).toEqual({
+      threadId: "thread-test",
+      processId: "11021",
     });
   } finally {
     await fake.close();

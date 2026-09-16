@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  Agent,
   AgentProvider,
   type AgentExecutionRequest,
   type AgentReasoningEffort,
@@ -74,6 +75,22 @@ describe("reasoning param", () => {
           request: makeCodexRequest(level),
         });
         expect(params.effort).toBe(level);
+      }
+    });
+
+    it("preserves max and ultra on new, resumed, and plan-mode turns", () => {
+      for (const level of ["max", "ultra"] as const) {
+        for (const resume of [false, true]) {
+          for (const mode of [undefined, "plan", "default"] as const) {
+            const request = makeCodexRequest(level);
+            request.run.model = "gpt-6-astra";
+            request.run.mode = mode;
+            if (resume) request.run.resumeSessionId = "existing-thread";
+            const params = buildCodexTurnStartParams({threadId: "thread-1", inputItems: [], request});
+            expect(params.effort).toBe(level);
+            if (mode) expect(params.collaborationMode).toMatchObject({mode, settings: {reasoning_effort: level}});
+          }
+        }
       }
     });
 
@@ -180,3 +197,12 @@ describe("buildOpenCodeConfig openRouter extraBody", () => {
     expect(options.extraBody.plugins).toBeUndefined();
   });
 });
+
+for (const provider of [AgentProvider.ClaudeCode, AgentProvider.OpenCode]) {
+  it(`rejects Codex-only effort before starting ${provider}`, () => {
+    const agent = new Agent(provider, { cwd: "/workspace" });
+    for (const reasoning of ["max", "ultra"] as const) {
+      expect(() => agent.stream({input: "hello", reasoning})).toThrow("only supported by Codex");
+    }
+  });
+}

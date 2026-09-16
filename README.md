@@ -130,33 +130,31 @@ default 30 minutes, `0` settles at the first turn end as before, `Infinity`
 waits forever. On expiry the tasks are stopped best-effort and the run
 completes with the last turn's text.
 
-Codex has no background mode of its own: its unified exec tool hands control
-back to the model early (`yield_time_ms`) and leaves the process running inside
-the app-server, where nothing wakes the model when it finishes. When a Codex
-turn ends with such a command still running, AgentBox keeps the app-server up
-and reports the command through `background.tasks` (`type: "command"`,
-`description` is the command line). Once every leftover command has finished
-while the model was idle, AgentBox starts a follow-up turn on the same thread
-carrying each command's exit code, duration and the last 4000 characters of
-output, asking the model to verify the outcome and finish without restarting
-the command; that turn is surfaced as a `message.injected` event and the run
-settles on its result (which may in turn leave more commands running). A
-message sent while waiting runs as a normal turn and is checked the same way; a
-command that finishes during a turn is left to the model's own polling and is
-only visible through `tool.call.completed`. A failed follow-up turn fails the
-run like any other turn. When `backgroundTaskTimeoutMs` expires, AgentBox asks
-the app-server to terminate the leftover processes
-(`thread/backgroundTerminals/list` + `terminate`, best effort) and completes
-with the last turn's text; `0` keeps the legacy settle-at-first-turn behaviour.
-Any unified-exec process still running at turn end counts — a dev server or
-watcher the model leaves running on purpose holds the run open until the
-ceiling — so hosts that expect such processes should pass a shorter
-`backgroundTaskTimeoutMs` for Codex. Spawned Codex sub-agents are not tracked:
-the parent must `wait_agent` for them within its turn. A waiting run can still
-be cancelled statelessly: `Agent.attach(...).abort()` interrupts the active turn
-when there is one and otherwise starts a turn only to interrupt it, which the
-originating run observes as an interrupted turn and reports as `run.cancelled`;
-the leftover processes are then terminated.
+Codex owns command polling (`write_stdin`), yielded code-mode waits (`wait`),
+and subagent waits (`wait_agent`). AgentBox finishes an ordinary Codex run on
+its root `turn/completed`, regardless of shell processes still running. It does
+not classify commands, wait for their exit, or inject synthetic follow-up turns.
+Raw tool events remain available. A command ending after the final turn does
+not restart the model. Remote cleanup disconnects from the shared app-server;
+local cleanup shuts down the app-server it owns.
+
+Native Codex goals are a separate lifecycle: an active root-thread goal keeps
+the run open between turns so Codex can continue on its own. AgentBox reports
+these gaps with `background.tasks { tasks: [], waiting: true }` and clears the
+wait when the next native turn starts. A root goal becoming `complete` or
+`blocked` ends the run after its final turn; a goal cleared or made inactive
+while idle settles immediately. Child-thread and stale-turn goal updates do
+not end the root run. `blocked` preserves the final answer without implying
+that the objective was achieved.
+
+Only these native goal waits use `backgroundTaskTimeoutMs` for Codex. The
+15-second idle grace and total wait ceiling bound the gap between native turns;
+`0` settles at the first turn. Expiry settles with the last answer without
+terminating remote shell processes. A user message can resume an idle goal
+wait. Stateless cancellation (`Agent.attach(...).abort()`) interrupts an active
+turn, or starts a turn only to interrupt it if the thread is idle, then stops
+the idle thread's leftover terminals. Claude Code and OpenCode retain their own
+background-work handling described above and below.
 
 OpenCode has no background shells, monitors, or wake-ups; its only work that
 outlives a turn is `task {background: true}`, which the server accepts only when
@@ -204,12 +202,14 @@ Pass an optional `reasoning` level alongside `model` on any run. It maps to each
 ```ts
 await agent.run({
   model: "sonnet",
-  reasoning: "high", // "low" | "medium" | "high" | "xhigh"
+  reasoning: "high", // "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
   input: "Refactor this module and explain your reasoning.",
 });
 ```
 
 `xhigh` requires a model that supports it (e.g. Claude Opus 4.7+, Codex `gpt-5.4`).
+
+Codex also supports `max` (maximum reasoning) and `ultra` (maximum reasoning with automatic task delegation). Astra, GPT-5.6 Sol, and GPT-5.6 Terra support both; GPT-5.6 Luna supports `max`. Check the runtime's `model/list` → `supportedReasoningEfforts` for model availability. Both values are forwarded unchanged to `turn/start.effort`, including resumed and plan-mode turns; other AgentBox providers reject them.
 
 ### Open-source & custom models (OpenRouter, OSS)
 

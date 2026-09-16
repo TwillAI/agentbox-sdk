@@ -30,7 +30,6 @@ import {
   type AgentExecutionRequest,
   type AgentOptions,
   type AgentProviderAdapter,
-  type AgentReasoningEffort,
   type AgentRunSink,
   type AgentSetupRequest,
   type UserContent,
@@ -158,7 +157,10 @@ export function buildClaudeQueryOptions(params: {
   // Ultracode requires xhigh effort (plus an xhigh-capable model). Force it
   // here so callers only have to flip the single `ultracode` flag; the CLI
   // silently downgrades if the selected model can't do xhigh.
-  const effort: AgentReasoningEffort | undefined = provider?.ultracode
+  if (run.reasoning === "max" || run.reasoning === "ultra") {
+    throw new Error(`Reasoning effort "${run.reasoning}" is only supported by Codex.`);
+  }
+  const effort = provider?.ultracode
     ? "xhigh"
     : run.reasoning;
 
