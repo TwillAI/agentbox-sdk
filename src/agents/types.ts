@@ -187,6 +187,8 @@ export interface AgentOptionsBase {
 }
 
 export interface CodexProviderOptions {
+  /** Native service tier; "default" explicitly selects standard speed. */
+  serviceTier?: string;
   /** Explicit policy for new, resumed, and forked native sessions. */
   approvalPolicy?: "untrusted" | "on-request" | "never";
   /** Managed host execution defaults to read-only; native configuration uses the CLI's settings. */
@@ -248,6 +250,8 @@ export interface OpenCodeProviderOptions {
 }
 
 export interface ClaudeCodeProviderOptions {
+  /** Request fast mode explicitly; false overrides inherited fast settings. */
+  fastMode?: boolean;
   binary?: string;
   args?: string[];
   hooks?: ClaudeCodeHooksConfig;

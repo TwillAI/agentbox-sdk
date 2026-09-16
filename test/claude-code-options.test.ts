@@ -26,6 +26,17 @@ function buildOptions(request: AgentExecutionRequest<"claude-code">) {
 }
 
 describe("claude-code query options", () => {
+  it("explicitly enables and disables native fast mode without mutating user settings", () => {
+    for (const fastMode of [true, false]) {
+      const options = buildClaudeQueryOptions({
+        request: makeClaudeRequest({ options: { configuration: "native", provider: { fastMode } } }),
+        env: {},
+      });
+      expect(options.settings).toEqual({ fastMode });
+      expect(options.settingSources).toEqual(["user", "project", "local"]);
+    }
+    expect(buildOptions(makeClaudeRequest()).settings).toBe("/tmp/agentbox/claude-code/.claude/settings.json");
+  });
   it("opts into full sub-agent transcript forwarding", () => {
     expect(buildOptions(makeClaudeRequest()).forwardSubagentText).toBe(true);
   });

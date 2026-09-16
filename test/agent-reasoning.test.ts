@@ -54,6 +54,18 @@ function makeOpenCodeRequest(
 
 describe("reasoning param", () => {
   describe("codex", () => {
+    it("forwards service tier independently of model and effort, including standard on resume", () => {
+      for (const serviceTier of ["fast", "priority", "default", undefined]) {
+        const request = makeCodexRequest("high");
+        request.options.provider = { serviceTier };
+        request.run.resumeSessionId = "existing-thread";
+        const params = buildCodexTurnStartParams({ threadId: "existing-thread", inputItems: [], request });
+        expect(params.serviceTier).toBe(serviceTier);
+        expect(params.effort).toBe("high");
+        expect(params.model).toBe(request.run.model ?? null);
+        if (serviceTier === undefined) expect(params).not.toHaveProperty("serviceTier");
+      }
+    });
     it("forwards reasoning to turn/start as effort", () => {
       for (const level of REASONING_LEVELS) {
         const params = buildCodexTurnStartParams({

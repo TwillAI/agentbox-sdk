@@ -167,6 +167,8 @@ export function buildClaudeQueryOptions(params: {
     env: params.env,
     pathToClaudeCodeExecutable: provider?.binary ?? "claude",
     ...(params.settingsPath ? { settings: params.settingsPath } : {}),
+    ...(params.request.options.configuration === "native" && provider?.fastMode !== undefined
+      ? { settings: { fastMode: provider.fastMode } } : {}),
     ...(params.request.options.configuration === "native" ? {
       settingSources: ["user", "project", "local"] as const,
       systemPrompt: { type: "preset" as const, preset: "claude_code" as const },
@@ -967,7 +969,9 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       const workflowSettings = buildClaudeWorkflowSettings(
         options.provider?.ultracode,
       );
-      const claudeSettings = { ...hookSettings, ...workflowSettings };
+      const claudeSettings = { ...hookSettings, ...workflowSettings,
+        ...(options.provider?.fastMode !== undefined ? { fastMode: options.provider.fastMode } : {}),
+      };
       const mcpConfigJson =
         buildClaudeMcpConfig(options.mcps) ??
         JSON.stringify({ mcpServers: {} }, null, 2);

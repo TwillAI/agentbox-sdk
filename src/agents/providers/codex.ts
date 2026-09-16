@@ -216,6 +216,7 @@ function buildThreadParams(
   return {
     cwd,
     model: request.run.model ?? null,
+    ...(request.options.provider?.serviceTier !== undefined ? { serviceTier: request.options.provider.serviceTier } : {}),
     ...(options.provider?.approvalPolicy ? { approvalPolicy: options.provider.approvalPolicy } : options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
     sandbox: buildCodexSandboxMode(options),
     serviceName: "agentbox",
@@ -236,6 +237,7 @@ function buildResumeParams(
     threadId: request.run.resumeSessionId,
     cwd,
     model: request.run.model ?? null,
+    ...(request.options.provider?.serviceTier !== undefined ? { serviceTier: request.options.provider.serviceTier } : {}),
     ...(options.provider?.approvalPolicy ? { approvalPolicy: options.provider.approvalPolicy } : options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
     sandbox: buildCodexSandboxMode(options),
     ...(request.run.systemPrompt ? { developerInstructions: request.run.systemPrompt } : options.configuration === "native" ? {} : { developerInstructions: null }),
@@ -272,6 +274,7 @@ function buildForkParams(
     lastTurnId: request.run.forkAtMessageId ?? null,
     cwd,
     model: request.run.model ?? null,
+    ...(request.options.provider?.serviceTier !== undefined ? { serviceTier: request.options.provider.serviceTier } : {}),
     ...(options.provider?.approvalPolicy ? { approvalPolicy: options.provider.approvalPolicy } : options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
     sandbox: buildCodexSandboxMode(options),
     ...(request.run.systemPrompt ? { developerInstructions: request.run.systemPrompt } : options.configuration === "native" ? {} : { developerInstructions: null }),
@@ -334,6 +337,7 @@ export function buildCodexTurnStartParams(params: {
     }),
     ...(sandboxPolicy ? { sandboxPolicy } : {}),
     model: request.run.model ?? null,
+    ...(request.options.provider?.serviceTier !== undefined ? { serviceTier: request.options.provider.serviceTier } : {}),
     effort: request.run.reasoning ?? null,
     ...(request.run.mode ? { collaborationMode: {
       mode: request.run.mode,

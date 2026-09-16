@@ -648,3 +648,5 @@ CLIs and SDK mocks; live tests remain opt-in.
 ## License
 
 MIT
+
+For native speed selection, use `provider: { serviceTier: "fast" }` with Codex (or `"default"` for standard speed), and `provider: { fastMode: true }` with Claude Code. Omit these options to inherit harness settings. Availability and usage charges are enforced by the harness.
