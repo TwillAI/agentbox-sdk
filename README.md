@@ -115,6 +115,72 @@ for await (const event of run) {
 const result = await run.finished;
 ```
 
+Claude Code can leave work running after its turn ends (`run_in_background`
+shells, `Monitor`, background subagents, scheduled wakeups) and re-prompts
+itself when that work finishes. AgentBox reports it through `background.tasks`
+events — `tasks` is the full live set after each change and `waiting` is `true`
+while the harness has ended its turn and the run stays open only for those
+tasks (or, with an empty set, for the wake-up the CLI queues for a task that
+finished mid-turn) — and settles the run on the follow-up turn's result
+instead of the first one. Once background work has been seen, a turn end
+settles the run only after a 15s grace with no new turn, and a final
+`background.tasks` with `tasks: []` and `waiting: false` precedes the settle.
+`backgroundTaskTimeoutMs` bounds the total time spent waiting across the run:
+default 30 minutes, `0` settles at the first turn end as before, `Infinity`
+waits forever. On expiry the tasks are stopped best-effort and the run
+completes with the last turn's text.
+
+Codex has no background mode of its own: its unified exec tool hands control
+back to the model early (`yield_time_ms`) and leaves the process running inside
+the app-server, where nothing wakes the model when it finishes. When a Codex
+turn ends with such a command still running, AgentBox keeps the app-server up
+and reports the command through `background.tasks` (`type: "command"`,
+`description` is the command line). Once every leftover command has finished
+while the model was idle, AgentBox starts a follow-up turn on the same thread
+carrying each command's exit code, duration and the last 4000 characters of
+output, asking the model to verify the outcome and finish without restarting
+the command; that turn is surfaced as a `message.injected` event and the run
+settles on its result (which may in turn leave more commands running). A
+message sent while waiting runs as a normal turn and is checked the same way; a
+command that finishes during a turn is left to the model's own polling and is
+only visible through `tool.call.completed`. A failed follow-up turn fails the
+run like any other turn. When `backgroundTaskTimeoutMs` expires, AgentBox asks
+the app-server to terminate the leftover processes
+(`thread/backgroundTerminals/list` + `terminate`, best effort) and completes
+with the last turn's text; `0` keeps the legacy settle-at-first-turn behaviour.
+Any unified-exec process still running at turn end counts — a dev server or
+watcher the model leaves running on purpose holds the run open until the
+ceiling — so hosts that expect such processes should pass a shorter
+`backgroundTaskTimeoutMs` for Codex. Spawned Codex sub-agents are not tracked:
+the parent must `wait_agent` for them within its turn. A waiting run can still
+be cancelled statelessly: `Agent.attach(...).abort()` interrupts the active turn
+when there is one and otherwise starts a turn only to interrupt it, which the
+originating run observes as an interrupted turn and reports as `run.cancelled`;
+the leftover processes are then terminated.
+
+OpenCode has no background shells, monitors, or wake-ups; its only work that
+outlives a turn is `task {background: true}`, which the server accepts only when
+it runs with `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` (or the
+`OPENCODE_EXPERIMENTAL` umbrella) in its environment. With that flag the parent
+session goes idle while the child session runs and OpenCode itself re-prompts
+the parent with the child's result. AgentBox recognises a background child from
+the parent's `task` tool call (`metadata.background`), so nothing depends on the
+caller's env: while such a child is live at the parent's idle the run stays
+open, the children are reported through `background.tasks` (`type:
+"subagent"`, `description` is the task description / child session title),
+`waiting` flips to `false` when the parent resumes, and the run settles on the
+next parent idle with nothing live — its text is the parent's last assistant
+message, never the injected result. Child liveness comes from SSE frames
+reconciled against `GET /session/status` at each parent idle and while waiting,
+and the injected `<task id=… state=…>` result also counts as the child's
+completion, so a lost frame cannot hold the run open. A child that ends without
+waking the parent settles the run after the 15s grace. `backgroundTaskTimeoutMs`
+bounds the total wait as for Claude Code; on expiry, or when the run fails with
+a child still live, the leftover subagents are stopped best-effort via
+`POST /session/:id/abort`. Aborting the run while waiting cancels the children
+through the same endpoint. Without the flag nothing changes: a parent idle is
+the end of the run.
+
 ## Agents
 
 Three agent providers are supported. Each wraps a CLI that runs inside the sandbox:
@@ -547,7 +613,11 @@ Host Claude runs the Anthropic SDK with the SDK-matched CLI by default.
 `provider.binary` explicitly selects another compatible CLI. Sign-in and session
 storage remain CLI-owned. Managed configuration loads generated skills, commands,
 and subagents as a private local plugin. Native configuration loads user, project,
-and local settings instead. Neither mode copies the CLI's credentials.
+and local settings instead. Neither mode copies the CLI's credentials. When
+`backgroundTaskTimeoutMs` expires, host Claude stops the leftover background
+tasks through the SDK; in a sandbox the daemon lets the CLI wind down on
+disconnect, bounded by `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=30000`, which
+AgentBox sets in the CLI environment unless `env` already defines it.
 
 Each host OpenCode Agent owns an authenticated loopback server on an ephemeral
 port. Managed configuration uses an isolated configuration directory; native

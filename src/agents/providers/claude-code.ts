@@ -17,7 +17,11 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 
-import { createNormalizedEvent, type RawAgentEvent } from "../../events";
+import {
+  createNormalizedEvent,
+  type BackgroundTask,
+  type RawAgentEvent,
+} from "../../events";
 import { sleep } from "../../shared/network";
 import { shellQuote } from "../../shared/shell";
 import {
@@ -59,6 +63,15 @@ import {
   withBearerToken,
 } from "../config/capability-token";
 import { extractClaudeCostData } from "../cost";
+import {
+  BACKGROUND_TASK_GRACE_MS,
+  BackgroundTaskTracker,
+  BackgroundWait,
+  STOP_TASKS_TIMEOUT_MS,
+  applyCliBackgroundWaitCeiling,
+  resolveBackgroundTaskTimeoutMs,
+  withTimeout,
+} from "../background-tasks";
 import { debugClaude, debugRelay, time } from "../../shared/debug";
 import type { Sandbox } from "../../sandboxes";
 
@@ -72,7 +85,14 @@ import type { Sandbox } from "../../sandboxes";
 // capability token on every route except `/__version`. The version bump
 // forces warm (unauthenticated) daemons on existing sandboxes to respawn
 // with the auth-enabled build.
-const DAEMON_PROTOCOL_VERSION = "4";
+//
+// Bumped 4 -> 5: the `/start` stream no longer ends at the first `result`.
+// Every SDKMessage is forwarded until the SDK iterator ends or the client
+// disconnects, so background work that re-prompts the model reaches the
+// host. Against an old daemon the host would silently fall back to
+// settling at the first turn end (background work lost), so warm sandboxes
+// must respawn.
+const DAEMON_PROTOCOL_VERSION = "5";
 const DAEMON_PORT = 43180;
 const DAEMON_PATH = "/tmp/agentbox/claude-code/daemon.mjs";
 const DAEMON_LOG_PATH = "/tmp/agentbox/claude-code/daemon.log";
@@ -424,6 +444,29 @@ async function handleStart(req, res, runId) {
     opts.pathToClaudeCodeExecutable,
   );
 
+  let queryHandle;
+  let clientGone = false;
+  // This run's own teardown. The liveRuns entry is only removed when it is
+  // still ours: hosts reuse a runId across retry attempts, and a successor
+  // registered while our CLI winds down must not be evicted by our exit.
+  const releaseRun = () => {
+    clearInterval(heartbeat);
+    clearPermissions();
+    if (liveRuns.get(runId)?.query === queryHandle) liveRuns.delete(runId);
+    promptStream.end();
+  };
+  // Host gone (settled, cancelled or crashed) → end the prompt so the CLI
+  // winds down instead of living on with its background work. Detected on
+  // the response: \`req\` emits "close" as soon as its body is consumed (Node
+  // >= 16), long before any disconnect, while the response only closes
+  // early when the socket dies before the stream finished.
+  res.on("close", () => {
+    if (res.writableFinished) return;
+    clientGone = true;
+    releaseRun();
+    queryHandle?.interrupt().catch(() => {});
+  });
+
   // Resume-if-exists gate. \`claude --resume <id>\` errors hard with "No
   // conversation found with session ID" when the local session jsonl is
   // missing — most often because a prior post-task snapshot failed and the
@@ -454,7 +497,8 @@ async function handleStart(req, res, runId) {
     }
   }
 
-  let queryHandle;
+  // Nobody left to stream to: do not start a CLI for it.
+  if (clientGone) { res.end(); return; }
   try {
     queryHandle = query({
       prompt: promptStream,
@@ -477,28 +521,19 @@ async function handleStart(req, res, runId) {
 
   liveRuns.set(runId, { query: queryHandle, prompt: promptStream, permissions });
 
-  // Client disconnected (e.g. host process killed) → tear down.
-  req.on("close", () => {
-    clearInterval(heartbeat);
-    clearPermissions();
-    if (!liveRuns.has(runId)) return;
-    liveRuns.delete(runId);
-    promptStream.end();
-    queryHandle.interrupt().catch(() => {});
-  });
-
+  // Forward every SDKMessage, not just up to the first result: in
+  // streaming-input mode the CLI keeps running after a turn ends and
+  // re-prompts the model when background work finishes. The host decides
+  // when the run is over and disconnects (res "close" above), which ends
+  // the prompt and lets the CLI wind down.
   try {
     for await (const message of queryHandle) {
       res.write(JSON.stringify(message) + "\\n");
-      if (message.type === "result") break;
     }
   } catch (e) {
     res.write(JSON.stringify({ _error: String(e?.message ?? e) }) + "\\n");
   } finally {
-    clearInterval(heartbeat);
-    clearPermissions();
-    liveRuns.delete(runId);
-    promptStream.end();
+    releaseRun();
     res.end();
   }
 }
@@ -1006,6 +1041,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       // user inside our images.
       IS_SANDBOX: "1",
     };
+    applyCliBackgroundWaitCeiling(env);
 
     // Custom headers reach Claude Code via ANTHROPIC_CUSTOM_HEADERS
     // (newline-separated `Name: Value` lines). Merge with any value the
@@ -1070,20 +1106,26 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     };
 
     const fetchAbort = new AbortController();
+    const runUrl = `${baseUrl}/runs/${encodeURIComponent(request.runId)}`;
     const cleanup = async () => {
-      // Tell the daemon to interrupt FIRST; the closing request will
-      // also trigger its `req.on('close')` handler as a backstop.
+      // Tell the daemon to interrupt FIRST, then end the run explicitly so
+      // the CLI's input closes and it winds down even when a tunnel keeps
+      // the upstream socket open after we abort the fetch; the daemon's
+      // response "close" handler is the backstop for a dead host.
       try {
-        await fetch(
-          `${baseUrl}/runs/${encodeURIComponent(request.runId)}/abort`,
-          { method: "POST", headers: authHeaders },
-        );
+        await fetch(`${runUrl}/abort`, { method: "POST", headers: authHeaders });
       } catch {
         // ignore — abort is best-effort
       }
+      try {
+        await fetch(runUrl, { method: "DELETE", headers: authHeaders, signal: AbortSignal.timeout(3_000) });
+      } catch {
+        // ignore — the fetch abort below still reaches the daemon
+      }
       fetchAbort.abort();
     };
-    sink.setAbort(cleanup);
+    let cancelled = false;
+    sink.setAbort(async () => { cancelled = true; await cleanup(); });
 
     sink.onMessage(async (content: UserContent) => {
       const parts = await validateProviderUserInput(request.provider, content);
@@ -1150,7 +1192,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         if (!reply.ok) throw new Error(`Claude permission response failed: ${reply.status}`);
       }
     };
-    await consumeClaudeMessages(request, sink, permissionMessages(), executeStartedAt, cleanup);
+    await consumeClaudeMessages(request, sink, permissionMessages(), executeStartedAt, cleanup, () => cancelled);
 
     return async () => undefined;
   }
@@ -1218,6 +1260,16 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
   }
 }
 
+/** Seams for the background-task wait; production uses the defaults. */
+export interface BackgroundWaitOptions {
+  /** Idle grace before settling once the live set empties without a follow-up turn. */
+  graceMs?: number;
+  /** Best-effort stop of the listed task ids when the ceiling expires. */
+  stopTasks?: (ids: string[]) => Promise<void>;
+  /** Bound on `stopTasks`: a CLI that never answers must not hold the run open. */
+  stopTimeoutMs?: number;
+}
+
 async function consumeClaudeMessages(
   request: AgentExecutionRequest<"claude-code">,
   sink: AgentRunSink,
@@ -1225,28 +1277,81 @@ async function consumeClaudeMessages(
   executeStartedAt: number,
   cleanup: () => Promise<void>,
   wasCancelled: () => boolean = () => false,
+  wait: BackgroundWaitOptions = {},
 ): Promise<void> {
     let accumulatedText = "";
     // Thinking chars streamed via thinking_delta for the current main-agent
     // message; used to avoid re-emitting the full thinking block carried by
     // the per-block assistant message.
     let streamedThinkingChars = 0;
-    let pendingMessages = 1;
     let sawResult = false;
     let firstStreamEventLogged = false;
     let firstTextDeltaLogged = false;
     let lastTerminalReason: string | undefined;
     let lastIsError = false;
     const rawPayloads: Array<Record<string, unknown>> = [];
+    const tracker = new BackgroundTaskTracker();
+    const timeoutMs = resolveBackgroundTaskTimeoutMs(request.options.backgroundTaskTimeoutMs);
+    const graceMs = wait.graceMs ?? BACKGROUND_TASK_GRACE_MS;
+    // Set while the run stays open only for background work; dropped as soon
+    // as a follow-up turn starts.
+    let pendingWait: BackgroundWait | undefined;
+    // Time already spent waiting: the ceiling bounds the run, not each wait,
+    // so a model that re-arms a monitor on every wake-up cannot stall forever.
+    let waitedMs = 0;
+    let expiry: "grace" | "ceiling" | "transport" | undefined;
+    let lastTasksKey = JSON.stringify({ tasks: [], waiting: false });
+    const emitTasks = (tasks: BackgroundTask[], waiting: boolean) => {
+      const key = JSON.stringify({ tasks, waiting });
+      if (key === lastTasksKey) return;
+      lastTasksKey = key;
+      sink.emitEvent(createNormalizedEvent("background.tasks", { provider: request.provider, runId: request.runId }, { tasks, waiting }));
+    };
+    const isAborted = () => wasCancelled() ||
+      lastTerminalReason === "aborted_streaming" ||
+      lastTerminalReason === "aborted_tools";
+    const endWait = () => {
+      if (!pendingWait) return;
+      waitedMs += pendingWait.elapsedMs();
+      pendingWait.clear();
+      pendingWait = undefined;
+    };
+    // A transport failure while only background work keeps the run open must
+    // not turn a complete answer into a failed run: settle on that answer.
+    const settleOnFailure = (error: unknown): boolean => {
+      if (!pendingWait || !sawResult || lastIsError) return false;
+      debugClaude("★ transport failed during background wait; settling on the last result: %o", error);
+      expiry = "transport";
+      return true;
+    };
+    const iterator = messages[Symbol.asyncIterator]();
+    type Step = { result: IteratorResult<unknown> } | { reason: "grace" | "ceiling" };
 
     try {
-      for await (const item of messages) {
+      // Manual iteration so a wait timer can race the transport read. A read
+      // left in flight by an expiry unwinds when cleanup() closes the transport.
+      for (let next = iterator.next(); ; next = iterator.next()) {
+        let step: Step;
+        try {
+          step = pendingWait
+            ? await Promise.race([
+                next.then((result) => ({ result })),
+                pendingWait.expired.then((reason) => ({ reason })),
+              ])
+            : { result: await next };
+        } catch (error) {
+          if (!settleOnFailure(error)) throw error;
+          break;
+        }
+        if ("reason" in step) { expiry = step.reason; break; }
+        if (step.result.done) break;
+        const item = step.result.value;
         if (item && typeof item === "object") {
           const ctrl = item as Record<string, unknown>;
           if ("_error" in ctrl) {
-            throw new Error(
-              String((item as { _error: unknown })._error ?? "daemon error"),
-            );
+            const error = new Error(String(ctrl._error ?? "daemon error"));
+            if (!settleOnFailure(error)) throw error;
+            break;
           }
           if ("_notice" in ctrl) {
             // Daemon-side advisories that aren't SDKMessages. Currently:
@@ -1268,6 +1373,12 @@ async function consumeClaudeMessages(
         const message = item as SDKMessage;
         rawPayloads.push(message as unknown as Record<string, unknown>);
         sink.emitRaw(toRawEvent(request.runId, message, message.type));
+        if (tracker.ingest(message) && pendingWait) {
+          debugClaude("★ follow-up turn started; background wait over (%dms since execute start)", Date.now() - executeStartedAt);
+          endWait();
+        }
+        emitTasks(tracker.liveTasks(), pendingWait !== undefined);
+        pendingWait?.setIdle(tracker.liveTasks().length === 0);
 
         if (message.type === "system") {
           // The CLI surfaces several message variants under `type: "system"`:
@@ -1420,18 +1531,47 @@ async function consumeClaudeMessages(
           if (resultText && resultText !== accumulatedText) {
             accumulatedText = resultText;
           }
-          pendingMessages--;
-          if (pendingMessages <= 0) break;
+          const live = tracker.liveTasks();
+          // Nothing ever ran in the background: the turn end is the run end.
+          if (timeoutMs === 0 || !tracker.hasSeenBackgroundWork() || isAborted()) break;
+          // Otherwise stay open for what is still live and for the wake-up
+          // the CLI queues for any task that finished mid-turn: that
+          // follow-up turn starts right after this result with nothing
+          // observable in between, so only the grace passing without a turn
+          // start means the run is over. Fall back to this result then; a
+          // later turn's result supersedes it.
+          debugClaude("★ turn ended with %d background task(s); waiting", live.length);
+          endWait();
+          pendingWait = new BackgroundWait(graceMs, Math.max(0, timeoutMs - waitedMs));
+          pendingWait.setIdle(live.length === 0);
+          emitTasks(live, true);
           continue;
         }
       }
 
+      if (expiry === "ceiling") {
+        // Mirrors the CLI's own "Background tasks still running; terminating":
+        // stop what is left (best effort, bounded — an unanswered stop_task
+        // must not hold the run open) and complete with the last result.
+        const ids = tracker.liveTasks()
+          .filter((task) => task.type !== "scheduled_wakeup")
+          .map((task) => task.id);
+        debugClaude("★ background wait ceiling (%dms) hit; stopping %d task(s)", timeoutMs, ids.length);
+        if (wait.stopTasks) {
+          await withTimeout(wait.stopTasks(ids), wait.stopTimeoutMs ?? STOP_TASKS_TIMEOUT_MS).catch(() => undefined);
+        }
+      } else if (expiry === "grace") {
+        debugClaude("★ background set emptied with no follow-up turn; settling");
+      }
+      if (pendingWait) {
+        // However the wait ended, nothing is pending once the run settles.
+        endWait();
+        emitTasks([], false);
+      }
       await cleanup();
       if (!sawResult && !wasCancelled()) throw new Error("Claude Code closed before reporting a result");
       const finalText = accumulatedText;
-      const isCancelled = wasCancelled() ||
-        lastTerminalReason === "aborted_streaming" ||
-        lastTerminalReason === "aborted_tools";
+      const isCancelled = isAborted();
       // is_error is the authoritative error signal — it covers both
       // explicit error subtypes and cases where subtype=success but
       // the run failed (e.g. auth errors after retries exhausted).
@@ -1479,6 +1619,7 @@ async function consumeClaudeMessages(
         });
       }
     } finally {
+      pendingWait?.clear();
       await cleanup();
     }
 
@@ -1489,6 +1630,7 @@ async function consumeClaudeMessages(
 export async function executeNativeClaude(
   request: AgentExecutionRequest<"claude-code">,
   sink: AgentRunSink,
+  wait: Pick<BackgroundWaitOptions, "graceMs" | "stopTimeoutMs"> = {},
 ): Promise<() => Promise<void>> {
   const { query } = await import("@anthropic-ai/claude-agent-sdk");
   const claudeDir = claudeConfigDir(request.options);
@@ -1511,6 +1653,7 @@ export async function executeNativeClaude(
   const messageId = randomUUID();
   prompt.push({ type: "user", uuid: messageId, message: { role: "user", content: mapToClaudeUserContent(input) as SDKUserMessage["message"]["content"] }, parent_tool_use_id: null });
   const hostEnv = Object.fromEntries(Object.entries({ ...process.env, ...request.options.env }).filter((entry): entry is [string, string] => entry[1] !== undefined));
+  applyCliBackgroundWaitCeiling(hostEnv);
   if (request.options.customHeaders) {
     const headers = Object.entries(request.options.customHeaders).map(([name, value]) => `${name}: ${value}`).join("\n");
     hostEnv.ANTHROPIC_CUSTOM_HEADERS = [hostEnv.ANTHROPIC_CUSTOM_HEADERS, headers].filter(Boolean).join("\n");
@@ -1578,10 +1721,15 @@ export async function executeNativeClaude(
         }
       },
     } });
-    sink.setRaw({ query: handle, claudeDir, runId: request.runId });
+    const live = handle;
+    sink.setRaw({ query: live, claudeDir, runId: request.runId });
     sink.emitEvent(createNormalizedEvent("run.started", { provider: request.provider, runId: request.runId }));
     sink.emitEvent(createNormalizedEvent("message.started", { provider: request.provider, runId: request.runId }, { messageId }));
-    await consumeClaudeMessages(request, sink, handle, Date.now(), stop, () => cancelled);
+    await consumeClaudeMessages(request, sink, live, Date.now(), stop, () => cancelled, {
+      ...wait,
+      // Native owns the CLI: ask it to stop leftover tasks before closing it.
+      stopTasks: async (ids) => { await Promise.all(ids.map((id) => live.stopTask(id).catch(() => undefined))); },
+    });
   } catch (error) {
     await stop();
     if (cancelled) sink.cancel();

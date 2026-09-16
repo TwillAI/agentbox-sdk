@@ -163,6 +163,18 @@ export interface AgentOptionsBase {
    * in particular are subject to upstream support.
    */
   customHeaders?: Record<string, string>;
+  /**
+   * Max time a run may spend waiting, after turn ends, for background work
+   * (background shells, monitors, background subagents, scheduled wakeups)
+   * that will wake the model again. Counted across the whole run — time
+   * spent in follow-up turns does not count — so re-arming a monitor on
+   * every wake-up cannot extend it. Default 30 minutes. `0` restores the
+   * legacy behaviour (settle at the first turn end and abandon background
+   * work); `Infinity` waits forever. On expiry the tasks are stopped
+   * best-effort and the run completes with the last turn's text. Progress
+   * is reported through `background.tasks` events.
+   */
+  backgroundTaskTimeoutMs?: number;
   approvalMode?: AgentApprovalMode;
   /** Route questions and plan approvals to the caller even with automatic tool approval. */
   interactiveQuestions?: boolean;

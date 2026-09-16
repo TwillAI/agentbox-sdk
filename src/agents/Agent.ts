@@ -32,6 +32,7 @@ import {
 } from "./types";
 import { normalizeUserInput } from "./input";
 import { validateUserAnswers } from "./questions";
+import { resolveBackgroundTaskTimeoutMs } from "./background-tasks";
 import type { Sandbox } from "../sandboxes";
 
 function buildAgentOptionsSystemAppendix(
@@ -129,6 +130,9 @@ function prepareAgentOptions<P extends AgentProviderName>(
     if (!path.isAbsolute(options.stateDirectory)) throw new Error("stateDirectory must be an absolute path.");
   }
   if (options.sandbox && options.processGroup !== undefined) throw new Error("processGroup is only supported for host execution.");
+  // Fail here, before any transport is dialed: a provider that rejected it
+  // mid-run would leave a sandbox CLI executing the prompt with no reader.
+  resolveBackgroundTaskTimeoutMs(options.backgroundTaskTimeoutMs);
   if (options.configuration === "native") {
     if (options.sandbox) throw new Error("Native configuration is only supported for host execution.");
     if (options.mcps?.length || options.skills?.length || options.subAgents?.length || options.commands?.length || options.enableRtk) {

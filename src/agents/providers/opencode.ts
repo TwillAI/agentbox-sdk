@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   createNormalizedEvent,
   normalizeRawAgentEvent,
+  type BackgroundTask,
   type PermissionRequestedEvent,
   type RawAgentEvent,
 } from "../../events";
@@ -19,6 +20,12 @@ import {
   type UserContent,
 } from "../types";
 import { isInteractiveApproval, hasInteractiveQuestions } from "../approval";
+import {
+  BACKGROUND_TASK_GRACE_MS,
+  BackgroundWait,
+  resolveBackgroundTaskTimeoutMs,
+  withTimeout,
+} from "../background-tasks";
 import { normalizeUserQuestions, questionReply } from "../questions";
 import {
   mapToOpenCodeParts,
@@ -253,6 +260,15 @@ function toRawEvent(
     timestamp: new Date().toISOString(),
     payload,
   };
+}
+
+/**
+ * Child session named by the `<task id=… state=completed|error>` result that
+ * opencode injects into the parent (TaskTool.renderOutput) once a background
+ * subagent ends: that child is done, whatever frames of its own were lost.
+ */
+function injectedTaskResultChild(text: string): string | undefined {
+  return /<task id="?([^"\s>]+)"? state="?(?:completed|error)"?>/.exec(text)?.[1];
 }
 
 function toOpenCodeModel(
@@ -1098,38 +1114,199 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
     // there is no long-polling fetch to cancel — the abort propagates
     // server-side and we observe it via `session.error{MessageAborted}`
     // on the SSE stream.
+    // Bounded, best-effort `POST /session/:id/abort`. Also used when the
+    // background wait ceiling expires: opencode's abort cancels the session's
+    // background jobs even while the session itself is idle.
+    const postAbort = async (id: string): Promise<void> => {
+      try {
+        await Promise.race([
+          fetchJson<boolean>(`${runtime.baseUrl}/session/${id}/abort`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              ...runtime.previewHeaders,
+            },
+          }),
+          new Promise((_, reject) =>
+            setTimeout(
+              () =>
+                reject(new Error("opencode POST /session/abort timed out")),
+              3_000,
+            ),
+          ),
+        ]);
+      } catch {
+        // Best-effort.
+      }
+    };
     let userAbortRequested = false;
     sink.setAbort(async () => {
       userAbortRequested = true;
       const sessionIdAtAbort = capturedSessionId;
-      if (sessionIdAtAbort) {
-        try {
-          await Promise.race([
-            fetchJson<boolean>(
-              `${runtime.baseUrl}/session/${sessionIdAtAbort}/abort`,
-              {
-                method: "POST",
-                headers: {
-                  "content-type": "application/json",
-                  ...runtime.previewHeaders,
-                },
-              },
-            ),
-            new Promise((_, reject) =>
-              setTimeout(
-                () =>
-                  reject(new Error("opencode POST /session/abort timed out")),
-                3_000,
-              ),
-            ),
-          ]);
-        } catch {
-          // Best-effort.
-        }
-      }
+      if (sessionIdAtAbort) await postAbort(sessionIdAtAbort);
       // Bail the wait loop in case the SSE-side cancel signal is slow.
       resolveSessionTerminal();
     });
+
+    // Background subagents: when the server runs with
+    // OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS, the parent session goes idle
+    // while a `task {background: true}` child runs, and opencode itself
+    // re-prompts the parent with the child's result
+    // (TaskTool.injectBackgroundResult), so the parent's first idle is not the
+    // end of the run. The parent's `task` tool part says whether the server
+    // accepted a background child (metadata.background); nothing depends on
+    // the caller's env, since the shared server keeps the flags it booted with.
+    const backgroundTimeoutMs = resolveBackgroundTaskTimeoutMs(
+      request.options.backgroundTaskTimeoutMs,
+    );
+    const trackChildren = backgroundTimeoutMs !== 0;
+    // Direct children of the run's session. A child counts as live from
+    // registration until its status idles; foreground `task` children idle
+    // before the parent does, so they never hold the run open.
+    const children = new Map<
+      string,
+      { id: string; title: string; live: boolean; background: boolean }
+    >();
+    const liveChildren = (): BackgroundTask[] =>
+      [...children.values()]
+        .filter((child) => child.live)
+        .map((child) => ({
+          id: child.id,
+          type: "subagent",
+          description: child.title,
+        }));
+    // Waiting only pays once the server has accepted a background child: it
+    // will re-prompt the parent with the result. A foreground child still
+    // live at a parent idle is a lost frame, which reconcileChildren() clears.
+    const shouldWait = () =>
+      [...children.values()].some((child) => child.background) &&
+      liveChildren().length > 0;
+    // Set while the run stays open only for background children; dropped as
+    // soon as the parent goes busy again.
+    let pendingWait: BackgroundWait | undefined;
+    // Time already spent waiting: the ceiling bounds the run, not each wait.
+    let waitedMs = 0;
+    let expiry: "grace" | "ceiling" | "transport" | undefined;
+    let sawParentIdle = false;
+    let lastTasksKey = JSON.stringify({ tasks: [], waiting: false });
+    const emitTasks = (tasks: BackgroundTask[], waiting: boolean) => {
+      const key = JSON.stringify({ tasks, waiting });
+      if (key === lastTasksKey) return;
+      lastTasksKey = key;
+      sink.emitEvent(
+        createNormalizedEvent(
+          "background.tasks",
+          { provider: request.provider, runId: request.runId },
+          { tasks, waiting },
+        ),
+      );
+    };
+    const endWait = () => {
+      if (!pendingWait) return;
+      waitedMs += pendingWait.elapsedMs();
+      pendingWait.clear();
+      pendingWait = undefined;
+    };
+    const onChildrenChanged = () => {
+      if (!pendingWait) return;
+      const live = liveChildren();
+      emitTasks(live, true);
+      // Nothing live: opencode's injection is immediate, so the grace only
+      // covers a child that ended without waking the parent.
+      pendingWait.setIdle(live.length === 0);
+    };
+    const registerChild = (
+      id: string,
+      title: string | undefined,
+      background = false,
+    ) => {
+      const known = children.get(id);
+      if (known) {
+        known.background ||= background;
+        if (title && title !== known.title) {
+          known.title = title;
+          onChildrenChanged();
+        }
+        return;
+      }
+      children.set(id, { id, title: title ?? "", live: true, background });
+      onChildrenChanged();
+    };
+    const setChildLive = (id: string, live: boolean) => {
+      const child = children.get(id);
+      if (!child || child.live === live) return;
+      child.live = live;
+      onChildrenChanged();
+    };
+    // Liveness is edge-triggered from SSE frames, and edges get lost: a
+    // reconnect gap (opencode's frames carry no id to replay from) or a child
+    // whose runner never started. The server's status map lists only non-idle
+    // sessions, so an absent child is done. Bounded and best effort: on
+    // failure the edges stand.
+    const reconcileChildren = async () => {
+      const live = [...children.values()].filter((child) => child.live);
+      if (live.length === 0) return;
+      const statuses = await withTimeout(
+        fetchJson<Record<string, { type?: string } | undefined>>(
+          `${runtime.baseUrl}/session/status`,
+          { headers: runtime.previewHeaders },
+        ).catch(() => undefined),
+        3_000,
+      );
+      if (!statuses || typeof statuses !== "object") return;
+      for (const child of live) {
+        const status = statuses[child.id];
+        if (!status || status.type === "idle") setChildLive(child.id, false);
+      }
+    };
+    const onParentIdle = async () => {
+      sawParentIdle = true;
+      // `session.idle` and `session.status{idle}` both fire for one idle:
+      // keep the wait already running rather than re-arming it.
+      if (pendingWait || sessionIdleFromSse) return;
+      const tracking = trackChildren && !userAbortRequested;
+      if (tracking && shouldWait()) await reconcileChildren();
+      if (!tracking || !shouldWait()) {
+        sessionIdleFromSse = true;
+        resolveSessionTerminal();
+        return;
+      }
+      const live = liveChildren();
+      debugOpencode(
+        "★ parent idle with %d live subagent(s); waiting",
+        live.length,
+      );
+      const wait = new BackgroundWait(
+        BACKGROUND_TASK_GRACE_MS,
+        Math.max(0, backgroundTimeoutMs - waitedMs),
+      );
+      pendingWait = wait;
+      void wait.expired.then((reason) => {
+        // A wait the parent has since resumed from must never settle the run.
+        if (pendingWait !== wait) return;
+        expiry = reason;
+        resolveSessionTerminal();
+      });
+      emitTasks(live, true);
+    };
+    // opencode re-ran the parent (the child's result was injected): the run
+    // is a normal turn again until the next idle.
+    const onParentBusy = () => {
+      if (!pendingWait) return;
+      debugOpencode(
+        "★ parent resumed after %dms of background wait",
+        pendingWait.elapsedMs(),
+      );
+      endWait();
+      emitTasks(liveChildren(), false);
+    };
+    // The injected result is the child's end and the parent's wake-up in
+    // one: opencode prompts the parent with it right away.
+    const onInjectedResult = (childId: string) => {
+      if (!children.has(childId)) return;
+      setChildLive(childId, false);
+      onParentBusy();
+    };
 
     try {
       const interactiveApproval = !request.options.fullAccess && isInteractiveApproval(request.options);
@@ -1299,6 +1476,12 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                 runSessionIds.has(info.parentID)
               ) {
                 runSessionIds.add(info.id);
+                if (trackChildren && info.parentID === sessionId) {
+                  registerChild(
+                    info.id,
+                    typeof info.title === "string" ? info.title : undefined,
+                  );
+                }
               }
             }
 
@@ -1474,15 +1657,17 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                           : "OpenCode session error";
                     sessionErrorFromSse = new Error(errMsg);
                   }
+                  resolveSessionTerminal();
                 } else {
-                  sessionIdleFromSse = true;
+                  await onParentIdle();
                 }
                 debugOpencode(
                   "★ %s for session=%s",
                   payloadRecord.type,
                   sessionId,
                 );
-                resolveSessionTerminal();
+              } else if (trackChildren && payloadRecord.type === "session.idle") {
+                setChildLive(eventSessionId, false);
               }
             }
             // Modern terminal signal: `session.status` with type idle.
@@ -1499,16 +1684,18 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                 typeof properties?.sessionID === "string"
                   ? properties.sessionID
                   : undefined;
-              if (
-                (!eventSessionId || eventSessionId === sessionId) &&
-                status?.type === "idle"
-              ) {
-                sessionIdleFromSse = true;
-                debugOpencode(
-                  "★ session.status{idle} for session=%s",
-                  sessionId,
-                );
-                resolveSessionTerminal();
+              if (!eventSessionId || eventSessionId === sessionId) {
+                if (status?.type === "idle") {
+                  debugOpencode(
+                    "★ session.status{idle} for session=%s",
+                    sessionId,
+                  );
+                  await onParentIdle();
+                } else if (status?.type === "busy" || status?.type === "retry") {
+                  onParentBusy();
+                }
+              } else if (trackChildren) {
+                setChildLive(eventSessionId, status?.type !== "idle");
               }
             }
 
@@ -1535,6 +1722,40 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                 typeof part.type === "string"
               ) {
                 partTypeById.set(part.id, part.type);
+              }
+              // The parent's `task {background: true}` call names the child
+              // session in its tool metadata; register it in case the
+              // child's own `session.created` frame was missed.
+              if (
+                trackChildren &&
+                part?.type === "tool" &&
+                part.tool === "task" &&
+                part.sessionID === sessionId
+              ) {
+                const state = part.state as Record<string, unknown> | undefined;
+                const metadata = state?.metadata as
+                  | Record<string, unknown>
+                  | undefined;
+                const childId = metadata?.sessionId ?? metadata?.jobId;
+                if (metadata?.background === true && typeof childId === "string") {
+                  registerChild(
+                    childId,
+                    typeof state?.title === "string" ? state.title : undefined,
+                    true,
+                  );
+                }
+              }
+              // A background child's result reaches the parent as a synthetic
+              // user text part.
+              if (
+                trackChildren &&
+                part?.type === "text" &&
+                part.synthetic === true &&
+                part.sessionID === sessionId &&
+                typeof part.text === "string"
+              ) {
+                const childId = injectedTaskResultChild(part.text);
+                if (childId) onInjectedResult(childId);
               }
             }
 
@@ -1566,6 +1787,15 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
                   eventMessageId !== undefined &&
                   foreignMessageIds.has(eventMessageId));
               if (isForeignSession) {
+                continue;
+              }
+              // User parts never stream deltas, but a background subagent's
+              // result reaches the parent as a synthetic user message: nothing
+              // attributed to a user message may become the run text.
+              if (
+                eventMessageId !== undefined &&
+                announcedUserMessageIds.has(eventMessageId)
+              ) {
                 continue;
               }
               const delta =
@@ -1786,14 +2016,29 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
         !sessionErrorFromSse &&
         !sessionAbortedFromSse &&
         !userAbortRequested &&
-        !dispatchError
+        !dispatchError &&
+        !expiry
       ) {
         const silence = Date.now() - lastSseActivityAt;
         if (silence > SSE_SILENCE_THRESHOLD_MS) {
+          // opencode heartbeats every 10s, so this is a dead server, not a
+          // quiet subagent. While only background work keeps the run open,
+          // settle on the answer the parent already gave instead of failing.
+          if (pendingWait && sawParentIdle) {
+            debugOpencode(
+              "SSE went silent (%dms) during background wait; settling",
+              silence,
+            );
+            expiry = "transport";
+            break;
+          }
           sseSilent = true;
           debugOpencode("SSE went silent (%dms) — giving up", silence);
           break;
         }
+        // A child's end this listener never saw must not hold the run open
+        // until the ceiling.
+        if (pendingWait && liveChildren().length > 0) await reconcileChildren();
         await Promise.race([
           sessionTerminal,
           new Promise<void>((resolve) =>
@@ -1804,6 +2049,25 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
 
       sseAbort.abort();
       await sseTask;
+
+      // Nothing listens to this session once the run settles, so a child
+      // finishing later would only start an unobserved parent turn: stop what
+      // is left (best effort). The abort handler already did on cancel.
+      if (
+        expiry === "ceiling" ||
+        ((sessionErrorFromSse || dispatchError) && liveChildren().length > 0)
+      ) {
+        debugOpencode(
+          "★ run over (%s) with %d subagent(s) live; aborting them",
+          expiry ?? "failure",
+          liveChildren().length,
+        );
+        await postAbort(sessionId);
+      }
+      // However the run ended, nothing is pending once it settles (a no-op
+      // unless a background set was reported).
+      endWait();
+      emitTasks([], false);
 
       if (userAbortRequested || sessionAbortedFromSse) {
         debugOpencode(
@@ -1818,7 +2082,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
         sink.fail(sessionErrorFromSse);
       } else if (dispatchError) {
         sink.fail(dispatchError);
-      } else if (sessionIdleFromSse) {
+      } else if (sessionIdleFromSse || expiry) {
         debugOpencode(
           "★ run.completed (%dms since execute start) chars=%d",
           Date.now() - executeStartedAt,
@@ -1869,6 +2133,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
         sink.fail(new Error("opencode run ended without a terminal signal"));
       }
     } finally {
+      endWait();
       sseAbort.abort();
       if (sseTask) {
         await sseTask.catch(() => undefined);

@@ -3,6 +3,7 @@ import path from "node:path";
 
 import {
   createNormalizedEvent,
+  type BackgroundTask,
   type NormalizedAgentEvent,
   type PermissionRequestedEvent,
   type RawAgentEvent,
@@ -53,6 +54,13 @@ import { shellQuote } from "../../shared/shell";
 import { sleep } from "../../shared/network";
 import { extractCodexCostData } from "../cost";
 import { debugCodex, time } from "../../shared/debug";
+import {
+  BACKGROUND_TASK_GRACE_MS,
+  BackgroundWait,
+  resolveBackgroundTaskTimeoutMs,
+  STOP_TASKS_TIMEOUT_MS,
+  withTimeout,
+} from "../background-tasks";
 
 type CodexNotification = {
   id?: number;
@@ -333,6 +341,75 @@ export function buildCodexTurnStartParams(params: {
     } } : {}),
     outputSchema: null,
   };
+}
+
+/** A `commandExecution` item on the root thread that has not completed. */
+type CodexCommandItem = {
+  id: string;
+  command: string;
+  processId?: string;
+  /** Still running when a turn ended: background work from then on. */
+  outlived: boolean;
+};
+
+type CodexFinishedCommand = CodexCommandItem & {
+  aggregatedOutput?: string;
+  exitCode?: number;
+  durationMs?: number;
+};
+
+const BACKGROUND_OUTPUT_TAIL_CHARS = 4000;
+
+/**
+ * The user turn that wakes Codex once a command it left running finished
+ * after its turn ended. Codex has no wake-up of its own for this: unified
+ * exec returns early on `yield_time_ms`, the process keeps running in the
+ * app-server, and `item/completed` lands later against the old turn.
+ */
+function buildCodexBackgroundFollowUp(items: CodexFinishedCommand[]): string {
+  const reports = items.map((item) => {
+    const tail = (item.aggregatedOutput ?? "")
+      .slice(-BACKGROUND_OUTPUT_TAIL_CHARS)
+      .trimEnd();
+    const duration =
+      item.durationMs === undefined
+        ? "an unknown time"
+        : `${Math.round(item.durationMs / 1000)}s`;
+    return `\`${item.command}\` exited with code ${item.exitCode ?? "unknown"} after ${duration}.\nOutput (last ${BACKGROUND_OUTPUT_TAIL_CHARS} chars):\n\`\`\`\n${tail || "(no output)"}\n\`\`\`\n`;
+  });
+  return `Background command finished while you were idle.\n\n${reports.join("")}\nContinue from here: verify the outcome and finish the task. Do not restart the command.`;
+}
+
+/**
+ * User text of the turn `attachAbort` starts only to interrupt it. A thread
+ * parked in a background wait has no active turn, so `turn/interrupt` alone
+ * is rejected and reaches nobody; an interrupted turn is the one signal the
+ * originating run already treats as a cancel.
+ */
+const CODEX_CANCEL_TURN_TEXT = "Run cancelled by the host.";
+
+/**
+ * Best-effort, bounded stop of every unified-exec process the app-server
+ * still holds for the thread. Listing first also covers commands tracked
+ * without a processId (an approval-flow `item/started` carries none). Any
+ * error ends the pass: an app-server without the experimental API answers
+ * with -32600 (invalid request), never -32601.
+ */
+async function terminateBackgroundTerminals(client: CodexRpcClient, threadId: string): Promise<void> {
+  await withTimeout((async () => {
+    try {
+      const listed = await client.request<{ data?: Array<{ processId?: unknown }> }>(
+        "thread/backgroundTerminals/list",
+        { threadId },
+      );
+      for (const terminal of listed?.data ?? []) {
+        if (typeof terminal?.processId !== "string") continue;
+        await client.request("thread/backgroundTerminals/terminate", { threadId, processId: terminal.processId });
+      }
+    } catch (error) {
+      debugCodex("background terminal termination stopped early: %o", error);
+    }
+  })(), STOP_TASKS_TIMEOUT_MS);
 }
 
 function toRawEvent(
@@ -1568,15 +1645,135 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       typeof params?.threadId === "string" && typeof params.turnId === "string" && typeof itemId === "string"
         ? `${params.threadId}:${params.turnId}:${itemId}` : undefined;
     let streamedText = "";
+    const timeoutMs = resolveBackgroundTaskTimeoutMs(request.options.backgroundTaskTimeoutMs);
+    const isRootThread = (params: Record<string, unknown> | undefined) =>
+      !params?.threadId || params.threadId === rootThreadId;
+    // Commands still running on the root thread. Unified exec hands control
+    // back to the model early (`yield_time_ms`) and parks the process in the
+    // app-server: nothing wakes the model when it finishes, and cleanup()
+    // would kill it along with the server.
+    const inFlight = new Map<string, CodexCommandItem>();
+    // Outlived commands that finished while the thread was idle. The model
+    // never saw their result; the synthetic follow-up turn reports them. One
+    // that finishes during a turn is left to the model's own polling.
+    const finished: CodexFinishedCommand[] = [];
+    // Set while the run stays open only for background work; dropped as soon
+    // as a follow-up turn starts.
+    let pendingWait: BackgroundWait | undefined;
+    // Time already spent waiting: the ceiling bounds the run, not each wait.
+    let waitedMs = 0;
+    let followUpSent = false;
+    // Last agentMessage of the current turn; a follow-up turn's supersedes it.
+    let turnMessageText = "";
+    let lastTurn: { text: string; messageText: string } | undefined;
+    let lastTasksKey = JSON.stringify({ tasks: [], waiting: false });
+    const liveTasks = (): BackgroundTask[] =>
+      [...inFlight.values()]
+        .filter((item) => item.outlived)
+        .map((item) => ({ id: item.id, type: "command", description: item.command }));
+    const emitTasks = (tasks: BackgroundTask[], waiting: boolean) => {
+      const key = JSON.stringify({ tasks, waiting });
+      if (key === lastTasksKey) return;
+      lastTasksKey = key;
+      sink.emitEvent(createNormalizedEvent("background.tasks", { provider: request.provider, runId: request.runId }, { tasks, waiting }));
+    };
+    const endWait = () => {
+      if (!pendingWait) return;
+      waitedMs += pendingWait.elapsedMs();
+      pendingWait.clear();
+      pendingWait = undefined;
+      followUpSent = false;
+    };
+    // Wake the model with what finished while it was idle. The thread is idle,
+    // so this `turn/start` runs a real turn, and its `turn/completed` goes
+    // through the in-flight check again. `pendingTurns` stays untouched: it
+    // only ever counts the run's initial turn (see sendTurn).
+    const sendBackgroundFollowUp = async () => {
+      if (!rootThreadId || !pendingWait || followUpSent || finished.length === 0 || abortInvoked) return;
+      // Budget spent: let the ceiling settle the run rather than start a
+      // turn it would abandon mid-flight.
+      if (timeoutMs - waitedMs - pendingWait.elapsedMs() <= 0) return;
+      followUpSent = true;
+      const text = buildCodexBackgroundFollowUp(finished.splice(0));
+      try {
+        const response = await client.request<{ turn?: { id?: string } }>(
+          "turn/start",
+          buildCodexTurnStartParams({
+            threadId: rootThreadId,
+            inputItems: [{ type: "text", text, text_elements: [] }],
+            request,
+          }),
+        );
+        // The turn runs on the app-server from here on: a ceiling firing
+        // during the round trip must not settle over it.
+        endWait();
+        sink.emitEvent(createNormalizedEvent("message.injected", { provider: request.provider, runId: request.runId }, {
+          content: text,
+          ...(typeof response?.turn?.id === "string" ? { messageId: response.turn.id } : {}),
+        }));
+      } catch (error) {
+        // Nothing will wake the model now; the armed grace settles the run.
+        debugCodex("background follow-up turn/start failed: %o", error);
+      }
+    };
     const completion = new Promise<{
       text?: string;
       turnId?: string;
       threadId?: string;
       interrupted?: boolean;
     }>((resolve, reject) => {
+      // Ends a wait with the last completed turn as the run's answer. That
+      // turn's `run.completed` was withheld when the wait began: emit it now.
+      const settle = () => {
+        endWait();
+        emitTasks([], false);
+        sink.emitEvent(createNormalizedEvent("run.completed", { provider: request.provider, runId: request.runId }, { text: lastTurn?.messageText || undefined }));
+        resolve({ text: lastTurn?.text ?? streamedText, turnId, threadId: rootThreadId, interrupted: false });
+      };
+      // A transport failure while only background work keeps the run open
+      // must not turn a complete answer into a failed run.
+      const settleOnFailure = (error: unknown): boolean => {
+        if (!pendingWait || !lastTurn || abortInvoked) return false;
+        debugCodex("★ transport failed during background wait; settling on the last turn: %o", error);
+        settle();
+        return true;
+      };
       void (async () => {
         let firstClientMessageLogged = false;
-        for await (const message of client.messages()) {
+        const iterator = client.messages()[Symbol.asyncIterator]();
+        type Step = { result: IteratorResult<CodexNotification> } | { reason: "grace" | "ceiling" };
+        // Manual iteration so a wait timer can race the transport read. A read
+        // left pending by an expiry unwinds when cleanup() closes the transport.
+        for (let next = iterator.next(); ; next = iterator.next()) {
+          let step: Step;
+          try {
+            step = pendingWait
+              ? await Promise.race([
+                  next.then((result) => ({ result })),
+                  pendingWait.expired.then((reason) => ({ reason })),
+                ])
+              : { result: await next };
+          } catch (error) {
+            if (settleOnFailure(error)) return;
+            throw error;
+          }
+          if ("reason" in step) {
+            if (!abortInvoked) {
+              debugCodex("★ background wait over (%s) with %d command(s) in flight", step.reason, inFlight.size);
+              // Mirrors the CLI's own "still running; terminating". cleanup()
+              // kills the app-server, and with it the processes, regardless.
+              if (step.reason === "ceiling" && rootThreadId) await terminateBackgroundTerminals(client, rootThreadId);
+              settle();
+              return;
+            }
+            // The abort handler is closing the transport, which ends the
+            // pending read (a failure there rejects into the cancel). A run
+            // the host is cancelling never settles.
+            endWait();
+            step = { result: await next };
+          }
+          if (step.result.done) break;
+          const message = step.result.value;
           if (!firstClientMessageLogged) {
             firstClientMessageLogged = true;
             debugCodex(
@@ -1664,10 +1861,23 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
               sink.emitEvent(createNormalizedEvent("plan.completed", { provider: request.provider, runId: request.runId }, { text: item.text }));
             }
           }
+          const turn = message.params?.turn as Record<string, unknown> | undefined;
+          const rootTurnCompleted = message.method === "turn/completed" && isRootThread(message.params);
+          // A turn end is the run end unless a command outlived it (or one
+          // finished during the turn unreported): the app-server must then
+          // stay up, since cleanup() would kill the process with it.
+          // `pendingTurns <= 1`: this is the turn/completed that settles.
+          const waitAfterTurn = rootTurnCompleted && pendingTurns <= 1 && timeoutMs !== 0 && !abortInvoked &&
+            turn?.status === "completed" && (inFlight.size > 0 || finished.length > 0);
           for (const event of toNormalizedCodexEvents(request.runId, message)) {
+            // The run is not over while it waits on background work, and an
+            // interrupted turn ends in run.cancelled, not run.completed.
+            if (event.type === "run.completed" && (waitAfterTurn || turn?.status === "interrupted")) continue;
             sink.emitEvent(event);
             if (event.type === "text.delta") {
               streamedText += event.delta;
+            } else if (event.type === "message.completed" && event.text) {
+              turnMessageText = event.text;
             }
           }
 
@@ -1678,38 +1888,81 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
           }
 
           if (message.method === "turn/started") {
-            turnId =
-              ((message.params?.turn as Record<string, unknown> | undefined)
-                ?.id as string | undefined) ?? turnId;
+            turnId = (turn?.id as string | undefined) ?? turnId;
+            if (isRootThread(message.params)) {
+              // A new turn's text supersedes the previous turn's.
+              streamedText = "";
+              turnMessageText = "";
+              if (pendingWait) debugCodex("★ follow-up turn started; background wait over");
+              // Also when sendBackgroundFollowUp already ended the wait: this
+              // is where the host learns the model is working again.
+              endWait();
+              emitTasks(liveTasks(), false);
+            }
           }
 
-          if (
-            message.method === "turn/completed" &&
-            (!message.params?.threadId ||
-              message.params.threadId === rootThreadId)
-          ) {
+          if (item?.type === "commandExecution" && typeof item.id === "string" && isRootThread(message.params)) {
+            if (message.method === "item/started") {
+              inFlight.set(item.id, {
+                id: item.id,
+                command: String(item.command ?? ""),
+                processId: typeof item.processId === "string" ? item.processId : undefined,
+                outlived: false,
+              });
+            } else if (message.method === "item/completed") {
+              const tracked = inFlight.get(item.id);
+              inFlight.delete(item.id);
+              // Reported only when it ended while the thread was idle: during
+              // a turn the model can (and does) read it with write_stdin.
+              if (tracked?.outlived && pendingWait) {
+                finished.push({
+                  ...tracked,
+                  aggregatedOutput: typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : undefined,
+                  exitCode: typeof item.exitCode === "number" ? item.exitCode : undefined,
+                  durationMs: typeof item.durationMs === "number" ? item.durationMs : undefined,
+                });
+              }
+              emitTasks(liveTasks(), pendingWait !== undefined);
+              pendingWait?.setIdle(inFlight.size === 0);
+              if (pendingWait && inFlight.size === 0) await sendBackgroundFollowUp();
+            }
+          }
+
+          if (rootTurnCompleted) {
             pendingTurns--;
             if (pendingTurns <= 0) {
-              const turn = message.params?.turn as
-                | Record<string, unknown>
-                | undefined;
-              const interrupted = turn?.status === "interrupted";
-              resolve({
-                text: streamedText,
-                turnId,
-                threadId: rootThreadId,
-                interrupted,
-              });
-              return;
+              // An interrupted turn that produced nothing (the cancel marker
+              // attachAbort starts) leaves the previous turn as the answer.
+              const previousText = lastTurn?.text;
+              lastTurn = { text: streamedText, messageText: turnMessageText };
+              if (!waitAfterTurn) {
+                resolve({
+                  text: streamedText || previousText,
+                  turnId,
+                  threadId: rootThreadId,
+                  interrupted: turn?.status === "interrupted",
+                });
+                return;
+              }
+              for (const tracked of inFlight.values()) tracked.outlived = true;
+              debugCodex("★ turn ended with %d command(s) in flight; waiting", inFlight.size);
+              endWait();
+              pendingWait = new BackgroundWait(BACKGROUND_TASK_GRACE_MS, Math.max(0, timeoutMs - waitedMs));
+              pendingWait.setIdle(inFlight.size === 0);
+              emitTasks(liveTasks(), true);
+              if (inFlight.size === 0) await sendBackgroundFollowUp();
             }
           }
 
           if (message.method === "error" && !shouldIgnoreCodexError(message)) {
+            // Normalized as run.error above: an app-server error fails the
+            // run, waiting or not.
             reject(message);
             return;
           }
         }
 
+        if (settleOnFailure(new Error("Codex transport closed."))) return;
         reject(new Error("Codex transport closed before run completed."));
       })().catch(reject);
     });
@@ -1793,6 +2046,10 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
         completionError = err;
       }
 
+      // However the run ended, nothing is pending once it settles (a no-op
+      // unless a background set was reported).
+      endWait();
+      emitTasks([], false);
       if (completionError !== undefined) {
         if (abortInvoked) {
           debugCodex(
@@ -1800,7 +2057,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
             Date.now() - executeStartedAt,
           );
           sink.cancel({
-            text: streamedText || undefined,
+            text: streamedText || lastTurn?.text || undefined,
             costData: extractCodexCostData(rawPayloads),
           });
         } else {
@@ -1825,6 +2082,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
         }
       }
     } finally {
+      pendingWait?.clear();
       await runtime.cleanup().catch(() => undefined);
     }
 
@@ -1839,36 +2097,58 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
    * driven by the normalized `message.started` event whose
    * `messageId` IS the codex turnId).
    *
-   * If `sessionId` or `turnId` is missing the call is a no-op.
+   * When that interrupt is rejected — the thread is idle in a background
+   * wait, or the turn id is stale or missing — a turn is started only to be
+   * interrupted, so the originating run still observes an interrupted turn
+   * and cancels; the model's leftover processes are then terminated.
+   * Without `sessionId` the call is a no-op.
    */
   async attachAbort(request: AgentAttachRequest<"codex">): Promise<void> {
     const threadId = request.sessionId;
-    const turnId = request.turnId;
-    if (!threadId || !turnId) {
-      debugCodex(
-        "attachAbort runId=%s skipped: threadId=%s turnId=%s",
-        request.runId,
-        threadId,
-        turnId,
-      );
+    if (!threadId) {
+      debugCodex("attachAbort runId=%s skipped: no threadId", request.runId);
       return;
     }
     await withCodexAppServer(request, async (client) => {
-      await Promise.race([
-        client.request("turn/interrupt", { threadId, turnId }),
-        new Promise((_, reject) =>
-          setTimeout(
-            () => reject(new Error("codex turn/interrupt timed out")),
-            3_000,
+      const bounded = <T>(what: string, promise: Promise<T>) =>
+        Promise.race([
+          promise,
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`codex ${what} timed out`)), 3_000),
           ),
-        ),
-      ]).catch((error) => {
-        debugCodex(
-          "attachAbort runId=%s turn/interrupt failed: %o",
-          request.runId,
-          error,
+        ]);
+      const interrupt = (turnId: string) =>
+        bounded("turn/interrupt", client.request("turn/interrupt", { threadId, turnId }));
+      if (request.turnId) {
+        try {
+          await interrupt(request.turnId);
+          return;
+        } catch (error) {
+          debugCodex("attachAbort runId=%s turn/interrupt failed: %o", request.runId, error);
+        }
+      }
+      // A busy thread steers this input into its active turn and returns
+      // that turn's id; an idle one starts a turn that the interrupt ends
+      // before the model answers.
+      try {
+        const response = await bounded(
+          "turn/start",
+          client.request<{ turn?: { id?: string } }>("turn/start", {
+            threadId,
+            input: [{ type: "text", text: CODEX_CANCEL_TURN_TEXT, text_elements: [] }],
+            approvalPolicy: "never",
+            model: null,
+            effort: null,
+            outputSchema: null,
+          }),
         );
-      });
+        if (typeof response?.turn?.id === "string") await interrupt(response.turn.id);
+      } catch (error) {
+        debugCodex("attachAbort runId=%s cancel turn failed: %o", request.runId, error);
+      }
+      // Otherwise the model's leftover processes outlive the cancel until
+      // the thread unloads.
+      await terminateBackgroundTerminals(client, threadId);
     });
   }
 

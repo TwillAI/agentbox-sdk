@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  createNormalizedEvent,
   normalizeRawAgentEvent,
   toAISDKEvent,
   type RawAgentEvent,
@@ -96,5 +97,24 @@ describe("event normalization", () => {
       decision: "allow",
       remember: true,
     });
+  });
+
+  it("carries background task membership and has no AI SDK counterpart", () => {
+    const event = createNormalizedEvent(
+      "background.tasks",
+      { provider: "claude-code", runId: "run-4" },
+      {
+        tasks: [{ id: "bp6o2wveh", type: "local_bash", description: "Sleep 25s" }],
+        waiting: true,
+      },
+    );
+
+    expect(event).toMatchObject({
+      type: "background.tasks",
+      runId: "run-4",
+      waiting: true,
+      tasks: [{ id: "bp6o2wveh", type: "local_bash" }],
+    });
+    expect(toAISDKEvent(event)).toBeNull();
   });
 });

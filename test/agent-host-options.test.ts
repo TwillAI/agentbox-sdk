@@ -35,6 +35,10 @@ describe("host execution configuration", () => {
     expect(agentboxRoot("claude-code", false, "/work/first")).toBe("/work/first/claude-code");
     expect(agentboxRoot("codex", true)).toBe("/tmp/agentbox/codex");
   });
+  it("rejects an invalid background task timeout before any transport is dialed", () => {
+    expect(() => new Agent("claude-code", { cwd: "/work", backgroundTaskTimeoutMs: -1 })).toThrow(/non-negative/);
+    expect(() => new Agent("claude-code", { cwd: "/work", backgroundTaskTimeoutMs: Number.NaN })).toThrow(/non-negative/);
+  });
   it("rejects relative host directories and host settings on cloud agents", () => {
     expect(() => new Agent("codex", { stateDirectory: "relative" })).toThrow(/absolute/);
     expect(() => new Agent("codex", { sandbox: new Sandbox("daytona", { provider: { apiKey: "test" } }), stateDirectory: "/work" })).toThrow(/host execution/);

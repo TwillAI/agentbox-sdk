@@ -19,6 +19,7 @@ export type NormalizedAgentEventType =
   | "permission.requested"
   | "permission.resolved"
   | "message.completed"
+  | "background.tasks"
   | "run.completed"
   | "run.cancelled"
   | "run.error";
@@ -121,6 +122,23 @@ export interface MessageCompletedEvent extends NormalizedAgentEventBase {
   messageId?: string;
 }
 
+/** Work the harness left running past its turn (background shell, monitor,
+ * background subagent, scheduled wakeup). */
+export interface BackgroundTask {
+  id: string;
+  /** Harness task type, e.g. `local_bash`, `local_agent`, `scheduled_wakeup`. */
+  type: string;
+  description: string;
+}
+
+export interface BackgroundTasksEvent extends NormalizedAgentEventBase {
+  type: "background.tasks";
+  /** Every live background task after the change (replace semantics). */
+  tasks: BackgroundTask[];
+  /** True once the harness ended its turn and the run stays open only for these tasks. */
+  waiting: boolean;
+}
+
 export interface RunCompletedEvent extends NormalizedAgentEventBase {
   type: "run.completed";
   text?: string;
@@ -154,6 +172,7 @@ export type NormalizedAgentEvent =
   | PermissionRequestedEvent
   | PermissionResolvedEvent
   | MessageCompletedEvent
+  | BackgroundTasksEvent
   | RunCompletedEvent
   | RunCancelledEvent
   | RunErrorEvent;
