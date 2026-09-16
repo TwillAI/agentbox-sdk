@@ -73,6 +73,7 @@ type CodexRpcClient = {
   request<TResult>(method: string, params: unknown): Promise<TResult>;
   notify(method: string, params?: unknown): Promise<void>;
   respond(id: number, result: unknown): Promise<void>;
+  respondError(id: number, error: unknown): Promise<void>;
   messages(): AsyncIterable<CodexNotification>;
   bindThread?(threadId: string): void;
 };
@@ -207,7 +208,7 @@ function buildThreadParams(
   return {
     cwd,
     model: request.run.model ?? null,
-    ...(options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
+    ...(options.provider?.approvalPolicy ? { approvalPolicy: options.provider.approvalPolicy } : options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
     sandbox: buildCodexSandboxMode(options),
     serviceName: "agentbox",
     // Persist the rollout on disk so follow-up runs can call `thread/resume`.
@@ -227,7 +228,7 @@ function buildResumeParams(
     threadId: request.run.resumeSessionId,
     cwd,
     model: request.run.model ?? null,
-    ...(options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
+    ...(options.provider?.approvalPolicy ? { approvalPolicy: options.provider.approvalPolicy } : options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
     sandbox: buildCodexSandboxMode(options),
     ...(request.run.systemPrompt ? { developerInstructions: request.run.systemPrompt } : options.configuration === "native" ? {} : { developerInstructions: null }),
     // We only need the thread id back; we never read `thread.turns`.
@@ -263,7 +264,7 @@ function buildForkParams(
     lastTurnId: request.run.forkAtMessageId ?? null,
     cwd,
     model: request.run.model ?? null,
-    ...(options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
+    ...(options.provider?.approvalPolicy ? { approvalPolicy: options.provider.approvalPolicy } : options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
     sandbox: buildCodexSandboxMode(options),
     ...(request.run.systemPrompt ? { developerInstructions: request.run.systemPrompt } : options.configuration === "native" ? {} : { developerInstructions: null }),
     excludeTurns: true,
@@ -320,7 +321,7 @@ export function buildCodexTurnStartParams(params: {
   return {
     threadId,
     input: inputItems,
-    ...(request.options.configuration === "native" && !request.options.fullAccess ? {} : {
+    ...(request.options.provider?.approvalPolicy ? { approvalPolicy: request.options.provider.approvalPolicy } : request.options.configuration === "native" && !request.options.fullAccess ? {} : {
       approvalPolicy: !request.options.fullAccess && isInteractiveApproval(request.options) ? "untrusted" : "never",
     }),
     ...(sandboxPolicy ? { sandboxPolicy } : {}),
@@ -595,6 +596,61 @@ function createCodexPermissionEvent(
   }
 
   return null;
+}
+
+const CODEX_ELICITATION_METHOD = "mcpServer/elicitation/request";
+
+/** Codex gates MCP tool calls (code mode included) behind a form elicitation
+ * tagged with `_meta.codex_approval_kind`. Unlike command or file approvals,
+ * it is answered with an elicitation result rather than a decision. */
+function createCodexElicitationPermissionEvent(
+  request: AgentExecutionRequest<"codex">,
+  notification: CodexNotification,
+): PermissionRequestedEvent | null {
+  if (notification.method !== CODEX_ELICITATION_METHOD || notification.id === undefined) {
+    return null;
+  }
+  const params = notification.params ?? {};
+  const meta = (params._meta ?? {}) as Record<string, unknown>;
+  if (meta.codex_approval_kind !== "mcp_tool_call") {
+    return null;
+  }
+  const raw = toRawEvent(request.runId, notification, notification.method);
+  const toolName =
+    typeof meta.tool_name === "string" ? meta.tool_name : undefined;
+  const server =
+    typeof params.serverName === "string" ? params.serverName : undefined;
+  const persist = Array.isArray(meta.persist) ? meta.persist : [];
+  return createNormalizedEvent(
+    "permission.requested",
+    { provider: request.provider, runId: request.runId, raw },
+    {
+      requestId: String(notification.id),
+      kind: "tool",
+      toolName: toolName ?? server,
+      title: "Approve tool call",
+      message:
+        typeof params.message === "string" && params.message.trim()
+          ? params.message
+          : `Codex wants to call ${toolName ?? "an MCP tool"}${server ? ` on ${server}` : ""}.`,
+      input: { server, tool: toolName, arguments: meta.tool_params, ...params },
+      canRemember: persist.includes("session"),
+    },
+  ) as PermissionRequestedEvent;
+}
+
+function toCodexElicitationResult(
+  notification: CodexNotification,
+  response: { decision: "allow" | "deny"; remember?: boolean },
+): { action: "accept" | "decline"; content: null; _meta?: { persist: "session" } } {
+  if (response.decision === "deny") {
+    return { action: "decline", content: null };
+  }
+  const meta = (notification.params?._meta ?? {}) as Record<string, unknown>;
+  const persist = Array.isArray(meta.persist) ? meta.persist : [];
+  return response.remember && persist.includes("session")
+    ? { action: "accept", content: null, _meta: { persist: "session" } }
+    : { action: "accept", content: null };
 }
 
 function toCodexApprovalDecision(
@@ -1575,6 +1631,30 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
               decision: toCodexApprovalDecision(message, response),
             });
             if (approvalKey) pendingFileChanges.delete(approvalKey);
+            continue;
+          }
+
+          const elicitation = createCodexElicitationPermissionEvent(request, message);
+          if (elicitation && message.id !== undefined) {
+            const response = interactiveApproval
+              ? await sink.requestPermission(elicitation)
+              : { requestId: elicitation.requestId, decision: "allow" as const };
+            await client.respond(message.id, toCodexElicitationResult(message, response));
+            continue;
+          }
+
+          // Codex blocks the turn until every server request is answered. A
+          // request this SDK does not understand (a non-approval elicitation,
+          // a newer approval kind, an auth refresh) must fail fast instead of
+          // stalling the run forever.
+          if (message.id !== undefined) {
+            debugCodex("unsupported server request %s; declining", message.method);
+            await (message.method === CODEX_ELICITATION_METHOD
+              ? client.respond(message.id, { action: "cancel", content: null })
+              : client.respondError(message.id, {
+                  code: -32601,
+                  message: `Unsupported request ${message.method}`,
+                }));
             continue;
           }
 
