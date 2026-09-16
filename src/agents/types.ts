@@ -175,6 +175,8 @@ export interface AgentOptionsBase {
 }
 
 export interface CodexProviderOptions {
+  /** Explicit policy for new, resumed, and forked native sessions. */
+  approvalPolicy?: "untrusted" | "on-request" | "never";
   /** Managed host execution defaults to read-only; native configuration uses the CLI's settings. */
   sandboxMode?: "read-only" | "workspace-write" | "danger-full-access";
   /** Additional task worktrees permitted by native Codex's write sandbox. */
