@@ -7,6 +7,7 @@ import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentExecutionRequest, AgentRunSink } from "../src/agents/types";
 import type { BackgroundTasksEvent } from "../src/events";
 import { executeNativeClaude } from "../src/agents/providers/claude-code";
+import orphanedPoll from "./fixtures/claude-orphaned-poll.json";
 
 const state = vi.hoisted(() => ({ query: vi.fn() }));
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({ query: state.query }));
@@ -74,7 +75,7 @@ describe("native Claude transport", () => {
     target.requestPermission = vi.fn<AgentRunSink["requestPermission"]>(async (event) => ({ requestId: event.requestId, decision: "allow", answers: [{ questionId: "0", values: ["Keep the existing theme"] }] }));
     const input = { questions: [{ question: "Which theme?", header: "Theme", options: [{ label: "Light" }, { label: "Dark" }], multiSelect: false }], metadata: { source: "test" } };
     state.query.mockImplementation(({ options }: { options: Options }) => Object.assign((async function* () {
-      expect(await options.canUseTool!("AskUserQuestion", input, { signal: new AbortController().signal, toolUseID: "ask-1" })).toEqual({ behavior: "allow", updatedInput: { ...input, answers: { "Which theme?": "Keep the existing theme" } } });
+      expect(await options.canUseTool!("AskUserQuestion", input, { signal: new AbortController().signal, toolUseID: "ask-1", requestId: "permission-ask-1" })).toEqual({ behavior: "allow", updatedInput: { ...input, answers: { "Which theme?": "Keep the existing theme" } } });
       yield { type: "result", subtype: "success", result: "Understood", is_error: false } as SDKMessage;
     })(), { close() {} }));
     await executeNativeClaude(request(), target);
@@ -91,7 +92,7 @@ describe("native Claude transport", () => {
       expect(options.env?.CLAUDE_CONFIG_DIR).toBe(process.env.CLAUDE_CONFIG_DIR);
       expect(options.env?.ANTHROPIC_CUSTOM_HEADERS).toContain("X-Test: value");
       const stream = (async function* () {
-        expect(await options.canUseTool!("Bash", { command: "git status" }, { signal: new AbortController().signal, toolUseID: "tool-1", title: "Inspect repository?" })).toMatchObject({ behavior: "allow" });
+        expect(await options.canUseTool!("Bash", { command: "git status" }, { signal: new AbortController().signal, toolUseID: "tool-1", requestId: "permission-tool-1", title: "Inspect repository?" })).toMatchObject({ behavior: "allow" });
         yield { type: "result", subtype: "success", result: "Done", is_error: false } as SDKMessage;
       })();
       return Object.assign(stream, { close: () => { events.push("close"); } });
@@ -134,9 +135,9 @@ describe("full-access conversations", () => {
     target.requestPermission = vi.fn<AgentRunSink["requestPermission"]>(async (event) => ({ requestId: event.requestId, decision: "allow", ...(event.kind === "question" ? { answers: [{ questionId: "0", values: ["A"] }] } : {}) }));
     state.query.mockImplementation(({ options }: { options: Options }) => Object.assign((async function* () {
       expect(options.permissionMode).toBe("bypassPermissions");
-      const context = { signal: new AbortController().signal, toolUseID: "question" };
+      const context = { signal: new AbortController().signal, toolUseID: "question", requestId: "permission-question" };
       await options.canUseTool!("AskUserQuestion", { questions: [{ question: "Pick", options: [{ label: "A" }, { label: "B" }] }] }, context);
-      await options.canUseTool!("ExitPlanMode", { plan: "Implement A" }, { ...context, toolUseID: "plan" });
+      await options.canUseTool!("ExitPlanMode", { plan: "Implement A" }, { ...context, toolUseID: "plan", requestId: "permission-plan" });
       yield { type: "result", subtype: "success", result: "Done", is_error: false } as SDKMessage;
     })(), { close() {} }));
     const runtime = request();
@@ -149,7 +150,7 @@ describe("full-access conversations", () => {
 
 describe("background tasks", () => {
   const system = (subtype: string, fields: Record<string, unknown> = {}) => ({ type: "system", subtype, ...fields }) as unknown as SDKMessage;
-  const changed = (tasks: Array<{ task_id: string; task_type: string; description: string }>) => system("background_tasks_changed", { tasks });
+  const changed = (tasks: Array<{ task_id: string; task_type: string; description: string; ambient?: boolean }>) => system("background_tasks_changed", { tasks });
   const success = (text: string) => ({ type: "result", subtype: "success", result: text, is_error: false }) as SDKMessage;
   const hang = () => new Promise<never>(() => {});
   const shell = { task_id: "bp6o2wveh", task_type: "local_bash", description: "Sleep for 25 seconds then print marker" };
@@ -157,6 +158,108 @@ describe("background tasks", () => {
     .map(([event]) => event)
     .filter((event): event is BackgroundTasksEvent => event.type === "background.tasks")
     .map((event) => ({ waiting: event.waiting, ids: event.tasks.map((task) => task.id) }));
+
+  it("completes without waiting for ambient watchers", async () => {
+    const target = sink();
+    const stopTask = vi.fn();
+    state.query.mockImplementation(() => Object.assign((async function* () {
+      yield changed([{ ...shell, ambient: true }]);
+      yield system("task_started", { ...shell, is_backgrounded: true });
+      yield success("Done");
+      await hang();
+    })(), { close() {}, stopTask }));
+    await executeNativeClaude(request(), target);
+    expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "Done" }));
+    expect(backgroundEvents(target)).toEqual([]);
+    expect(stopTask).not.toHaveBeenCalled();
+  });
+
+  it("drains coalesced task results, retaining the last non-empty answer", async () => {
+    const target = sink();
+    state.query.mockImplementation(() => Object.assign((async function* () {
+      yield system("session_state_changed", { state: "running" });
+      yield changed([shell]);
+      yield success("Started");
+      yield changed([]);
+      yield system("init", { session_id: "s" });
+      // 0.3.274 acknowledges coalesced notifications with empty, zero-turn
+      // results, followed by the one model response for the whole batch.
+      yield { ...success(""), num_turns: 0 } as SDKMessage;
+      expect(target.complete).not.toHaveBeenCalled();
+      yield success("Both background tasks finished.");
+      yield { ...success(""), num_turns: 0 } as SDKMessage;
+      yield system("session_state_changed", { state: "idle" });
+      throw new Error("Must finish on idle");
+    })(), { close() {} }));
+    await executeNativeClaude(request(), target, { graceMs: 20 });
+    expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "Both background tasks finished." }));
+  });
+
+  it("waits for the CLI idle barrier after a task finishes mid-turn", async () => {
+    const target = sink();
+    const close = vi.fn();
+    state.query.mockImplementation(({ options }: { options: Options }) => Object.assign((async function* () {
+      expect(options.env?.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS).toBe("1");
+      expect(options.hooks?.Stop).toBeUndefined();
+      yield system("session_state_changed", { state: "running" });
+      yield changed([shell]);
+      yield changed([]);
+      yield success("Initial answer");
+      // Empty snapshot + result with queued_turn_count=0 is insufficient:
+      // system-generated notification turns are not in that count.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(target.complete).not.toHaveBeenCalled();
+      yield system("init", { session_id: "s" });
+      yield success("Notification reply");
+      yield system("session_state_changed", { state: "idle" });
+      throw new Error("Must settle at idle without another read or grace");
+    })(), { close }));
+    await executeNativeClaude(request(), target, { graceMs: 1 });
+    expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "Notification reply" }));
+    expect(close).toHaveBeenCalledOnce();
+    expect(backgroundEvents(target).at(-1)).toEqual({ waiting: false, ids: [] });
+  });
+
+  it("keeps waiting when the session is idle but a task is still running", async () => {
+    const target = sink();
+    state.query.mockImplementation(() => Object.assign((async function* () {
+      yield system("session_state_changed", { state: "running" });
+      yield changed([shell]);
+      yield success("Launched");
+      yield system("session_state_changed", { state: "idle" });
+      expect(target.complete).not.toHaveBeenCalled();
+      expect(backgroundEvents(target).at(-1)).toEqual({ waiting: true, ids: [shell.task_id] });
+      yield changed([]);
+      // An earlier idle must not be reused for a later task snapshot.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(target.complete).not.toHaveBeenCalled();
+      yield system("session_state_changed", { state: "running" });
+      yield system("init", { session_id: "s" });
+      yield success("Finished");
+      yield system("session_state_changed", { state: "idle" });
+      await hang();
+    })(), { close() {} }));
+    await executeNativeClaude(request(), target, { graceMs: 1 });
+    expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "Finished" }));
+  });
+
+  it("bounds a genuinely live forgotten poll without injecting model cleanup", async () => {
+    const target = sink();
+    const runtime = request();
+    runtime.options.backgroundTaskTimeoutMs = 20;
+    const stopTask = vi.fn(async () => {});
+    state.query.mockImplementation(({ options }: { options: Options }) => Object.assign((async function* () {
+      expect(options.hooks?.Stop).toBeUndefined();
+      yield system("session_state_changed", { state: "running" });
+      for (const event of orphanedPoll) yield event as SDKMessage;
+      yield success("All three probes are stopped.");
+      yield system("session_state_changed", { state: "idle" });
+      await hang();
+    })(), { close() {}, stopTask }));
+    await executeNativeClaude(runtime, target);
+    expect(stopTask).toHaveBeenCalledExactlyOnceWith("bcdvi89ub");
+    expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "All three probes are stopped." }));
+  });
 
   it("stays open for a background shell and completes with the follow-up turn's result", async () => {
     const order: string[] = [];

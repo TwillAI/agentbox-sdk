@@ -91,7 +91,11 @@ import type { Sandbox } from "../../sandboxes";
 // host. Against an old daemon the host would silently fall back to
 // settling at the first turn end (background work lost), so warm sandboxes
 // must respawn.
-const DAEMON_PROTOCOL_VERSION = "5";
+// Bumped 5 -> 6: Stop hooks ask the host to review remaining background
+// shells before ending the turn, so forgotten polling helpers can be stopped.
+// Bumped 6 -> 7: Stop review frames include the CLI's current task list.
+// Bumped 7 -> 8: remove synthetic Stop review; use CLI session-state events.
+const DAEMON_PROTOCOL_VERSION = "8";
 const DAEMON_PORT = 43180;
 const DAEMON_PATH = "/tmp/agentbox/claude-code/daemon.mjs";
 const DAEMON_LOG_PATH = "/tmp/agentbox/claude-code/daemon.log";
@@ -288,7 +292,7 @@ export function createClaudeCodeDaemonScript(): string {
   return `import http from "node:http";
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { query, getSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 
 const VERSION = ${version};
@@ -1048,6 +1052,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       IS_SANDBOX: "1",
     };
     applyCliBackgroundWaitCeiling(env);
+    env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS ??= "1";
 
     // Custom headers reach Claude Code via ANTHROPIC_CUSTOM_HEADERS
     // (newline-separated `Name: Value` lines). Merge with any value the
@@ -1186,6 +1191,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       ),
     );
 
+    const tracker = new BackgroundTaskTracker();
     const permissionMessages = async function* () {
       for await (const item of parseNdjsonStream(response.body!)) {
         const control = item as { _permission?: { requestId: string; toolName: string; input: Record<string, unknown>; title?: string } };
@@ -1198,7 +1204,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         if (!reply.ok) throw new Error(`Claude permission response failed: ${reply.status}`);
       }
     };
-    await consumeClaudeMessages(request, sink, permissionMessages(), executeStartedAt, cleanup, () => cancelled);
+    await consumeClaudeMessages(request, sink, permissionMessages(), executeStartedAt, cleanup, () => cancelled, {}, tracker);
 
     return async () => undefined;
   }
@@ -1284,6 +1290,7 @@ async function consumeClaudeMessages(
   cleanup: () => Promise<void>,
   wasCancelled: () => boolean = () => false,
   wait: BackgroundWaitOptions = {},
+  tracker = new BackgroundTaskTracker(),
 ): Promise<void> {
     let accumulatedText = "";
     // Thinking chars streamed via thinking_delta for the current main-agent
@@ -1291,12 +1298,12 @@ async function consumeClaudeMessages(
     // the per-block assistant message.
     let streamedThinkingChars = 0;
     let sawResult = false;
+    let sawSessionState = false;
     let firstStreamEventLogged = false;
     let firstTextDeltaLogged = false;
     let lastTerminalReason: string | undefined;
     let lastIsError = false;
     const rawPayloads: Array<Record<string, unknown>> = [];
-    const tracker = new BackgroundTaskTracker();
     const timeoutMs = resolveBackgroundTaskTimeoutMs(request.options.backgroundTaskTimeoutMs);
     const graceMs = wait.graceMs ?? BACKGROUND_TASK_GRACE_MS;
     // Set while the run stays open only for background work; dropped as soon
@@ -1384,7 +1391,13 @@ async function consumeClaudeMessages(
           endWait();
         }
         emitTasks(tracker.liveTasks(), pendingWait !== undefined);
-        pendingWait?.setIdle(tracker.liveTasks().length === 0);
+        // The CLI's idle event follows notification draining. Empty task
+        // snapshots and results alone are not a completion barrier.
+        const sessionState = message.type === "system" && message.subtype === "session_state_changed"
+          ? message.state : undefined;
+        if (sessionState) sawSessionState = true;
+        pendingWait?.setIdle(!sawSessionState && tracker.liveTasks().length === 0);
+        if (sessionState === "idle" && pendingWait && tracker.liveTasks().length === 0) break;
 
         if (message.type === "system") {
           // The CLI surfaces several message variants under `type: "system"`:
@@ -1540,16 +1553,13 @@ async function consumeClaudeMessages(
           const live = tracker.liveTasks();
           // Nothing ever ran in the background: the turn end is the run end.
           if (timeoutMs === 0 || !tracker.hasSeenBackgroundWork() || isAborted()) break;
-          // Otherwise stay open for what is still live and for the wake-up
-          // the CLI queues for any task that finished mid-turn: that
-          // follow-up turn starts right after this result with nothing
-          // observable in between, so only the grace passing without a turn
-          // start means the run is over. Fall back to this result then; a
-          // later turn's result supersedes it.
+          // Stay open for live tasks and their queued notification turns.
+          // On current CLIs session_state_changed/idle is the completion
+          // barrier. Use the grace only if no session-state event was emitted.
           debugClaude("★ turn ended with %d background task(s); waiting", live.length);
           endWait();
           pendingWait = new BackgroundWait(graceMs, Math.max(0, timeoutMs - waitedMs));
-          pendingWait.setIdle(live.length === 0);
+          pendingWait.setIdle(!sawSessionState && live.length === 0);
           emitTasks(live, true);
           continue;
         }
@@ -1644,6 +1654,7 @@ export async function executeNativeClaude(
   const prompt = new AsyncQueue<SDKUserMessage>();
   const sessionId = request.run.resumeSessionId ?? randomUUID();
   const controller = new AbortController();
+  const tracker = new BackgroundTaskTracker();
   let handle: Query | undefined;
   let processHandle: SpawnedProcess | undefined;
   let stopped: Promise<void> | undefined;
@@ -1660,6 +1671,7 @@ export async function executeNativeClaude(
   prompt.push({ type: "user", uuid: messageId, message: { role: "user", content: mapToClaudeUserContent(input) as SDKUserMessage["message"]["content"] }, parent_tool_use_id: null });
   const hostEnv = Object.fromEntries(Object.entries({ ...process.env, ...request.options.env }).filter((entry): entry is [string, string] => entry[1] !== undefined));
   applyCliBackgroundWaitCeiling(hostEnv);
+  hostEnv.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS ??= "1";
   if (request.options.customHeaders) {
     const headers = Object.entries(request.options.customHeaders).map(([name, value]) => `${name}: ${value}`).join("\n");
     hostEnv.ANTHROPIC_CUSTOM_HEADERS = [hostEnv.ANTHROPIC_CUSTOM_HEADERS, headers].filter(Boolean).join("\n");
@@ -1735,7 +1747,7 @@ export async function executeNativeClaude(
       ...wait,
       // Native owns the CLI: ask it to stop leftover tasks before closing it.
       stopTasks: async (ids) => { await Promise.all(ids.map((id) => live.stopTask(id).catch(() => undefined))); },
-    });
+    }, tracker);
   } catch (error) {
     await stop();
     if (cancelled) sink.cancel();

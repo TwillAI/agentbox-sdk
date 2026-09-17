@@ -1,0 +1,338 @@
+[
+  {
+    "type": "system",
+    "subtype": "task_started",
+    "task_id": "bjttgsdqv",
+    "task_type": "local_bash",
+    "description": "Install Agent SDK in temp dir",
+    "is_backgrounded": false
+  },
+  {
+    "type": "system",
+    "status": "completed",
+    "subtype": "task_notification",
+    "task_id": "bjttgsdqv"
+  },
+  {
+    "type": "system",
+    "tasks": [
+      {
+        "task_id": "bjmlz0013",
+        "task_type": "local_bash",
+        "description": "Run SDK probe session with settings"
+      }
+    ],
+    "subtype": "background_tasks_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "task_started",
+    "task_id": "bjmlz0013",
+    "task_type": "local_bash",
+    "description": "Run SDK probe session with settings",
+    "is_backgrounded": true
+  },
+  {
+    "type": "system",
+    "tasks": [
+      {
+        "task_id": "bjmlz0013",
+        "task_type": "local_bash",
+        "description": "Run SDK probe session with settings"
+      },
+      {
+        "task_id": "b05gefzx4",
+        "task_type": "local_bash",
+        "description": "Wait briefly for probe output"
+      }
+    ],
+    "subtype": "background_tasks_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "task_started",
+    "task_id": "b05gefzx4",
+    "task_type": "local_bash",
+    "description": "Wait briefly for probe output",
+    "is_backgrounded": true
+  },
+  {
+    "type": "system",
+    "tasks": [
+      {
+        "task_id": "bjmlz0013",
+        "task_type": "local_bash",
+        "description": "Run SDK probe session with settings"
+      }
+    ],
+    "subtype": "background_tasks_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "task_updated",
+    "task_id": "b05gefzx4",
+    "patch": {
+      "status": "completed"
+    }
+  },
+  {
+    "type": "system",
+    "status": "completed",
+    "subtype": "task_notification",
+    "task_id": "b05gefzx4"
+  },
+  {
+    "type": "system",
+    "tasks": [
+      {
+        "task_id": "bjmlz0013",
+        "task_type": "local_bash",
+        "description": "Run SDK probe session with settings"
+      },
+      {
+        "task_id": "bapa9v0ja",
+        "task_type": "local_bash",
+        "description": "Wait for inbound message delivery in probe log"
+      }
+    ],
+    "subtype": "background_tasks_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "task_started",
+    "task_id": "bapa9v0ja",
+    "task_type": "local_bash",
+    "description": "Wait for inbound message delivery in probe log",
+    "is_backgrounded": true
+  },
+  {
+    "type": "system",
+    "tasks": [
+      {
+        "task_id": "bjmlz0013",
+        "task_type": "local_bash",
+        "description": "Run SDK probe session with settings"
+      }
+    ],
+    "subtype": "background_tasks_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "task_updated",
+    "task_id": "bapa9v0ja",
+    "patch": {
+      "status": "completed"
+    }
+  },
+  {
+    "type": "system",
+    "status": "completed",
+    "subtype": "task_notification",
+    "task_id": "bapa9v0ja"
+  },
+  {
+    "type": "system",
+    "tasks": [
+      {
+        "task_id": "bjmlz0013",
+        "task_type": "local_bash",
+        "description": "Run SDK probe session with settings"
+      },
+      {
+        "task_id": "bte2skh60",
+        "task_type": "local_bash",
+        "description": "Run bare-mode SDK probe"
+      }
+    ],
+    "subtype": "background_tasks_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "task_started",
+    "task_id": "bte2skh60",
+    "task_type": "local_bash",
+    "description": "Run bare-mode SDK probe",
+    "is_backgrounded": true
+  },
+  {
+    "type": "system",
+    "tasks": [
+      {
+        "task_id": "bjmlz0013",
+        "task_type": "local_bash",
+        "description": "Run SDK probe session with settings"
+      },
+      {
+        "task_id": "bte2skh60",
+        "task_type": "local_bash",
+        "description": "Run bare-mode SDK probe"
+      },
+      {
+        "task_id": "bcdvi89ub",
+        "task_type": "local_bash",
+        "description": "Wait for bare probe to report tools"
+      }
+    ],
+    "subtype": "background_tasks_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "task_started",
+    "task_id": "bcdvi89ub",
+    "task_type": "local_bash",
+    "description": "Wait for bare probe to report tools",
+    "is_backgrounded": true
+  },
+  {
+    "type": "system",
+    "tasks": [
+      {
+        "task_id": "bjmlz0013",
+        "task_type": "local_bash",
+        "description": "Run SDK probe session with settings"
+      },
+      {
+        "task_id": "bte2skh60",
+        "task_type": "local_bash",
+        "description": "Run bare-mode SDK probe"
+      },
+      {
+        "task_id": "bcdvi89ub",
+        "task_type": "local_bash",
+        "description": "Wait for bare probe to report tools"
+      },
+      {
+        "task_id": "bo6pgy9jz",
+        "task_type": "local_bash",
+        "description": "Run single-shot string-prompt SDK probe"
+      }
+    ],
+    "subtype": "background_tasks_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "task_started",
+    "task_id": "bo6pgy9jz",
+    "task_type": "local_bash",
+    "description": "Run single-shot string-prompt SDK probe",
+    "is_backgrounded": true
+  },
+  {
+    "type": "system",
+    "subtype": "task_started",
+    "task_id": "brg2l46p5",
+    "task_type": "local_bash",
+    "description": "Wait for and read string-mode probe init",
+    "is_backgrounded": false
+  },
+  {
+    "type": "system",
+    "status": "completed",
+    "subtype": "task_notification",
+    "task_id": "brg2l46p5"
+  },
+  {
+    "type": "system",
+    "subtype": "task_started",
+    "task_id": "bq1pchpil",
+    "task_type": "local_bash",
+    "description": "Wait for string probe ack",
+    "is_backgrounded": false
+  },
+  {
+    "type": "system",
+    "status": "completed",
+    "subtype": "task_notification",
+    "task_id": "bq1pchpil"
+  },
+  {
+    "type": "system",
+    "tasks": [
+      {
+        "task_id": "bte2skh60",
+        "task_type": "local_bash",
+        "description": "Run bare-mode SDK probe"
+      },
+      {
+        "task_id": "bcdvi89ub",
+        "task_type": "local_bash",
+        "description": "Wait for bare probe to report tools"
+      },
+      {
+        "task_id": "bo6pgy9jz",
+        "task_type": "local_bash",
+        "description": "Run single-shot string-prompt SDK probe"
+      }
+    ],
+    "subtype": "background_tasks_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "task_updated",
+    "task_id": "bjmlz0013",
+    "patch": {
+      "status": "killed"
+    }
+  },
+  {
+    "type": "system",
+    "status": "stopped",
+    "subtype": "task_notification",
+    "task_id": "bjmlz0013"
+  },
+  {
+    "type": "system",
+    "tasks": [
+      {
+        "task_id": "bcdvi89ub",
+        "task_type": "local_bash",
+        "description": "Wait for bare probe to report tools"
+      },
+      {
+        "task_id": "bo6pgy9jz",
+        "task_type": "local_bash",
+        "description": "Run single-shot string-prompt SDK probe"
+      }
+    ],
+    "subtype": "background_tasks_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "task_updated",
+    "task_id": "bte2skh60",
+    "patch": {
+      "status": "killed"
+    }
+  },
+  {
+    "type": "system",
+    "status": "stopped",
+    "subtype": "task_notification",
+    "task_id": "bte2skh60"
+  },
+  {
+    "type": "system",
+    "tasks": [
+      {
+        "task_id": "bcdvi89ub",
+        "task_type": "local_bash",
+        "description": "Wait for bare probe to report tools"
+      }
+    ],
+    "subtype": "background_tasks_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "task_updated",
+    "task_id": "bo6pgy9jz",
+    "patch": {
+      "status": "killed"
+    }
+  },
+  {
+    "type": "system",
+    "status": "stopped",
+    "subtype": "task_notification",
+    "task_id": "bo6pgy9jz"
+  }
+]

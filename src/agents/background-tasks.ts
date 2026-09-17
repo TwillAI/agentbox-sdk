@@ -56,7 +56,9 @@ const DONE_STATUSES = new Set(["completed", "failed", "killed"]);
  * provider knows whether a `result` is really the end of the run.
  *
  * `background_tasks_changed` is authoritative (replace semantics); the
- * `task_*` edges keep older CLIs working. Scheduled wakeups (CronCreate /
+ * `task_*` edges are only a fallback until the first snapshot. Their ordering
+ * relative to snapshots is unspecified. Ambient watchers are not activity.
+ * Scheduled wakeups (CronCreate /
  * ScheduleWakeup) never appear in the CLI's task set, so they are tracked
  * as pseudo tasks keyed by tool_use id. Only a fired schedule
  * (`command_lifecycle started`) or an explicit cancel drops them: a turn
@@ -64,15 +66,19 @@ const DONE_STATUSES = new Set(["completed", "failed", "killed"]);
  * armed in the CLI, so it must stay live here too.
  */
 export class BackgroundTaskTracker {
-  private readonly tasks = new Map<string, BackgroundTask>();
+  private readonly tasks = new Map<string, { task: BackgroundTask; ambient: boolean }>();
   private readonly wakeups = new Map<string, BackgroundTask>();
   // tool_use seen, tool_result not yet: a failed schedule adds nothing.
   private readonly pendingWakeups = new Map<string, BackgroundTask>();
   private afterResult = false;
   private seenBackgroundWork = false;
+  private hasTaskSnapshot = false;
 
   liveTasks(): BackgroundTask[] {
-    return [...this.tasks.values(), ...this.wakeups.values()];
+    return [
+      ...[...this.tasks.values()].filter(({ ambient }) => !ambient).map(({ task }) => task),
+      ...this.wakeups.values(),
+    ];
   }
 
   /**
@@ -80,9 +86,9 @@ export class BackgroundTaskTracker {
    * The CLI queues a wake-up for every task that finishes and delivers it as
    * a new turn once the model is idle — including tasks that finished
    * mid-turn, whose queued turn starts right after that turn's `result`
-   * with nothing live and nothing observable in between. After background
-   * work has been seen, a `result` is therefore never the end of the run on
-   * its own; only the grace passing without a new turn is.
+   * with nothing live in between. After background work has been seen, wait
+   * for session_state_changed/idle with an empty live set. Older CLIs that
+   * never emit session state use an idle grace as a compatibility fallback.
    */
   hasSeenBackgroundWork(): boolean {
     return this.seenBackgroundWork;
@@ -132,6 +138,7 @@ export class BackgroundTaskTracker {
     const id = String(m.task_id ?? "");
     switch (m.subtype) {
       case "background_tasks_changed":
+        this.hasTaskSnapshot = true;
         this.tasks.clear();
         for (const entry of asArray(m.tasks)) {
           const task = asRecord(entry);
@@ -139,13 +146,13 @@ export class BackgroundTaskTracker {
         }
         return false;
       case "task_started":
-        if (m.is_backgrounded === true && !m.owned_by_subagent) this.addTask(m);
+        if (!this.hasTaskSnapshot && m.is_backgrounded === true && !m.owned_by_subagent) this.addTask(m);
         return false;
       case "task_notification":
-        this.tasks.delete(id);
+        if (!this.hasTaskSnapshot) this.tasks.delete(id);
         return false;
       case "task_updated":
-        if (DONE_STATUSES.has(String(asRecord(m.patch)?.status)))
+        if (!this.hasTaskSnapshot && DONE_STATUSES.has(String(asRecord(m.patch)?.status)))
           this.tasks.delete(id);
         return false;
       case "init":
@@ -158,11 +165,15 @@ export class BackgroundTaskTracker {
   private addTask(task: Msg): void {
     const id = String(task.task_id ?? "");
     if (!id) return;
-    this.seenBackgroundWork = true;
+    const ambient = task.ambient === true || task.skip_transcript === true;
+    if (!ambient) this.seenBackgroundWork = true;
     this.tasks.set(id, {
-      id,
-      type: String(task.task_type ?? "task"),
-      description: String(task.description ?? ""),
+      ambient,
+      task: {
+        id,
+        type: String(task.task_type ?? "task"),
+        description: String(task.description ?? ""),
+      },
     });
   }
 

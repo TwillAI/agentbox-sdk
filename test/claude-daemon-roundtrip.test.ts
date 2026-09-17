@@ -26,7 +26,8 @@ export function query({ options }) {
 // input stays open; only interrupt()/close() lets it finish.
 const BACKGROUND_SDK = `
 export const getSessionInfo = async () => undefined;
-export function query() {
+export function query({ options }) {
+  if (options.hooks.Stop) throw new Error("Unexpected synthetic Stop hook");
   let release;
   const interrupted = new Promise((resolve) => { release = resolve; });
   const iterator = (async function* () {
@@ -34,6 +35,7 @@ export function query() {
     yield { type: "result", subtype: "success", result: "first" };
     yield { type: "system", subtype: "task_notification", task_id: "bg", status: "completed", output_file: "", summary: "done" };
     yield { type: "result", subtype: "success", result: "second" };
+    yield { type: "system", subtype: "session_state_changed", state: "idle" };
     await interrupted;
   })();
   return Object.assign(iterator, { interrupt: async () => release(), close() { release(); } });
@@ -214,13 +216,12 @@ it("forwards messages past the first result until the client ends the run", asyn
   try {
     const response = await daemon.post("/start", { prompt: { type: "user", message: { role: "user", content: "Go" } }, options: { autoApproveTools: true, pathToClaudeCodeExecutable: process.execPath } });
     expect(response.status).toBe(200);
-    let results = 0;
     const frames = await readFrames(response, async (frame) => {
-      if (frame.type !== "result" || ++results < 2) return;
+      if (frame.subtype !== "session_state_changed") return;
       // Both turns arrived and the stream is still open: the host decides when the run ends.
       expect((await daemon.del()).status).toBe(204);
     });
-    expect(frames.map((frame) => frame.subtype ?? frame.type)).toEqual(["init", "success", "task_notification", "success"]);
+    expect(frames.map((frame) => frame.subtype ?? frame.type)).toEqual(["init", "success", "task_notification", "success", "session_state_changed"]);
     expect(frames.filter((frame) => frame.type === "result").map((frame) => frame.result)).toEqual(["first", "second"]);
   } finally {
     await daemon.stop();

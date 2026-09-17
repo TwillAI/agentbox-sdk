@@ -14,10 +14,46 @@ const result = (text: string) => ({ type: "result", subtype: "success", result: 
 const assistant = (content: unknown[], parent_tool_use_id: string | null = null) => ({ type: "assistant", parent_tool_use_id, message: { role: "assistant", content } });
 const toolUse = (id: string, name: string, input: Record<string, unknown>) => ({ type: "tool_use", id, name, input });
 const toolResult = (tool_use_id: string, content: unknown, extra: Record<string, unknown> = {}, parent_tool_use_id: string | null = null) => ({ type: "user", parent_tool_use_id, message: { role: "user", content: [{ type: "tool_result", tool_use_id, content, ...extra }] } });
-const changed = (tasks: Array<{ task_id: string; task_type: string; description: string }>) => system("background_tasks_changed", { tasks });
+const changed = (tasks: Array<{ task_id: string; task_type: string; description: string; ambient?: boolean }>) => system("background_tasks_changed", { tasks });
 const ids = (tracker: BackgroundTaskTracker) => tracker.liveTasks().map((task) => task.id);
 
 describe("BackgroundTaskTracker", () => {
+  it("uses snapshots exclusively once available, regardless of task edge ordering", () => {
+    const tracker = new BackgroundTaskTracker();
+    const shell = { task_id: "poll", task_type: "local_bash", description: "Wait for probe output" };
+    tracker.ingest(system("task_started", { ...shell, is_backgrounded: true }));
+    tracker.ingest(changed([]));
+    tracker.ingest(system("task_started", { ...shell, is_backgrounded: true }));
+    expect(ids(tracker)).toEqual([]);
+    tracker.ingest(changed([shell]));
+    tracker.ingest(system("task_notification", { task_id: shell.task_id, status: "stopped" }));
+    tracker.ingest(system("task_updated", { task_id: shell.task_id, patch: { status: "killed" } }));
+    expect(ids(tracker)).toEqual([shell.task_id]);
+    tracker.ingest(changed([]));
+    expect(ids(tracker)).toEqual([]);
+  });
+
+  it("excludes ambient watchers from activity, including late edges", () => {
+    const tracker = new BackgroundTaskTracker();
+    const watcher = { task_id: "watch", task_type: "local_bash", description: "Live updates", ambient: true };
+    tracker.ingest(changed([watcher]));
+    tracker.ingest(system("task_started", { ...watcher, ambient: undefined, is_backgrounded: true }));
+    expect(ids(tracker)).toEqual([]);
+    expect(tracker.hasSeenBackgroundWork()).toBe(false);
+    tracker.ingest(changed([{ ...watcher, ambient: false }]));
+    expect(ids(tracker)).toEqual(["watch"]);
+    tracker.ingest(changed([watcher]));
+    expect(ids(tracker)).toEqual([]);
+  });
+
+  it("excludes ambient and skip_transcript tasks when using legacy edges", () => {
+    const tracker = new BackgroundTaskTracker();
+    tracker.ingest(system("task_started", { task_id: "watch", task_type: "local_bash", is_backgrounded: true, ambient: true }));
+    tracker.ingest(system("task_started", { task_id: "hidden", task_type: "local_bash", is_backgrounded: true, skip_transcript: true }));
+    expect(ids(tracker)).toEqual([]);
+    expect(tracker.hasSeenBackgroundWork()).toBe(false);
+  });
+
   it("follows a background shell through its notification and the CLI's follow-up turn", () => {
     const tracker = new BackgroundTaskTracker();
     expect(tracker.ingest(system("init"))).toBe(false);

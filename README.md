@@ -123,12 +123,26 @@ while the harness has ended its turn and the run stays open only for those
 tasks (or, with an empty set, for the wake-up the CLI queues for a task that
 finished mid-turn) — and settles the run on the follow-up turn's result
 instead of the first one. Once background work has been seen, a turn end
-settles the run only after a 15s grace with no new turn, and a final
+settles the run when Claude emits `session_state_changed: idle` and the live
+task set is empty. AgentBox enables this documented CLI event with
+`CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1`; there is no extra model call or
+fixed completion delay ([upstream opt-in documentation](https://github.com/anthropics/claude-agent-sdk-typescript/blob/main/CHANGELOG.md#0283)). Older/custom CLIs that never emit session state use
+a 15s grace as a compatibility fallback. A final
 `background.tasks` with `tasks: []` and `waiting: false` precedes the settle.
 `backgroundTaskTimeoutMs` bounds the total time spent waiting across the run:
 default 30 minutes, `0` settles at the first turn end as before, `Infinity`
 waits forever. On expiry the tasks are stopped best-effort and the run
 completes with the last turn's text.
+Tasks marked ambient by Claude (such as live-update watchers) do not keep the
+run waiting. The SDK's full task snapshots take precedence over task start and
+finish events, whose ordering relative to those snapshots is unspecified.
+
+AgentBox does not inject a Stop-hook prompt or infer from the answer that a
+running task is unwanted. A genuinely live polling helper keeps the run open
+until it finishes, is stopped, or reaches the wait budget. Unlike the interactive
+CLI, an AgentBox run owns the query lifetime: completing it closes the process.
+Keep the streaming input open while waiting so background continuations retain
+their hooks, permissions, and SDK MCP control channel.
 
 Codex owns command polling (`write_stdin`), yielded code-mode waits (`wait`),
 and subagent waits (`wait_agent`). AgentBox finishes an ordinary Codex run on
