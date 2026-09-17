@@ -98,6 +98,7 @@ Provisioning is **explicit**: `new Sandbox(...)` only stores config; the live sa
 - `e2b` exposes one timeout/lifecycle model, so combining `idleTimeoutMs` and `autoStopMs` should fail clearly.
 - Codex uses an env-driven login/setup path when `OPENAI_API_KEY` is present.
 - Claude Code over `--sdk-url` is sensitive to websocket startup ordering; the server must drive the initial user message correctly.
+- Host Codex can opt into `provider.prewarm`: `setup()` initializes a process without a thread or prompt, the next run consumes it, and ordinary run cleanup still stops it. `killServer()` also cancels unused or in-flight preparation.
 - Resume support is run-scoped and uses `resumeSessionId`.
 - Fork-at-message is run-scoped and uses `forkSessionId` + `forkAtMessageId`.
   The message id comes from the unified `messageId` field on `message.started`

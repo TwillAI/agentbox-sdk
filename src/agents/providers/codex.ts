@@ -72,6 +72,7 @@ type CodexRuntime = {
   source?: AsyncIterable<string>;
   writeLine?: (line: string) => Promise<void>;
   cleanup: () => Promise<void>;
+  isAlive?: () => boolean;
   raw: unknown;
   inputItems: Array<Record<string, unknown>>;
 };
@@ -1293,7 +1294,7 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
 }
 
 async function createRuntime(
-  request: AgentExecutionRequest<"codex">,
+  request: Pick<AgentExecutionRequest<"codex">, "options">,
   inputParts: Awaited<ReturnType<typeof validateProviderUserInput>>,
 ): Promise<CodexRuntime> {
   const options = request.options;
@@ -1411,6 +1412,7 @@ async function createRuntime(
     cleanup: async () => {
       await processHandle.kill();
     },
+    isAlive: () => processHandle.child.exitCode === null && processHandle.child.signalCode === null && !processHandle.child.killed,
     raw: { processHandle, codexDir },
     inputItems,
   };
@@ -1484,12 +1486,50 @@ async function killCodexAppServer(
     .catch(() => undefined);
 }
 
+async function initializeCodexClient(client: CodexRpcClient): Promise<void> {
+  await client.request("initialize", {
+    clientInfo: { title: "AgentBox", name: "AgentBox", version: "0.1.0" },
+    capabilities: { experimentalApi: true },
+  });
+  await client.notify("initialized", {});
+}
+
 export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
+  private prepared?: CodexRuntime;
+  private preparationGeneration = 0;
+
   async setup(request: AgentSetupRequest<"codex">): Promise<void> {
+    const generation = this.preparationGeneration;
+    if (request.options.provider?.prewarm && request.options.sandbox) {
+      throw new Error("Codex prewarm is only supported for host execution.");
+    }
     await setupCodex(request);
+    if (!request.options.provider?.prewarm || this.prepared?.isAlive?.()) return;
+    await this.prepared?.cleanup();
+    if (generation !== this.preparationGeneration) throw new Error("Codex preparation was cancelled.");
+    const runtime = await createRuntime(request, []);
+    if (generation !== this.preparationGeneration) {
+      await runtime.cleanup();
+      throw new Error("Codex preparation was cancelled.");
+    }
+    const client = new JsonRpcLineClient<CodexNotification>(runtime.source!, runtime.writeLine!);
+    const prepared = { ...runtime, client };
+    this.prepared = prepared;
+    try {
+      await withTimeout(initializeCodexClient(client), 10_000);
+      if (this.prepared !== prepared) throw new Error("Codex preparation was cancelled.");
+    } catch (error) {
+      if (this.prepared === prepared) this.prepared = undefined;
+      await runtime.cleanup();
+      throw error;
+    }
   }
 
   async killServer(request: AgentSetupRequest<"codex">): Promise<void> {
+    this.preparationGeneration++;
+    const prepared = this.prepared;
+    this.prepared = undefined;
+    await prepared?.cleanup();
     await killCodexAppServer(request);
   }
 
@@ -1506,9 +1546,22 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
     // in the `thread/start` params. Agent-config is on disk and discovered
     // via `CODEX_HOME`. `createRuntime` does the wire dial / binary spawn
     // from `request.options` directly.
-    const runtime = await time(debugCodex, "createRuntime", () =>
-      createRuntime(request, inputParts),
-    );
+    // A prepared process is consumed exactly once. Execution and abort keep
+    // their existing process ownership, including all tool descendants.
+    const prepared = this.prepared;
+    this.prepared = undefined;
+    let runtime: CodexRuntime;
+    if (prepared?.isAlive?.()) {
+      try {
+        runtime = { ...prepared, inputItems: await buildCodexInputItems(request.options, inputParts) };
+      } catch (error) {
+        await prepared.cleanup();
+        throw error;
+      }
+    } else {
+      await prepared?.cleanup();
+      runtime = await time(debugCodex, "createRuntime", () => createRuntime(request, inputParts));
+    }
     sink.setRaw(runtime.raw);
     sink.emitEvent(
       createNormalizedEvent("run.started", {
@@ -1871,17 +1924,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
 
     try {
       if (!runtime.client) {
-        await client.request("initialize", {
-          clientInfo: {
-            title: "AgentBox",
-            name: "AgentBox",
-            version: "0.1.0",
-          },
-          capabilities: {
-            experimentalApi: true,
-          },
-        });
-        await client.notify("initialized", {});
+        await initializeCodexClient(client);
       }
 
       const cwd = request.options.cwd ?? process.cwd();

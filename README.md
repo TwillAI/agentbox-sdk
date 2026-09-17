@@ -650,3 +650,13 @@ CLIs and SDK mocks; live tests remain opt-in.
 MIT
 
 For native speed selection, use `provider: { serviceTier: "fast" }` with Codex (or `"default"` for standard speed), and `provider: { fastMode: true }` with Claude Code. Omit these options to inherit harness settings. Availability and usage charges are enforced by the harness.
+
+### Preparing local Codex before a prompt
+
+For an interactive host, `provider: { prewarm: true }` makes `await agent.setup()`
+start and initialize the next Codex app-server. It does not create a thread, send
+a prompt, or run tools. The next `stream()`/`run()` consumes that prepared process
+and stops it normally when the run ends; abort still stops the owned process.
+A prepared process that exited while idle is replaced before execution. Call
+`await agent.killServer()` to dispose an unused prepared process. Prewarming is
+host-only and opt-in. Use a new Agent for a changed cwd, environment, or policy.

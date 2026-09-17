@@ -194,6 +194,10 @@ export interface AgentOptionsBase {
 }
 
 export interface CodexProviderOptions {
+  /** Prepare the next host app-server during setup(), before a prompt arrives.
+   * No thread or turn is started. Each execution still owns and stops its
+   * process; killServer() also disposes an unused prepared process. */
+  prewarm?: boolean;
   /** Native service tier; "default" explicitly selects standard speed. */
   serviceTier?: string;
   /** Explicit policy for new, resumed, and forked native sessions. */
