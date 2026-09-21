@@ -512,6 +512,34 @@ it("bounds an idle native goal wait without stopping shell processes or injectin
   }
 });
 
+it("completes, not cancels, when the host finishes a native goal wait", async () => {
+  const { directory, agent, requests } = await setup("goal-finish-wait", {
+    duringFirstTurn: goalUpdate("active"),
+  });
+  let active: AgentRun | undefined;
+  try {
+    // A ceiling far beyond the test timeout: only the host's request ends the wait.
+    active = agent({ backgroundTaskTimeoutMs: 10 * 60_000 }).stream({ input: "Finish the goal" });
+    const run = active;
+    const result = await collect(run, async (event) => {
+      if (event.type === "background.tasks" && event.waiting) await run.finishBackgroundWait();
+    });
+    expect(result.isCancelled).toBe(false);
+    expect(result.text).toBe("STARTED");
+    expect(ofType(result.events, "run.completed").map((event) => event.text)).toEqual(["STARTED"]);
+    expect(ofType(result.events, "run.cancelled")).toEqual([]);
+    expect(backgroundEvents(result.events)).toEqual([
+      { waiting: true, ids: [] },
+      { waiting: false, ids: [] },
+    ]);
+    expect((await requests()).map((request) => request.method)).toEqual(["turn/start"]);
+    active = undefined;
+  } finally {
+    await active?.abort();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 it.each([0, 300])("cancels during a native goal wait even if its ceiling fires during abort (interrupt delay: %s)", async (interruptDelayMs) => {
   const { directory, agent, requests } = await setup("goal-abort", {
     duringFirstTurn: goalUpdate("active"),

@@ -56,6 +56,8 @@ import { debugCodex, time } from "../../shared/debug";
 import {
   BACKGROUND_TASK_GRACE_MS,
   BackgroundWait,
+  BackgroundWaitFinish,
+  type BackgroundWaitExpiry,
   resolveBackgroundTaskTimeoutMs,
   STOP_TASKS_TIMEOUT_MS,
   withTimeout,
@@ -1673,6 +1675,10 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
     // turn is final even with live processes. Only native goal continuation
     // keeps this transport open between turns.
     let pendingWait: BackgroundWait | undefined;
+    // The host moved on (finishBackgroundWait): latched, so a request made
+    // mid-turn ends the wait that turn would otherwise start.
+    const finishWait = new BackgroundWaitFinish();
+    sink.setFinishBackgroundWait?.(() => finishWait.request());
     // Time already spent waiting: the ceiling bounds the run, not each wait.
     let waitedMs = 0;
     // Last agentMessage of the current turn; a follow-up turn's supersedes it.
@@ -1688,7 +1694,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       if (!pendingWait) return;
       waitedMs += pendingWait.elapsedMs();
       pendingWait.clear();
-      pendingWait = undefined;
+      pendingWait = finishWait.watch(undefined);
       emitGoalWaiting(false);
     };
     const completion = new Promise<{
@@ -1715,7 +1721,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       void (async () => {
         let firstClientMessageLogged = false;
         const iterator = client.messages()[Symbol.asyncIterator]();
-        type Step = { result: IteratorResult<CodexNotification> } | { reason: "grace" | "ceiling" };
+        type Step = { result: IteratorResult<CodexNotification> } | { reason: BackgroundWaitExpiry };
         // Manual iteration so a wait timer can race the transport read. A read
         // left pending by an expiry unwinds when cleanup() closes the transport.
         for (let next = iterator.next(); ; next = iterator.next()) {
@@ -1904,7 +1910,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
             }
             debugCodex("★ turn ended with an active goal; waiting for native continuation");
             endWait();
-            pendingWait = new BackgroundWait(BACKGROUND_TASK_GRACE_MS, Math.max(0, timeoutMs - waitedMs));
+            pendingWait = finishWait.watch(new BackgroundWait(BACKGROUND_TASK_GRACE_MS, Math.max(0, timeoutMs - waitedMs)));
             pendingWait.setIdle(true);
             emitGoalWaiting(true);
           }

@@ -99,6 +99,8 @@ Provisioning is **explicit**: `new Sandbox(...)` only stores config; the live sa
 - Codex uses an env-driven login/setup path when `OPENAI_API_KEY` is present.
 - Claude Code over `--sdk-url` is sensitive to websocket startup ordering; the server must drive the initial user message correctly.
 - Host Codex can opt into `provider.prewarm`: `setup()` initializes a process without a thread or prompt, the next run consumes it, and ordinary run cleanup still stops it. `killServer()` also cancels unused or in-flight preparation.
+- A run owns its harness process, so background work keeps the run open rather than outliving it. `AgentRun.finishBackgroundWait()` is the shared way for a host to end that wait and complete with the existing answer; providers register it through the optional `AgentRunSink.setFinishBackgroundWait`. Do not add model-side cleanup prompts to shorten waits.
+- The exception is the claude-code sandbox daemon, which outlives runs: with `provider.parkBackgroundWork` a run ends at its answer and the daemon *parks* the CLI **only while background work is live**, hands it to the next run for that session, and wakes the host (`wakeUrl`) when the CLI starts a turn nobody is watching. The host decides whether a wake becomes a run (`resumeParked`). Native runs still own their process.
 - Resume support is run-scoped and uses `resumeSessionId`.
 - Fork-at-message is run-scoped and uses `forkSessionId` + `forkAtMessageId`.
   The message id comes from the unified `messageId` field on `message.started`

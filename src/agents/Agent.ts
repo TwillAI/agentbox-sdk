@@ -150,6 +150,8 @@ class AgentRunController implements AgentRun, AgentRunSink {
   readonly sessionIdReady: Promise<string>;
   private abortHandler: () => Promise<void> = async () => undefined;
   private abortRequested = false;
+  private finishBackgroundWaitHandler?: () => void;
+  private finishBackgroundWaitRequested = false;
   private readonly eventQueue = new AsyncQueue<NormalizedAgentEvent>();
   private readonly rawQueue = new AsyncQueue<RawAgentEvent>();
   private readonly events: NormalizedAgentEvent[] = [];
@@ -202,6 +204,13 @@ class AgentRunController implements AgentRun, AgentRunSink {
     this.abortHandler = abort;
     if (this.abortRequested) {
       void abort();
+    }
+  }
+
+  setFinishBackgroundWait(finish: () => void): void {
+    this.finishBackgroundWaitHandler = finish;
+    if (this.finishBackgroundWaitRequested) {
+      finish();
     }
   }
 
@@ -346,12 +355,17 @@ class AgentRunController implements AgentRun, AgentRunSink {
     this.pendingPermissions.clear();
   }
 
-  complete(result?: { text?: string; costData?: AgentCostData | null }): void {
+  complete(result?: {
+    text?: string;
+    costData?: AgentCostData | null;
+    nothingParked?: boolean;
+  }): void {
     if (this.settled) {
       return;
     }
 
     this.settled = true;
+    const nothingParked = result?.nothingParked === true;
     this.clearPendingPermissions(
       new Error(
         "Agent run completed before pending permission requests resolved.",
@@ -380,6 +394,7 @@ class AgentRunController implements AgentRun, AgentRunSink {
         costData: this.costData,
         isCancelled: false,
         error: errorMsg,
+        ...(nothingParked ? { nothingParked: true } : {}),
       });
       return;
     }
@@ -392,6 +407,7 @@ class AgentRunController implements AgentRun, AgentRunSink {
       events: [...this.events],
       costData: this.costData,
       isCancelled: false,
+      ...(nothingParked ? { nothingParked: true } : {}),
     });
   }
 
@@ -477,6 +493,11 @@ class AgentRunController implements AgentRun, AgentRunSink {
     this.abortRequested = true;
     this.clearPendingPermissions(new Error("Agent run cancelled"));
     await this.abortHandler();
+  }
+
+  async finishBackgroundWait(): Promise<void> {
+    this.finishBackgroundWaitRequested = true;
+    this.finishBackgroundWaitHandler?.();
   }
 
   rawEvents(): AsyncIterable<RawAgentEvent> {
@@ -605,6 +626,15 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
     }
     if (runConfig.forkAtMessageId && !runConfig.forkSessionId) {
       throw new Error("AgentRunConfig.forkAtMessageId requires forkSessionId.");
+    }
+    if (runConfig.resumeParked) {
+      // Only a sandbox daemon can keep a harness alive between runs.
+      if (this.provider !== AgentProvider.ClaudeCode || !this.options.sandbox) {
+        throw new Error("AgentRunConfig.resumeParked is only supported for claude-code sandbox runs.");
+      }
+      if (!runConfig.resumeSessionId) {
+        throw new Error("AgentRunConfig.resumeParked requires resumeSessionId.");
+      }
     }
 
     const runId = runConfig.runId ?? randomUUID();

@@ -137,6 +137,11 @@ export interface BackgroundTasksEvent extends NormalizedAgentEventBase {
   tasks: BackgroundTask[];
   /** True once the harness ended its turn and the run stays open only for these tasks. */
   waiting: boolean;
+  /**
+   * Set on a run's last event when it ended with `tasks` still running in a
+   * parked harness: the work goes on, and a later run picks it up.
+   */
+  parked?: boolean;
 }
 
 export interface RunCompletedEvent extends NormalizedAgentEventBase {

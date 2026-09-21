@@ -70,6 +70,9 @@ export class BackgroundTaskTracker {
   private readonly wakeups = new Map<string, BackgroundTask>();
   // tool_use seen, tool_result not yet: a failed schedule adds nothing.
   private readonly pendingWakeups = new Map<string, BackgroundTask>();
+  // task_started seen while the command was still in the foreground, kept so
+  // a later "moved to the background" patch can name the task it promotes.
+  private readonly foreground = new Map<string, Msg>();
   private afterResult = false;
   private seenBackgroundWork = false;
   private hasTaskSnapshot = false;
@@ -92,6 +95,21 @@ export class BackgroundTaskTracker {
    */
   hasSeenBackgroundWork(): boolean {
     return this.seenBackgroundWork;
+  }
+
+  /**
+   * Prime a run that attaches to a parked harness with what was live when it
+   * was parked: that run never saw the work start, and would otherwise take
+   * its first `result` for the end of the run and tear the harness down.
+   * Snapshots and schedule events replayed afterwards supersede it.
+   */
+  restore(tasks: BackgroundTask[]): void {
+    for (const task of tasks) {
+      if (!task.id) continue;
+      this.seenBackgroundWork = true;
+      if (task.type === "scheduled_wakeup") this.wakeups.set(task.id, task);
+      else this.tasks.set(task.id, { task, ambient: false });
+    }
   }
 
   /** Feed one SDKMessage. Returns true when it started a follow-up turn. */
@@ -139,6 +157,7 @@ export class BackgroundTaskTracker {
     switch (m.subtype) {
       case "background_tasks_changed":
         this.hasTaskSnapshot = true;
+        this.foreground.clear();
         this.tasks.clear();
         for (const entry of asArray(m.tasks)) {
           const task = asRecord(entry);
@@ -146,15 +165,43 @@ export class BackgroundTaskTracker {
         }
         return false;
       case "task_started":
-        if (!this.hasTaskSnapshot && m.is_backgrounded === true && !m.owned_by_subagent) this.addTask(m);
+        if (this.hasTaskSnapshot || m.owned_by_subagent) return false;
+        if (m.is_backgrounded === true) this.addTask(m);
+        // Still in the foreground. Remember it anyway: `task_started` carries
+        // the only copy of the description and type, and a command that
+        // outlives its timeout is promoted to the background later, by a
+        // `task_updated` patch that carries neither.
+        else if (id) this.foreground.set(id, m);
         return false;
       case "task_notification":
-        if (!this.hasTaskSnapshot) this.tasks.delete(id);
-        return false;
-      case "task_updated":
-        if (!this.hasTaskSnapshot && DONE_STATUSES.has(String(asRecord(m.patch)?.status)))
+        if (!this.hasTaskSnapshot) {
           this.tasks.delete(id);
+          this.foreground.delete(id);
+        }
         return false;
+      case "task_updated": {
+        if (this.hasTaskSnapshot) return false;
+        const patch = asRecord(m.patch);
+        if (DONE_STATUSES.has(String(patch?.status))) {
+          this.tasks.delete(id);
+          this.foreground.delete(id);
+          return false;
+        }
+        // A foreground command moved to the background once it exceeded its
+        // timeout. That promotion is how background work most often begins,
+        // and on a CLI that emits no `background_tasks_changed` snapshot it
+        // is the only signal that it began at all — without it the run takes
+        // the turn end for the run end and the work is torn down with the CLI.
+        // Only a task whose start we saw in the foreground: the patch names
+        // no owner, so promoting an unknown id would also adopt a subagent's
+        // own command, which is not this run's background work.
+        const started = this.foreground.get(id);
+        if (patch?.is_backgrounded === true && started) {
+          this.foreground.delete(id);
+          this.addTask(started);
+        }
+        return false;
+      }
       case "init":
         return this.startTurn();
       default:
@@ -227,6 +274,9 @@ export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | und
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+/** Why a background wait ended without a follow-up turn starting. */
+export type BackgroundWaitExpiry = "grace" | "ceiling" | "finished";
+
 /**
  * Timers that end one background wait. Created when a turn ends and
  * discarded when a follow-up turn starts, so a stale expiry can never
@@ -234,8 +284,8 @@ export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | und
  * budget, so re-armed waits cannot extend it.
  */
 export class BackgroundWait {
-  readonly expired: Promise<"grace" | "ceiling">;
-  private expire!: (reason: "grace" | "ceiling") => void;
+  readonly expired: Promise<BackgroundWaitExpiry>;
+  private expire!: (reason: BackgroundWaitExpiry) => void;
   private grace?: NodeJS.Timeout;
   private readonly ceiling?: NodeJS.Timeout;
   private readonly startedAt = Date.now();
@@ -254,6 +304,11 @@ export class BackgroundWait {
     this.grace ??= setTimeout(() => this.expire("grace"), this.graceMs);
   }
 
+  /** End the wait now on the host's request ({@link BackgroundWaitFinish}). */
+  finish(): void {
+    this.expire("finished");
+  }
+
   elapsedMs(): number {
     return Date.now() - this.startedAt;
   }
@@ -261,5 +316,28 @@ export class BackgroundWait {
   clear(): void {
     clearTimeout(this.grace);
     clearTimeout(this.ceiling);
+  }
+}
+
+/**
+ * The host's request to stop holding a run open for background work
+ * (`AgentRun.finishBackgroundWait()`). It latches: asked while a turn is
+ * active, it ends the wait that turn would otherwise start, so the caller
+ * never has to time the request against the turn end.
+ */
+export class BackgroundWaitFinish {
+  private requested = false;
+  private wait?: BackgroundWait;
+
+  request(): void {
+    this.requested = true;
+    this.wait?.finish();
+  }
+
+  /** Follow the run's current wait; a latched request ends a new one at once. */
+  watch<T extends BackgroundWait | undefined>(wait: T): T {
+    this.wait = wait;
+    if (this.requested) wait?.finish();
+    return wait;
   }
 }

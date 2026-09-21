@@ -7,6 +7,7 @@ import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentExecutionRequest, AgentRunSink } from "../src/agents/types";
 import type { BackgroundTasksEvent } from "../src/events";
 import { executeNativeClaude } from "../src/agents/providers/claude-code";
+import abandonedGrep from "./fixtures/claude-auto-backgrounded-abandoned.json";
 import orphanedPoll from "./fixtures/claude-orphaned-poll.json";
 
 const state = vi.hoisted(() => ({ query: vi.fn() }));
@@ -259,6 +260,85 @@ describe("background tasks", () => {
     await executeNativeClaude(runtime, target);
     expect(stopTask).toHaveBeenCalledExactlyOnceWith("bcdvi89ub");
     expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "All three probes are stopped." }));
+  });
+
+  // Staging task 23ffae2b (2026-09-19): a foreground grep hit Bash's 120s
+  // timeout, the CLI moved it to the background, and the model answered
+  // without it. No event was missed; the run was held open by a command
+  // nobody needed, with the user's follow-up queued behind it.
+  describe("a foreground command the CLI auto-backgrounded, then abandoned", () => {
+    const grep = "b7ijs7ayg";
+    const answered = abandonedGrep.findIndex((event) => (event as { state?: string }).state === "idle");
+    const finishable = () => {
+      const target = sink();
+      let finish = () => {};
+      target.setFinishBackgroundWait = (handler) => { finish = handler; };
+      return { target, finish: () => finish() };
+    };
+
+    it("was never requested as background work", () => {
+      expect(abandonedGrep).toContainEqual(expect.objectContaining({ subtype: "task_started", task_id: grep, is_backgrounded: false }));
+      expect(abandonedGrep).toContainEqual(expect.objectContaining({ subtype: "task_updated", task_id: grep, patch: { is_backgrounded: true } }));
+    });
+
+    it("keeps the answered run open until the command exits, then completes on the CLI's follow-up turn", async () => {
+      const target = sink();
+      state.query.mockImplementation(() => Object.assign((async function* () {
+        for (const [index, event] of abandonedGrep.entries()) {
+          yield event as unknown as SDKMessage;
+          if (index !== answered) continue;
+          expect(target.complete).not.toHaveBeenCalled();
+          expect(backgroundEvents(target).at(-1)).toEqual({ waiting: true, ids: [grep] });
+        }
+        await hang();
+      })(), { close() {}, stopTask: vi.fn() }));
+      await executeNativeClaude(request(), target);
+      expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "The slow search finished; nothing else to change." }));
+    });
+
+    it("completes with the answer it already has once the host finishes the wait", async () => {
+      const { target, finish } = finishable();
+      const stopTask = vi.fn(async () => {});
+      // The default 30 minute ceiling stays in place: only the request ends the wait.
+      state.query.mockImplementation(() => Object.assign((async function* () {
+        for (const event of abandonedGrep.slice(0, answered + 1)) yield event as unknown as SDKMessage;
+        finish();
+        await hang();
+      })(), { close() {}, stopTask }));
+      await executeNativeClaude(request(), target);
+      expect(stopTask).toHaveBeenCalledExactlyOnceWith(grep);
+      expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "Renamed the button." }));
+      expect(target.cancel).not.toHaveBeenCalled();
+      expect(backgroundEvents(target).slice(-2)).toEqual([{ waiting: true, ids: [grep] }, { waiting: false, ids: [] }]);
+    });
+
+    it("applies a request made mid-turn at that turn's end", async () => {
+      const { target, finish } = finishable();
+      const stopTask = vi.fn(async () => {});
+      state.query.mockImplementation(() => Object.assign((async function* () {
+        for (const event of abandonedGrep.slice(0, answered + 1)) {
+          // The follow-up arrives while the model is still working.
+          if ((event as { type: string }).type === "result") finish();
+          yield event as unknown as SDKMessage;
+        }
+        await hang();
+      })(), { close() {}, stopTask }));
+      await executeNativeClaude(request(), target);
+      expect(stopTask).toHaveBeenCalledExactlyOnceWith(grep);
+      expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "Renamed the button." }));
+      expect(target.cancel).not.toHaveBeenCalled();
+    });
+
+    it("ignores a request when nothing ever ran in the background", async () => {
+      const { target, finish } = finishable();
+      state.query.mockImplementation(() => Object.assign((async function* () {
+        finish();
+        yield success("Done");
+      })(), { close() {} }));
+      await executeNativeClaude(request(), target);
+      expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "Done" }));
+      expect(backgroundEvents(target)).toEqual([]);
+    });
   });
 
   it("stays open for a background shell and completes with the follow-up turn's result", async () => {

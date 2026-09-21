@@ -144,6 +144,48 @@ CLI, an AgentBox run owns the query lifetime: completing it closes the process.
 Keep the streaming input open while waiting so background continuations retain
 their hooks, permissions, and SDK MCP control channel.
 
+The host decides when a wait has stopped being useful. A foreground command
+that outlives Bash's timeout is moved to the background by the CLI, and a model
+that answers without it leaves the run open for work nobody needs.
+`run.finishBackgroundWait()` ends the wait: a run that is only waiting stops
+what is left and completes with the answer it already has (`run.completed`,
+not `run.cancelled` as with `abort()`). The request latches, so calling it
+while a turn is active applies at that turn's end; a run that never waits
+ignores it. Use it when the user moves on, for example by sending a follow-up.
+It applies equally to Codex native goal waits and OpenCode background subagents.
+
+```ts
+for await (const event of run) {
+  if (event.type === "background.tasks" && event.waiting && userMovedOn()) {
+    await run.finishBackgroundWait();
+  }
+}
+```
+
+**Parked runs (claude-code in a sandbox).** A sandbox outlives the run, and so
+does the in-sandbox daemon, so a run there does not have to stay open at all.
+With `provider.parkBackgroundWork: { wakeUrl, wakeToken }` a run whose turn
+ends with background work still live **completes at its answer** and the daemon
+keeps the CLI for that work; the last `background.tasks` event carries
+`parked: true` and the tasks still running. A turn that ends with nothing live
+is untouched: the CLI winds down as before. While parked:
+
+- The next run that resumes the session takes the same CLI over (never a second
+  one on the session). It learns what was live, skips the results of turns that
+  ran before its own input, answers, and parks again if work is still live.
+- When the CLI starts a turn on its own with nobody attached, the daemon POSTs
+  `{ runId, sessionId }` to `wakeUrl` with `Authorization: Bearer <wakeToken>`,
+  retrying until it gets a 2xx. Stream that turn with
+  `agent.stream({ input: "", resumeSessionId, resumeParked: true })`; it
+  completes with empty text if nothing is parked. Whether to act on a wake is
+  the host's call: a host already running that session is attached to the same
+  CLI, which delivers the turn inside that run.
+- The park lasts what is left of `backgroundTaskTimeoutMs`, then the CLI winds
+  down as at the wait ceiling. A rewind (`forkSessionId`) and an explicit
+  `DELETE` end it too. With parking on, `finishBackgroundWait()` parks rather
+  than stops the work. Output is buffered while nobody is attached (partial
+  deltas excepted), up to 16 MB.
+
 Codex owns command polling (`write_stdin`), yielded code-mode waits (`wait`),
 and subagent waits (`wait_agent`). AgentBox finishes an ordinary Codex run on
 its root `turn/completed`, regardless of shell processes still running. It does
@@ -195,7 +237,7 @@ the end of the run.
 
 ## Agents
 
-Three agent providers are supported. Each wraps a CLI that runs inside the sandbox:
+Four agent providers are supported. Each wraps a CLI that runs inside the sandbox:
 
 | Provider      | CLI        | Model format                                    |
 | ------------- | ---------- | ----------------------------------------------- |

@@ -46,7 +46,8 @@ export type UserContentPart = TextPart | ImagePart | FilePart;
 export type UserContent = string | UserContentPart[];
 
 /** `max` and `ultra` are Codex-only and require a supporting model/runtime. */
-export type AgentReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+export type AgentReasoningEffort =
+  "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export interface AgentRunConfig {
   input: UserContent;
@@ -54,6 +55,13 @@ export interface AgentRunConfig {
   model?: string;
   systemPrompt?: string;
   resumeSessionId?: string;
+  /**
+   * claude-code sandbox runs: attach to the harness parked for
+   * {@link resumeSessionId} without sending {@link input}, and stream the
+   * turn it started on its own. Completes with empty text when nothing is
+   * parked or no such turn exists. See `provider.parkBackgroundWork`.
+   */
+  resumeParked?: boolean;
   /**
    * Source session/thread to fork from. The new run begins in a *new*
    * session whose history is the prefix of the source up to and including
@@ -261,6 +269,17 @@ export interface OpenCodeProviderOptions {
 }
 
 export interface ClaudeCodeProviderOptions {
+  /**
+   * Sandbox runs only. End a run at its answer even when background work is
+   * still live, and keep the CLI alive in the sandbox for it (a "parked"
+   * run) instead of holding the run open. A run whose turn ends with nothing
+   * live is unaffected. The next run resuming that session takes the CLI
+   * over. When the CLI starts a turn on its own with nobody attached (a task
+   * finished, a schedule fired) the daemon POSTs `{ runId, sessionId }` to
+   * `wakeUrl` with `Authorization: Bearer <wakeToken>`; stream that turn with
+   * `resumeParked`. The park lasts what is left of `backgroundTaskTimeoutMs`.
+   */
+  parkBackgroundWork?: { wakeUrl: string; wakeToken: string };
   /** Request fast mode explicitly; false overrides inherited fast settings. */
   fastMode?: boolean;
   binary?: string;
@@ -375,6 +394,14 @@ export interface AgentResult {
   rawEvents: RawAgentEvent[];
   events: NormalizedAgentEvent[];
   costData?: AgentCostData | null;
+  /**
+   * A {@link AgentRunConfig.resumeParked} run found nothing parked for its
+   * session — the park's budget ran out, the sandbox was replaced, or the CLI
+   * was torn down. The run streamed no turn of its own, so there is nothing
+   * to show for it. Never inferred from empty output: a real tool-only turn
+   * (a commit, an edit, a push) produces that too.
+   */
+  nothingParked?: boolean;
 }
 
 export interface AgentRun extends AsyncIterable<NormalizedAgentEvent> {
@@ -388,12 +415,22 @@ export interface AgentRun extends AsyncIterable<NormalizedAgentEvent> {
   respondToPermission(response: AgentPermissionResponse): Promise<void>;
   sendMessage(content: UserContent): Promise<void>;
   abort(): Promise<void>;
+  /**
+   * Stop holding the run open for background work. A run that is only
+   * waiting (`background.tasks` with `waiting: true`) stops what is left and
+   * completes with the answer it already has; unlike {@link abort} it is not
+   * cancelled. Asked while a turn is active, it applies at that turn's end.
+   * A no-op for a run that never waits.
+   */
+  finishBackgroundWait(): Promise<void>;
   readonly finished: Promise<AgentResult>;
 }
 
 export interface AgentRunSink {
   setRaw(raw: unknown): void;
   setAbort(abort: () => Promise<void>): void;
+  /** Providers that hold runs open for background work register how to stop. */
+  setFinishBackgroundWait?(finish: () => void): void;
   setSessionId(sessionId: string): void;
   emitRaw(event: RawAgentEvent): void;
   emitEvent(event: NormalizedAgentEvent): void;
@@ -403,7 +440,12 @@ export interface AgentRunSink {
   onMessage(
     handler: (content: UserContent) => Promise<{ messageId?: string } | void>,
   ): void;
-  complete(result?: { text?: string; costData?: AgentCostData | null }): void;
+  complete(result?: {
+    text?: string;
+    costData?: AgentCostData | null;
+    /** See {@link AgentResult.nothingParked}. */
+    nothingParked?: boolean;
+  }): void;
   cancel(result?: { text?: string; costData?: AgentCostData | null }): void;
   fail(error: unknown): void;
 }

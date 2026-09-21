@@ -34,7 +34,10 @@ import {
   type AgentSetupRequest,
   type UserContent,
 } from "../types";
-import { shouldAutoApproveClaudeTools, hasInteractiveQuestions } from "../approval";
+import {
+  shouldAutoApproveClaudeTools,
+  hasInteractiveQuestions,
+} from "../approval";
 import { normalizeUserQuestions, questionReply } from "../questions";
 import { mapToClaudeUserContent, validateProviderUserInput } from "../input";
 import {
@@ -66,6 +69,8 @@ import {
   BACKGROUND_TASK_GRACE_MS,
   BackgroundTaskTracker,
   BackgroundWait,
+  BackgroundWaitFinish,
+  type BackgroundWaitExpiry,
   STOP_TASKS_TIMEOUT_MS,
   applyCliBackgroundWaitCeiling,
   resolveBackgroundTaskTimeoutMs,
@@ -95,7 +100,14 @@ import type { Sandbox } from "../../sandboxes";
 // shells before ending the turn, so forgotten polling helpers can be stopped.
 // Bumped 6 -> 7: Stop review frames include the CLI's current task list.
 // Bumped 7 -> 8: remove synthetic Stop review; use CLI session-state events.
-const DAEMON_PROTOCOL_VERSION = "8";
+// Bumped 8 -> 9: parked runs. POST /runs/:id/park keeps the CLI and its
+// background work after the host leaves; /start adopts a parked run for the
+// same session (or attaches to the turn it started on its own), and a turn
+// nobody is watching wakes the host.
+// Bumped 9 -> 10: a park carries its deadline across adoptions (`_parked`
+// reports the budget left), an adopting run's permission mode replaces the
+// parking run's, and an unattended CLI never blocks on a permission.
+const DAEMON_PROTOCOL_VERSION = "10";
 const DAEMON_PORT = 43180;
 const DAEMON_PATH = "/tmp/agentbox/claude-code/daemon.mjs";
 const DAEMON_LOG_PATH = "/tmp/agentbox/claude-code/daemon.log";
@@ -119,7 +131,11 @@ const DAEMON_READY_POLL_INTERVAL_MS = 250;
  */
 function claudeConfigDir(options: AgentOptions<"claude-code">): string {
   return path.join(
-    agentboxRoot(AgentProvider.ClaudeCode, Boolean(options.sandbox), options.stateDirectory),
+    agentboxRoot(
+      AgentProvider.ClaudeCode,
+      Boolean(options.sandbox),
+      options.stateDirectory,
+    ),
     ".claude",
   );
 }
@@ -162,23 +178,30 @@ export function buildClaudeQueryOptions(params: {
   // here so callers only have to flip the single `ultracode` flag; the CLI
   // silently downgrades if the selected model can't do xhigh.
   if (run.reasoning === "max" || run.reasoning === "ultra") {
-    throw new Error(`Reasoning effort "${run.reasoning}" is only supported by Codex.`);
+    throw new Error(
+      `Reasoning effort "${run.reasoning}" is only supported by Codex.`,
+    );
   }
-  const effort = provider?.ultracode
-    ? "xhigh"
-    : run.reasoning;
+  const effort = provider?.ultracode ? "xhigh" : run.reasoning;
 
   return {
     cwd: params.cwd ?? params.request.options.cwd,
     env: params.env,
     pathToClaudeCodeExecutable: provider?.binary ?? "claude",
     ...(params.settingsPath ? { settings: params.settingsPath } : {}),
-    ...(params.request.options.configuration === "native" && provider?.fastMode !== undefined
-      ? { settings: { fastMode: provider.fastMode } } : {}),
-    ...(params.request.options.configuration === "native" ? {
-      settingSources: ["user", "project", "local"] as const,
-      systemPrompt: { type: "preset" as const, preset: "claude_code" as const },
-    } : {}),
+    ...(params.request.options.configuration === "native" &&
+    provider?.fastMode !== undefined
+      ? { settings: { fastMode: provider.fastMode } }
+      : {}),
+    ...(params.request.options.configuration === "native"
+      ? {
+          settingSources: ["user", "project", "local"] as const,
+          systemPrompt: {
+            type: "preset" as const,
+            preset: "claude_code" as const,
+          },
+        }
+      : {}),
     extraArgs,
     includePartialMessages: true,
     forwardSubagentText: true,
@@ -189,11 +212,17 @@ export function buildClaudeQueryOptions(params: {
       : {}),
     ...(run.model ? { model: run.model } : {}),
     ...(effort ? { effort } : {}),
-    ...(run.mode === "plan" ? { permissionMode: "plan" as const }
-      : params.request.options.fullAccess ? { permissionMode: "bypassPermissions" as const }
-      : run.mode === "default" ? { permissionMode: "default" as const }
-      : provider?.permissionMode ? { permissionMode: provider.permissionMode as PermissionMode } : {}),
-    ...((params.request.options.fullAccess || provider?.permissionMode === "bypassPermissions")
+    ...(run.mode === "plan"
+      ? { permissionMode: "plan" as const }
+      : params.request.options.fullAccess
+        ? { permissionMode: "bypassPermissions" as const }
+        : run.mode === "default"
+          ? { permissionMode: "default" as const }
+          : provider?.permissionMode
+            ? { permissionMode: provider.permissionMode as PermissionMode }
+            : {}),
+    ...(params.request.options.fullAccess ||
+    provider?.permissionMode === "bypassPermissions"
       ? { allowDangerouslySkipPermissions: true }
       : {}),
     ...(provider?.allowedTools?.length
@@ -317,6 +346,199 @@ function isAuthorized(req) {
 
 const liveRuns = new Map();
 
+// A parked run keeps its CLI, and the background work that CLI owns, alive
+// after the host settled the run and left. Its output is buffered until a
+// later run for the same session attaches through /start; a turn the CLI
+// starts on its own (a task finished, a schedule fired) wakes the host.
+const NDJSON_HEADERS = { "content-type": "application/x-ndjson", "transfer-encoding": "chunked", "x-daemon-version": VERSION };
+const PARK_BUFFER_LIMIT = 16 * 1024 * 1024;
+// A host may answer "busy" (non-2xx) for far longer than a fixed ladder: the
+// run that parked this work may still be finalizing, another job may hold the
+// task, a deploy may be rolling. Back off to WAKE_RETRY_CEILING_MS and then
+// keep asking for as long as the park lives — the park's own TTL is the bound,
+// not the ladder. A run attaching, or the park ending, stops the retries.
+const WAKE_RETRY_MS = [0, 1000, 2000, 4000, 8000, 16000, 30000, 60000];
+const WAKE_RETRY_CEILING_MS = 60000;
+
+function findParkedRun(sessionId) {
+  for (const run of liveRuns.values()) {
+    if (run.parked && !run.sink && run.sessionId === sessionId) return run;
+  }
+  return undefined;
+}
+
+// A run's own teardown. The liveRuns entry is only removed when it is still
+// ours: hosts reuse a runId across retry attempts, and a successor
+// registered while our CLI winds down must not be evicted by our exit.
+function releaseRun(run) {
+  clearInterval(run.heartbeat);
+  clearTimeout(run.parked?.timer);
+  run.parked = null;
+  run.clearPermissions();
+  if (liveRuns.get(run.id) === run) liveRuns.delete(run.id);
+  run.prompt.end();
+}
+
+// End the prompt so the CLI winds down with its background work.
+function endRun(run) {
+  releaseRun(run);
+  run.query?.interrupt().catch(() => {});
+}
+
+function writeFrame(run, message) {
+  const line = JSON.stringify(message) + "\\n";
+  if (run.sink && !run.sink.writableEnded) { run.sink.write(line); return; }
+  // Nobody is attached. Partial deltas are rebuilt from the final messages.
+  if (message.type === "stream_event") return;
+  // byteLength, not .length: JSON.stringify keeps non-ASCII verbatim, so
+  // UTF-16 units under-count the bytes this buffer actually holds.
+  const size = Buffer.byteLength(line);
+  if (run.bufferedBytes + size > PARK_BUFFER_LIMIT) {
+    // Out of room while nobody is attached. Keep what the CLI already
+    // produced and drop the rest rather than killing the CLI: the
+    // background work goes on, and the run that attaches learns from the
+    // notice that its transcript is incomplete. Turn accounting is
+    // unaffected — observeFrame counts results before we are called.
+    if (!run.bufferOverflowed) {
+      run.bufferOverflowed = true;
+      run.buffer.push(JSON.stringify({ _notice: "park_buffer_overflow" }) + "\\n");
+      if (run.parked) wakeHost(run);
+    }
+    return;
+  }
+  run.bufferedBytes += size;
+  run.buffer.push(line);
+}
+
+function attachSink(run, res) {
+  clearInterval(run.heartbeat);
+  run.sink = res;
+  // Heartbeat: write a blank NDJSON line every 15s so HTTPS proxies
+  // (Modal/Daytona tunnels, intermediate LBs) don't idle-kill the
+  // stream during long blocking tool calls (e.g. TaskOutput block:true).
+  // The host's parseNdjsonStream skips empty lines, so this is a no-op
+  // for consumers but keeps the underlying TCP stream warm.
+  run.heartbeat = setInterval(() => {
+    if (run.sink === res && !res.writableEnded) res.write("\\n");
+  }, 15000);
+  if (typeof run.heartbeat.unref === "function") run.heartbeat.unref();
+  // Host gone (settled, cancelled or crashed) → end the prompt so the CLI
+  // winds down instead of living on with its background work, unless the
+  // host parked the run first. Detected on the response: \`req\` emits
+  // "close" as soon as its body is consumed (Node >= 16), long before any
+  // disconnect, while the response only closes early when the socket dies
+  // before the stream finished.
+  res.on("close", () => {
+    if (run.sink !== res) return;
+    run.sink = null;
+    clearInterval(run.heartbeat);
+    if (run.parked) {
+      // The CLI survives, but a permission left outstanding would wedge it:
+      // nobody is attached to decide, and a blocked tool call never ends the
+      // turn, so the host would never be woken either. Decline without
+      // interrupting so the background work carries on.
+      run.declinePermissions();
+      return;
+    }
+    if (res.writableFinished) return;
+    run.clientGone = true;
+    endRun(run);
+  });
+}
+
+// Track turn boundaries so an attaching run knows how many results precede
+// its own, and so a turn nobody is watching wakes the host.
+function observeFrame(run, message) {
+  const state = message.type === "system" && message.subtype === "session_state_changed"
+    ? message.state : undefined;
+  const started = message.type === "system" &&
+    (message.subtype === "init" || state === "running");
+  if (started) run.turnActive = true;
+  // A turn ends at its result — but a turn that dies without one (a CLI
+  // error, a killed subagent) would otherwise leave turnActive stuck true
+  // and inflate the turn count adoptRun hands to the next run, which would
+  // then skip its own result. Idle means no turn is running, whatever the
+  // reason, so it clears the flag too.
+  if (message.type === "result" || state === "idle") run.turnActive = false;
+  if (message.type === "result" && !run.sink) run.bufferedResults++;
+  // Anything a parked, unattended CLI produces on its own is news for the
+  // host: the start of a turn, and equally the result of a turn that was
+  // already in flight when the park landed (whose start edge was consumed
+  // while the host was still attached, so it never announced itself).
+  if (run.parked && !run.sink && (started || message.type === "result")) {
+    wakeHost(run);
+  }
+}
+
+async function wakeHost(run) {
+  const parked = run.parked;
+  if (!parked || !parked.wakeUrl || parked.waking) return;
+  // A wake the host accepted stands until a run attaches. The job it started
+  // takes a while to boot its side, and every frame the CLI emits meanwhile
+  // calls us again — without this, one chatty turn is one POST per frame.
+  // Retry only once it is plain that no run is coming.
+  if (parked.wokeAt && Date.now() - parked.wokeAt < WAKE_RETRY_CEILING_MS) return;
+  parked.waking = true;
+  try {
+    for (let attempt = 0; ; attempt++) {
+      const delay = attempt < WAKE_RETRY_MS.length
+        ? WAKE_RETRY_MS[attempt]
+        : WAKE_RETRY_CEILING_MS;
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      // Attached or torn down meanwhile: someone is already listening, or
+      // the park's TTL ended it. Either way, stop asking.
+      if (run.parked !== parked || run.sink) return;
+      try {
+        const response = await fetch(parked.wakeUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: "Bearer " + parked.wakeToken },
+          body: JSON.stringify({ runId: run.id, sessionId: run.sessionId }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (response.ok) { parked.wokeAt = Date.now(); return; }
+      } catch {}
+    }
+  } finally {
+    parked.waking = false;
+  }
+}
+
+// A later run for a parked session takes the CLI over instead of starting a
+// second one on the same session: replay what was buffered, then stream.
+function adoptRun(run, res, runId, prompt, attachOnly, settings) {
+  const turns = run.bufferedResults + (run.turnActive ? 1 : 0);
+  res.writeHead(200, NDJSON_HEADERS);
+  // Nothing happened while parked: leave it for the wake that will.
+  if (attachOnly && turns === 0) {
+    res.end(JSON.stringify({ _notice: "no_parked_turn", sessionId: run.sessionId }) + "\\n");
+    return;
+  }
+  const parked = run.parked;
+  clearTimeout(parked.timer);
+  run.parked = null;
+  // The adopting run's permission settings govern its own turn: a CLI parked
+  // by a full-access run must not keep auto-approving once the task is back
+  // in ask or plan mode. An attach-only run sends no input of its own, so it
+  // leaves the settings of the turn already in flight alone.
+  if (settings) run.settings = settings;
+  liveRuns.delete(run.id);
+  run.id = runId;
+  liveRuns.set(runId, run);
+  attachSink(run, res);
+  // What is left of the background budget, so a run that adopts and parks
+  // again inherits the deadline instead of restarting it.
+  const budgetLeftMs = Number.isFinite(run.parkDeadline)
+    ? Math.max(0, run.parkDeadline - Date.now())
+    : null;
+  res.write(JSON.stringify({ _parked: { tasks: parked.tasks, turns, budgetLeftMs } }) + "\\n");
+  for (const line of run.buffer) res.write(line);
+  run.buffer = [];
+  run.bufferedBytes = 0;
+  run.bufferedResults = 0;
+  run.bufferOverflowed = false;
+  if (prompt) run.prompt.push(prompt);
+}
+
 // The SDK's default spawn does \`existsSync(pathToClaudeCodeExecutable)\`
 // before invoking child_process.spawn — that check fails on bare names
 // like "claude" because existsSync doesn't do PATH lookup. Resolve to an
@@ -400,7 +622,36 @@ async function handleStart(req, res, runId) {
     res.end(JSON.stringify({ error: String(e?.message ?? e) }));
     return;
   }
-  const { prompt, options } = body || {};
+  const { prompt, options, attach } = body || {};
+  const opts = { ...(options || {}) };
+  // Permission shaping belongs to the request, not to the CLI process that
+  // happens to serve it: read it before the adopt branch so a run taking over
+  // a parked CLI applies its own mode rather than inheriting the parking
+  // run's. The rest of \`opts\` configures the CLI at spawn and cannot change
+  // under a live query.
+  const settings = {
+    autoApprove: !!opts.autoApproveTools,
+    interactiveQuestions: !!opts.interactiveQuestions,
+    planning: opts.permissionMode === "plan",
+  };
+  delete opts.autoApproveTools;
+  delete opts.interactiveQuestions;
+  const parkedRun = opts.resume ? findParkedRun(opts.resume) : undefined;
+  if (parkedRun && opts.forkSession) {
+    // The conversation is being rewound: work started on the abandoned
+    // branch goes with it.
+    endRun(parkedRun);
+  } else if (parkedRun) {
+    adoptRun(parkedRun, res, runId, prompt, !!attach, attach ? undefined : settings);
+    return;
+  }
+  // An attach-only request streams the turn a parked CLI started on its own;
+  // without one there is nothing to run.
+  if (attach) {
+    res.writeHead(200, NDJSON_HEADERS);
+    res.end(JSON.stringify({ _notice: "no_parked_run", sessionId: opts.resume ?? "" }) + "\\n");
+    return;
+  }
   if (!prompt) {
     res.writeHead(400);
     res.end("missing prompt");
@@ -410,70 +661,63 @@ async function handleStart(req, res, runId) {
   const promptStream = createPromptStream();
   promptStream.push(prompt);
 
-  res.writeHead(200, {
-    "content-type": "application/x-ndjson",
-    "transfer-encoding": "chunked",
-    "x-daemon-version": VERSION,
-  });
+  res.writeHead(200, NDJSON_HEADERS);
 
-  // Heartbeat: write a blank NDJSON line every 15s so HTTPS proxies
-  // (Modal/Daytona tunnels, intermediate LBs) don't idle-kill the
-  // stream during long blocking tool calls (e.g. TaskOutput block:true).
-  // The host's parseNdjsonStream skips empty lines, so this is a no-op
-  // for consumers but keeps the underlying TCP stream warm.
-  const heartbeat = setInterval(() => {
-    if (!res.writableEnded) res.write("\\n");
-  }, 15000);
-  if (typeof heartbeat.unref === "function") heartbeat.unref();
-
-  const opts = { ...(options || {}) };
-  const autoApprove = !!opts.autoApproveTools;
-  delete opts.autoApproveTools;
-  const interactiveQuestions = !!opts.interactiveQuestions;
-  delete opts.interactiveQuestions;
-  let planning = opts.permissionMode === "plan";
   const permissions = new Map();
-  const clearPermissions = () => { for (const resolve of permissions.values()) resolve({ behavior: "deny", message: "Run ended", interrupt: true }); permissions.clear(); };
+  const denyAll = (response) => { for (const resolve of permissions.values()) resolve(response); permissions.clear(); };
+  const clearPermissions = () => denyAll({ behavior: "deny", message: "Run ended", interrupt: true });
+  // Nobody is attached to decide. Declining without \`interrupt\` lets the CLI
+  // report and carry on with its background work instead of blocking forever
+  // on a tool call — a blocked call never ends the turn, so the host would
+  // never be woken to answer it either.
+  const declinePermissions = () => denyAll({ behavior: "deny", message: "No user is attached to approve this request." });
   const canUseTool = async (toolName, input, context) => {
     const isQuestion = toolName === "AskUserQuestion";
     const isPlan = toolName === "ExitPlanMode";
+    const mode = run.settings;
     if (context.signal.aborted) return { behavior: "deny", message: "Run cancelled", interrupt: true };
-    if ((isQuestion || isPlan) && !interactiveQuestions) return { behavior: "deny", message: "No interactive user is available." };
-    if (!isQuestion && !isPlan && planning && toolName !== "EnterPlanMode") return { behavior: "deny", message: "Finish planning before requesting write access." };
-    if (!isQuestion && !isPlan && autoApprove) return { behavior: "allow", updatedInput: input };
+    if ((isQuestion || isPlan) && !mode.interactiveQuestions) return { behavior: "deny", message: "No interactive user is available." };
+    if (!isQuestion && !isPlan && mode.planning && toolName !== "EnterPlanMode") return { behavior: "deny", message: "Finish planning before requesting write access." };
+    if (!isQuestion && !isPlan && mode.autoApprove) return { behavior: "allow", updatedInput: input };
+    // Parked with nobody attached: there is no one to ask, and waiting would
+    // wedge the CLI out of reach of any wake.
+    if (run.parked && !run.sink) return { behavior: "deny", message: "No user is attached to approve this request." };
     return new Promise((resolve) => {
       const abort = () => { permissions.delete(context.toolUseID); resolve({ behavior: "deny", message: "Run cancelled", interrupt: true }); };
-      permissions.set(context.toolUseID, (response) => { context.signal.removeEventListener("abort", abort); if (isPlan && response.behavior === "allow") planning = false; resolve(response); });
+      permissions.set(context.toolUseID, (response) => { context.signal.removeEventListener("abort", abort); if (isPlan && response.behavior === "allow") run.settings.planning = false; resolve(response); });
       context.signal.addEventListener("abort", abort, { once: true });
-      res.write(JSON.stringify({ _permission: { requestId: context.toolUseID, toolName, input, title: context.title } }) + "\\n");
+      // Buffered while parked: the run that attaches answers it.
+      writeFrame(run, { _permission: { requestId: context.toolUseID, toolName, input, title: context.title } });
     });
   };
   opts.pathToClaudeCodeExecutable = resolveClaudeBinary(
     opts.pathToClaudeCodeExecutable,
   );
 
-  let queryHandle;
-  let clientGone = false;
-  // This run's own teardown. The liveRuns entry is only removed when it is
-  // still ours: hosts reuse a runId across retry attempts, and a successor
-  // registered while our CLI winds down must not be evicted by our exit.
-  const releaseRun = () => {
-    clearInterval(heartbeat);
-    clearPermissions();
-    if (liveRuns.get(runId)?.query === queryHandle) liveRuns.delete(runId);
-    promptStream.end();
+  const run = {
+    id: runId,
+    sessionId: opts.resume || opts.sessionId || "",
+    query: undefined,
+    prompt: promptStream,
+    permissions,
+    clearPermissions,
+    declinePermissions,
+    // Replaced by each run that adopts this CLI out of a park.
+    settings,
+    sink: null,
+    heartbeat: undefined,
+    clientGone: false,
+    parked: null,
+    // Absolute end of the background budget, carried across parks so a CLI
+    // that is adopted and parked again cannot extend its own ceiling.
+    parkDeadline: Infinity,
+    buffer: [],
+    bufferedBytes: 0,
+    bufferedResults: 0,
+    bufferOverflowed: false,
+    turnActive: false,
   };
-  // Host gone (settled, cancelled or crashed) → end the prompt so the CLI
-  // winds down instead of living on with its background work. Detected on
-  // the response: \`req\` emits "close" as soon as its body is consumed (Node
-  // >= 16), long before any disconnect, while the response only closes
-  // early when the socket dies before the stream finished.
-  res.on("close", () => {
-    if (res.writableFinished) return;
-    clientGone = true;
-    releaseRun();
-    queryHandle?.interrupt().catch(() => {});
-  });
+  attachSink(run, res);
 
   // Resume-if-exists gate. \`claude --resume <id>\` errors hard with "No
   // conversation found with session ID" when the local session jsonl is
@@ -506,44 +750,94 @@ async function handleStart(req, res, runId) {
   }
 
   // Nobody left to stream to: do not start a CLI for it.
-  if (clientGone) { res.end(); return; }
+  if (run.clientGone) { res.end(); return; }
   try {
-    queryHandle = query({
+    run.query = query({
       prompt: promptStream,
       options: {
         ...opts,
         canUseTool,
         hooks: { PreToolUse: [{ hooks: [async (input) => {
-          planning = input.permission_mode === "plan";
-          return interactiveQuestions && ["AskUserQuestion", "ExitPlanMode"].includes(input.tool_name)
+          run.settings.planning = input.permission_mode === "plan";
+          return run.settings.interactiveQuestions && ["AskUserQuestion", "ExitPlanMode"].includes(input.tool_name)
             ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask" } } : {};
         }] }] },
       },
     });
   } catch (e) {
-    clearInterval(heartbeat);
+    clearInterval(run.heartbeat);
     res.write(JSON.stringify({ _error: String(e?.message ?? e) }) + "\\n");
     res.end();
     return;
   }
 
-  liveRuns.set(runId, { query: queryHandle, prompt: promptStream, permissions });
+  liveRuns.set(runId, run);
 
   // Forward every SDKMessage, not just up to the first result: in
   // streaming-input mode the CLI keeps running after a turn ends and
   // re-prompts the model when background work finishes. The host decides
-  // when the run is over and disconnects (res "close" above), which ends
-  // the prompt and lets the CLI wind down.
+  // when the run is over and disconnects (the sink's "close"), which ends
+  // the prompt and lets the CLI wind down, or parks the run first, which
+  // keeps it. Frames go to whichever run is attached, else to the buffer.
   try {
-    for await (const message of queryHandle) {
-      res.write(JSON.stringify(message) + "\\n");
+    for await (const message of run.query) {
+      observeFrame(run, message);
+      writeFrame(run, message);
     }
   } catch (e) {
-    res.write(JSON.stringify({ _error: String(e?.message ?? e) }) + "\\n");
+    writeFrame(run, { _error: String(e?.message ?? e) });
   } finally {
-    releaseRun();
-    res.end();
+    const sink = run.sink;
+    releaseRun(run);
+    sink?.end();
   }
+}
+
+// The host settled a run whose background work is still live and is about
+// to leave: keep the CLI instead of winding it down. \`tasks\` is what the
+// host saw live (handed back to the run that attaches), \`ttlMs\` what is
+// left of its background budget, so unattended work never outlives it.
+async function handlePark(req, res, runId) {
+  let body;
+  try { body = await readJsonBody(req); }
+  catch { res.writeHead(400); res.end(); return; }
+  const run = liveRuns.get(runId);
+  if (!run || !run.query || run.clientGone) {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ parked: false }));
+    return;
+  }
+  clearTimeout(run.parked?.timer);
+  const parked = {
+    wakeUrl: /^https?:\\/\\//.test(String(body?.wakeUrl ?? "")) ? String(body.wakeUrl) : "",
+    wakeToken: String(body?.wakeToken ?? ""),
+    tasks: Array.isArray(body?.tasks) ? body.tasks : [],
+    waking: false,
+    wokeAt: 0,
+    timer: undefined,
+  };
+  // \`ttlMs: null\` is how the host says "no bound" (backgroundTaskTimeoutMs
+  // of Infinity). Number(null) is 0, so the raw value has to be typed —
+  // coercing it would arm an immediate teardown for an unbounded park.
+  const ttlMs = body?.ttlMs;
+  const requested = typeof ttlMs === "number" && Number.isFinite(ttlMs) && ttlMs >= 0
+    ? ttlMs
+    : Infinity;
+  // Never past a deadline inherited from an earlier park: the ceiling bounds
+  // the work, not each park, so a CLI that is adopted and re-parked on every
+  // wake-up cannot hold the sandbox open forever.
+  run.parkDeadline = Math.min(
+    run.parkDeadline ?? Infinity,
+    requested === Infinity ? Infinity : Date.now() + requested,
+  );
+  if (Number.isFinite(run.parkDeadline)) {
+    const delay = Math.max(0, run.parkDeadline - Date.now());
+    parked.timer = setTimeout(() => { if (run.parked === parked) endRun(run); }, Math.min(delay, 2147483647));
+    if (typeof parked.timer.unref === "function") parked.timer.unref();
+  }
+  run.parked = parked;
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({ parked: true }));
 }
 
 async function handleSendMessage(req, res, runId) {
@@ -576,6 +870,14 @@ async function handleAbort(_req, res, runId) {
     res.end();
     return;
   }
+  // Stop means stop: a parked CLI kept for background work must not survive
+  // the abort and wake the host with a new turn after the user pressed it.
+  if (run.parked) {
+    endRun(run);
+    res.writeHead(204);
+    res.end();
+    return;
+  }
   await run.query.interrupt().catch(() => {});
   res.writeHead(204);
   res.end();
@@ -584,9 +886,9 @@ async function handleAbort(_req, res, runId) {
 async function handleDelete(_req, res, runId) {
   const run = liveRuns.get(runId);
   if (run) {
-    liveRuns.delete(runId);
-    run.prompt.end();
-    await run.query.interrupt().catch(() => {});
+    // Also drops a park: an explicit delete ends the background work too.
+    releaseRun(run);
+    await run.query?.interrupt().catch(() => {});
   }
   res.writeHead(204);
   res.end();
@@ -623,6 +925,10 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === "POST" && (m = url.match(/^\\/runs\\/([^/]+)\\/abort$/))) {
     handleAbort(req, res, decodeURIComponent(m[1]));
+    return;
+  }
+  if (req.method === "POST" && (m = url.match(/^\\/runs\\/([^/]+)\\/park$/))) {
+    handlePark(req, res, decodeURIComponent(m[1])).catch(() => { if (!res.headersSent) res.writeHead(400); res.end(); });
     return;
   }
   if (req.method === "DELETE" && (m = url.match(/^\\/runs\\/([^/]+)$/))) {
@@ -975,15 +1281,30 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       const workflowSettings = buildClaudeWorkflowSettings(
         options.provider?.ultracode,
       );
-      const claudeSettings = { ...hookSettings, ...workflowSettings,
-        ...(options.provider?.fastMode !== undefined ? { fastMode: options.provider.fastMode } : {}),
+      const claudeSettings = {
+        ...hookSettings,
+        ...workflowSettings,
+        ...(options.provider?.fastMode !== undefined
+          ? { fastMode: options.provider.fastMode }
+          : {}),
       };
       const mcpConfigJson =
         buildClaudeMcpConfig(options.mcps) ??
         JSON.stringify({ mcpServers: {} }, null, 2);
 
       const artifacts = [
-        ...(!sandbox ? [{ path: path.join(target.layout.claudeDir, ".claude-plugin", "plugin.json"), content: JSON.stringify({ name: "agentbox", version: "1.0.0" }) }] : []),
+        ...(!sandbox
+          ? [
+              {
+                path: path.join(
+                  target.layout.claudeDir,
+                  ".claude-plugin",
+                  "plugin.json",
+                ),
+                content: JSON.stringify({ name: "agentbox", version: "1.0.0" }),
+              },
+            ]
+          : []),
         ...skillArtifacts,
         ...buildClaudeCommandArtifacts(options.commands, target.layout),
         ...buildClaudeSubagentArtifacts(options.subAgents, target.layout),
@@ -995,11 +1316,13 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       ];
 
       const enableRtk = options.enableRtk === true;
-      const daemonInfo = sandbox ? {
-        port: DAEMON_PORT,
-        healthPath: "/__version",
-        expectedVersionMatch: DAEMON_PROTOCOL_VERSION,
-      } : undefined;
+      const daemonInfo = sandbox
+        ? {
+            port: DAEMON_PORT,
+            healthPath: "/__version",
+            expectedVersionMatch: DAEMON_PROTOCOL_VERSION,
+          }
+        : undefined;
       const setupId = computeSetupId({
         artifacts,
         installCommands,
@@ -1067,11 +1390,14 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         : serialized;
     }
 
-    const inputParts = await time(
-      debugClaude,
-      "validateProviderUserInput",
-      () => validateProviderUserInput(request.provider, request.run.input),
-    );
+    // An attach-only run sends nothing: it streams the turn a parked CLI
+    // started on its own.
+    const attachOnly = request.run.resumeParked === true;
+    const inputParts = attachOnly
+      ? []
+      : await time(debugClaude, "validateProviderUserInput", () =>
+          validateProviderUserInput(request.provider, request.run.input),
+        );
     const userContent = mapToClaudeUserContent(inputParts);
     const initialUuid = randomUUID();
 
@@ -1097,14 +1423,18 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     const autoApproveTools = shouldAutoApproveClaudeTools(request.options);
 
     const requestBody = {
-      prompt: {
-        type: "user" as const,
-        message: {
-          role: "user" as const,
-          content: userContent as SDKUserMessage["message"]["content"],
-        },
-        parent_tool_use_id: null,
-      } satisfies SDKUserMessage,
+      ...(attachOnly
+        ? { attach: true }
+        : {
+            prompt: {
+              type: "user" as const,
+              message: {
+                role: "user" as const,
+                content: userContent as SDKUserMessage["message"]["content"],
+              },
+              parent_tool_use_id: null,
+            } satisfies SDKUserMessage,
+          }),
       options: {
         ...sdkOptions,
         // `sessionId` and `resume` are mutually exclusive — buildClaudeQueryOptions
@@ -1124,19 +1454,29 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       // the upstream socket open after we abort the fetch; the daemon's
       // response "close" handler is the backstop for a dead host.
       try {
-        await fetch(`${runUrl}/abort`, { method: "POST", headers: authHeaders });
+        await fetch(`${runUrl}/abort`, {
+          method: "POST",
+          headers: authHeaders,
+        });
       } catch {
         // ignore — abort is best-effort
       }
       try {
-        await fetch(runUrl, { method: "DELETE", headers: authHeaders, signal: AbortSignal.timeout(3_000) });
+        await fetch(runUrl, {
+          method: "DELETE",
+          headers: authHeaders,
+          signal: AbortSignal.timeout(3_000),
+        });
       } catch {
         // ignore — the fetch abort below still reaches the daemon
       }
       fetchAbort.abort();
     };
     let cancelled = false;
-    sink.setAbort(async () => { cancelled = true; await cleanup(); });
+    sink.setAbort(async () => {
+      cancelled = true;
+      await cleanup();
+    });
 
     sink.onMessage(async (content: UserContent) => {
       const parts = await validateProviderUserInput(request.provider, content);
@@ -1194,17 +1534,116 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     const tracker = new BackgroundTaskTracker();
     const permissionMessages = async function* () {
       for await (const item of parseNdjsonStream(response.body!)) {
-        const control = item as { _permission?: { requestId: string; toolName: string; input: Record<string, unknown>; title?: string } };
-        if (!control._permission) { yield item; continue; }
+        const control = item as {
+          _permission?: {
+            requestId: string;
+            toolName: string;
+            input: Record<string, unknown>;
+            title?: string;
+          };
+        };
+        if (!control._permission) {
+          yield item;
+          continue;
+        }
         const ask = control._permission;
         const isQuestion = ask.toolName === "AskUserQuestion";
         const isPlan = ask.toolName === "ExitPlanMode";
-        const answer = await sink.requestPermission({ type: "permission.requested", provider: request.provider, runId: request.runId, timestamp: new Date().toISOString(), requestId: ask.requestId, kind: isQuestion ? "question" : isPlan ? "plan" : "tool", toolName: ask.toolName, title: isQuestion ? "Your input is needed" : isPlan ? "Review the plan" : ask.title ?? `Allow ${ask.toolName}?`, input: ask.input, ...(isQuestion ? { questions: normalizeUserQuestions("claude-code", ask.input) } : {}) });
-        const reply = await fetch(`${baseUrl}/runs/${encodeURIComponent(request.runId)}/permission`, { method: "POST", headers: { "content-type": "application/json", ...authHeaders }, signal: fetchAbort.signal, body: JSON.stringify({ requestId: ask.requestId, response: answer.decision === "allow" ? { behavior: "allow", updatedInput: isQuestion ? { ...ask.input, answers: questionReply("claude-code", ask.input, answer.answers ?? []) } : ask.input } : { behavior: "deny", message: "The user declined this request." } }) });
-        if (!reply.ok) throw new Error(`Claude permission response failed: ${reply.status}`);
+        const answer = await sink.requestPermission({
+          type: "permission.requested",
+          provider: request.provider,
+          runId: request.runId,
+          timestamp: new Date().toISOString(),
+          requestId: ask.requestId,
+          kind: isQuestion ? "question" : isPlan ? "plan" : "tool",
+          toolName: ask.toolName,
+          title: isQuestion
+            ? "Your input is needed"
+            : isPlan
+              ? "Review the plan"
+              : (ask.title ?? `Allow ${ask.toolName}?`),
+          input: ask.input,
+          ...(isQuestion
+            ? { questions: normalizeUserQuestions("claude-code", ask.input) }
+            : {}),
+        });
+        const reply = await fetch(
+          `${baseUrl}/runs/${encodeURIComponent(request.runId)}/permission`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json", ...authHeaders },
+            signal: fetchAbort.signal,
+            body: JSON.stringify({
+              requestId: ask.requestId,
+              response:
+                answer.decision === "allow"
+                  ? {
+                      behavior: "allow",
+                      updatedInput: isQuestion
+                        ? {
+                            ...ask.input,
+                            answers: questionReply(
+                              "claude-code",
+                              ask.input,
+                              answer.answers ?? [],
+                            ),
+                          }
+                        : ask.input,
+                    }
+                  : {
+                      behavior: "deny",
+                      message: "The user declined this request.",
+                    },
+            }),
+          },
+        );
+        if (!reply.ok)
+          throw new Error(`Claude permission response failed: ${reply.status}`);
       }
     };
-    await consumeClaudeMessages(request, sink, permissionMessages(), executeStartedAt, cleanup, () => cancelled, {}, tracker);
+    const parking = request.options.provider?.parkBackgroundWork;
+    await consumeClaudeMessages(
+      request,
+      sink,
+      permissionMessages(),
+      executeStartedAt,
+      cleanup,
+      () => cancelled,
+      {
+        attachOnly,
+        ...(parking
+          ? {
+              // The daemon keeps the CLI once told to; only then may the stream be
+              // dropped without the wind-down that `cleanup` asks for.
+              park: async (tasks, ttlMs) => {
+                const response = await fetch(`${runUrl}/park`, {
+                  method: "POST",
+                  headers: {
+                    "content-type": "application/json",
+                    ...authHeaders,
+                  },
+                  signal: AbortSignal.timeout(10_000),
+                  body: JSON.stringify({
+                    wakeUrl: parking.wakeUrl,
+                    wakeToken: parking.wakeToken,
+                    tasks,
+                    ttlMs: Number.isFinite(ttlMs) ? ttlMs : null,
+                  }),
+                });
+                return (
+                  response.ok &&
+                  ((await response.json()) as { parked?: boolean }).parked ===
+                    true
+                );
+              },
+              detach: async () => {
+                fetchAbort.abort();
+              },
+            }
+          : {}),
+      },
+      tracker,
+    );
 
     return async () => undefined;
   }
@@ -1280,6 +1719,17 @@ export interface BackgroundWaitOptions {
   stopTasks?: (ids: string[]) => Promise<void>;
   /** Bound on `stopTasks`: a CLI that never answers must not hold the run open. */
   stopTimeoutMs?: number;
+  /**
+   * Keep the harness alive for `tasks` after this run settles instead of
+   * waiting on them (sandbox daemon only). `ttlMs` is what is left of the
+   * background budget. Resolves false when parking is unavailable, in which
+   * case the run waits as it always did.
+   */
+  park?: (tasks: BackgroundTask[], ttlMs: number) => Promise<boolean>;
+  /** Leave a parked run: drop the stream without winding the harness down. */
+  detach?: () => Promise<void>;
+  /** This run sent no input of its own (`resumeParked`). */
+  attachOnly?: boolean;
 }
 
 async function consumeClaudeMessages(
@@ -1292,355 +1742,520 @@ async function consumeClaudeMessages(
   wait: BackgroundWaitOptions = {},
   tracker = new BackgroundTaskTracker(),
 ): Promise<void> {
-    let accumulatedText = "";
-    // Thinking chars streamed via thinking_delta for the current main-agent
-    // message; used to avoid re-emitting the full thinking block carried by
-    // the per-block assistant message.
-    let streamedThinkingChars = 0;
-    let sawResult = false;
-    let sawSessionState = false;
-    let firstStreamEventLogged = false;
-    let firstTextDeltaLogged = false;
-    let lastTerminalReason: string | undefined;
-    let lastIsError = false;
-    const rawPayloads: Array<Record<string, unknown>> = [];
-    const timeoutMs = resolveBackgroundTaskTimeoutMs(request.options.backgroundTaskTimeoutMs);
-    const graceMs = wait.graceMs ?? BACKGROUND_TASK_GRACE_MS;
-    // Set while the run stays open only for background work; dropped as soon
-    // as a follow-up turn starts.
-    let pendingWait: BackgroundWait | undefined;
-    // Time already spent waiting: the ceiling bounds the run, not each wait,
-    // so a model that re-arms a monitor on every wake-up cannot stall forever.
-    let waitedMs = 0;
-    let expiry: "grace" | "ceiling" | "transport" | undefined;
-    let lastTasksKey = JSON.stringify({ tasks: [], waiting: false });
-    const emitTasks = (tasks: BackgroundTask[], waiting: boolean) => {
-      const key = JSON.stringify({ tasks, waiting });
-      if (key === lastTasksKey) return;
-      lastTasksKey = key;
-      sink.emitEvent(createNormalizedEvent("background.tasks", { provider: request.provider, runId: request.runId }, { tasks, waiting }));
-    };
-    const isAborted = () => wasCancelled() ||
-      lastTerminalReason === "aborted_streaming" ||
-      lastTerminalReason === "aborted_tools";
-    const endWait = () => {
-      if (!pendingWait) return;
-      waitedMs += pendingWait.elapsedMs();
-      pendingWait.clear();
-      pendingWait = undefined;
-    };
-    // A transport failure while only background work keeps the run open must
-    // not turn a complete answer into a failed run: settle on that answer.
-    const settleOnFailure = (error: unknown): boolean => {
-      if (!pendingWait || !sawResult || lastIsError) return false;
-      debugClaude("★ transport failed during background wait; settling on the last result: %o", error);
-      expiry = "transport";
-      return true;
-    };
-    const iterator = messages[Symbol.asyncIterator]();
-    type Step = { result: IteratorResult<unknown> } | { reason: "grace" | "ceiling" };
+  let accumulatedText = "";
+  // Thinking chars streamed via thinking_delta for the current main-agent
+  // message; used to avoid re-emitting the full thinking block carried by
+  // the per-block assistant message.
+  let streamedThinkingChars = 0;
+  let sawResult = false;
+  let sawSessionState = false;
+  let firstStreamEventLogged = false;
+  let firstTextDeltaLogged = false;
+  let lastTerminalReason: string | undefined;
+  let lastIsError = false;
+  const rawPayloads: Array<Record<string, unknown>> = [];
+  const timeoutMs = resolveBackgroundTaskTimeoutMs(
+    request.options.backgroundTaskTimeoutMs,
+  );
+  const graceMs = wait.graceMs ?? BACKGROUND_TASK_GRACE_MS;
+  // Set while the run stays open only for background work; dropped as soon
+  // as a follow-up turn starts.
+  let pendingWait: BackgroundWait | undefined;
+  // Time already spent waiting: the ceiling bounds the run, not each wait,
+  // so a model that re-arms a monitor on every wake-up cannot stall forever.
+  let waitedMs = 0;
+  let expiry: BackgroundWaitExpiry | "transport" | undefined;
+  // The host moved on (finishBackgroundWait): latched, so a request made
+  // mid-turn ends the wait that turn would otherwise start.
+  const finishWait = new BackgroundWaitFinish();
+  sink.setFinishBackgroundWait?.(() => finishWait.request());
+  // The run ended with its background work handed to a parked harness.
+  let parked = false;
+  // How the run lets go of its transport once it is over, whatever the path.
+  let leave = cleanup;
+  // Attached to a parked harness: results of turns that began before this
+  // run's own are not its answer, and an attach with nothing parked is a
+  // run with nothing to do.
+  let foreignResults = 0;
+  let nothingParked = false;
+  let lastTasksKey = JSON.stringify({
+    tasks: [],
+    waiting: false,
+    isParked: false,
+  });
+  const emitTasks = (
+    tasks: BackgroundTask[],
+    waiting: boolean,
+    isParked = false,
+  ) => {
+    const key = JSON.stringify({ tasks, waiting, isParked });
+    if (key === lastTasksKey) return;
+    lastTasksKey = key;
+    sink.emitEvent(
+      createNormalizedEvent(
+        "background.tasks",
+        { provider: request.provider, runId: request.runId },
+        { tasks, waiting, ...(isParked ? { parked: true } : {}) },
+      ),
+    );
+  };
+  const budgetLeftMs = () =>
+    Math.max(0, timeoutMs - waitedMs - (pendingWait?.elapsedMs() ?? 0));
+  // Parking replaces the wait whenever work is still live, so the harness
+  // keeps it while the run ends at its answer.
+  const tryPark = async (): Promise<boolean> => {
+    const live = tracker.liveTasks();
+    const ttlMs = budgetLeftMs();
+    // No budget left is not something to park for: the harness would tear the
+    // work down a tick later, after the run already reported it as parked.
+    // Fall through to the ordinary stop-what-is-left path instead.
+    if (!wait.park || live.length === 0 || isAborted() || ttlMs <= 0)
+      return false;
+    parked = await wait.park(live, ttlMs).catch(() => false);
+    if (parked)
+      debugClaude(
+        "★ parked the harness with %d background task(s); settling",
+        live.length,
+      );
+    return parked;
+  };
+  const isAborted = () =>
+    wasCancelled() ||
+    lastTerminalReason === "aborted_streaming" ||
+    lastTerminalReason === "aborted_tools";
+  const endWait = () => {
+    if (!pendingWait) return;
+    waitedMs += pendingWait.elapsedMs();
+    pendingWait.clear();
+    pendingWait = finishWait.watch(undefined);
+  };
+  // A transport failure while only background work keeps the run open must
+  // not turn a complete answer into a failed run: settle on that answer.
+  const settleOnFailure = (error: unknown): boolean => {
+    if (!pendingWait || !sawResult || lastIsError) return false;
+    debugClaude(
+      "★ transport failed during background wait; settling on the last result: %o",
+      error,
+    );
+    expiry = "transport";
+    return true;
+  };
+  const iterator = messages[Symbol.asyncIterator]();
+  type Step =
+    { result: IteratorResult<unknown> } | { reason: BackgroundWaitExpiry };
 
-    try {
-      // Manual iteration so a wait timer can race the transport read. A read
-      // left in flight by an expiry unwinds when cleanup() closes the transport.
-      for (let next = iterator.next(); ; next = iterator.next()) {
-        let step: Step;
-        try {
-          step = pendingWait
-            ? await Promise.race([
-                next.then((result) => ({ result })),
-                pendingWait.expired.then((reason) => ({ reason })),
-              ])
-            : { result: await next };
-        } catch (error) {
+  try {
+    // Manual iteration so a wait timer can race the transport read. A read
+    // left in flight by an expiry unwinds when cleanup() closes the transport.
+    for (let next = iterator.next(); ; next = iterator.next()) {
+      let step: Step;
+      try {
+        step = pendingWait
+          ? await Promise.race([
+              next.then((result) => ({ result })),
+              pendingWait.expired.then((reason) => ({ reason })),
+            ])
+          : { result: await next };
+      } catch (error) {
+        if (!settleOnFailure(error)) throw error;
+        break;
+      }
+      if ("reason" in step) {
+        // Asked to stop waiting: a harness that can park keeps the work
+        // for the run that follows instead of ending it.
+        if (!(step.reason === "finished" && (await tryPark())))
+          expiry = step.reason;
+        break;
+      }
+      if (step.result.done) break;
+      const item = step.result.value;
+      if (item && typeof item === "object") {
+        const ctrl = item as Record<string, unknown>;
+        if ("_error" in ctrl) {
+          const error = new Error(String(ctrl._error ?? "daemon error"));
           if (!settleOnFailure(error)) throw error;
           break;
         }
-        if ("reason" in step) { expiry = step.reason; break; }
-        if (step.result.done) break;
-        const item = step.result.value;
-        if (item && typeof item === "object") {
-          const ctrl = item as Record<string, unknown>;
-          if ("_error" in ctrl) {
-            const error = new Error(String(ctrl._error ?? "daemon error"));
-            if (!settleOnFailure(error)) throw error;
-            break;
+        if ("_parked" in ctrl) {
+          // This run took over a parked harness. It never saw the
+          // background work start, so learn what was live; `turns` results
+          // belong to turns that began before its own input (for an
+          // attach-only run, the last of them is its answer).
+          const info = ctrl._parked as
+            | {
+                tasks?: BackgroundTask[];
+                turns?: number;
+                budgetLeftMs?: number | null;
+              }
+            | undefined;
+          tracker.restore(Array.isArray(info?.tasks) ? info.tasks : []);
+          foreignResults = Math.max(
+            0,
+            Number(info?.turns ?? 0) - (wait.attachOnly ? 1 : 0),
+          );
+          // Time the work already spent parked counts against this run's
+          // budget: the ceiling bounds the background work, not each run that
+          // adopts it, so re-parking on every wake-up cannot extend it.
+          const budgetLeft = info?.budgetLeftMs;
+          if (typeof budgetLeft === "number" && Number.isFinite(timeoutMs)) {
+            waitedMs = Math.max(0, timeoutMs - Math.max(0, budgetLeft));
           }
-          if ("_notice" in ctrl) {
-            // Daemon-side advisories that aren't SDKMessages. Currently:
-            //   { _notice: "resume_session_missing", sessionId: "<uuid>" }
-            //     → daemon dropped a stale `resume` because the session
-            //       file wasn't on disk; a fresh session was started under
-            //       the same id. The host can clear its resume hint.
-            debugClaude("daemon notice: %o", ctrl);
-            sink.emitRaw(
-              toRawEvent(
-                request.runId,
-                ctrl,
-                `daemon.${String(ctrl._notice ?? "notice")}`,
-              ),
-            );
-            continue;
-          }
-        }
-        const message = item as SDKMessage;
-        rawPayloads.push(message as unknown as Record<string, unknown>);
-        sink.emitRaw(toRawEvent(request.runId, message, message.type));
-        if (tracker.ingest(message) && pendingWait) {
-          debugClaude("★ follow-up turn started; background wait over (%dms since execute start)", Date.now() - executeStartedAt);
-          endWait();
-        }
-        emitTasks(tracker.liveTasks(), pendingWait !== undefined);
-        // The CLI's idle event follows notification draining. Empty task
-        // snapshots and results alone are not a completion barrier.
-        const sessionState = message.type === "system" && message.subtype === "session_state_changed"
-          ? message.state : undefined;
-        if (sessionState) sawSessionState = true;
-        pendingWait?.setIdle(!sawSessionState && tracker.liveTasks().length === 0);
-        if (sessionState === "idle" && pendingWait && tracker.liveTasks().length === 0) break;
-
-        if (message.type === "system") {
-          // The CLI surfaces several message variants under `type: "system"`:
-          // `init` (SDKSystemMessage), `hook_started`/`hook_response`
-          // (SDKHookStartedMessage / SDKHookResponseMessage), and others.
-          // Discriminate on `subtype` against the union so each branch
-          // narrows correctly.
-          const sub = (message as { subtype?: string }).subtype;
-          if (sub === "init") {
-            const sys = message as SDKSystemMessage;
-            // Session id is already set on the sink (pre-minted before
-            // POSTing /start). The init message arrives confirming what
-            // claude assigned — should match `presetSessionId`.
-            if (request.run.goal && !sys.slash_commands.some((command) => command.replace(/^\//, "") === "goal")) {
-              await cleanup();
-              throw new Error("This Claude Code installation does not expose the native /goal command.");
-            }
-            if (sys.session_id) {
-              debugClaude(
-                "★ session.init session_id=%s (%dms)",
-                sys.session_id.slice(0, 8),
-                Date.now() - executeStartedAt,
-              );
-            }
-          } else if (sub === "hook_started") {
-            const h = message as SDKHookStartedMessage;
-            debugClaude(
-              "hook.started name=%s event=%s hook_id=%s",
-              h.hook_name,
-              h.hook_event,
-              h.hook_id,
-            );
-          } else if (sub === "hook_response") {
-            const h = message as SDKHookResponseMessage;
-            // `stderr` is where users typically `echo` from their hook
-            // commands (per Claude Code's hook protocol). Surface it
-            // verbatim so a misconfigured hook (e.g. `yarn` not on PATH)
-            // shows its real error message in agentbox DEBUG logs.
-            const stderr =
-              h.stderr && h.stderr.length > 0
-                ? h.stderr.replace(/\s+$/, "")
-                : undefined;
-            debugClaude(
-              "hook.response name=%s exit=%s outcome=%s%s",
-              h.hook_name,
-              h.exit_code,
-              h.outcome,
-              stderr ? ` stderr=${JSON.stringify(stderr).slice(0, 200)}` : "",
-            );
-          }
+          debugClaude(
+            "★ attached to a parked harness: %d task(s) live, %d earlier result(s)",
+            tracker.liveTasks().length,
+            foreignResults,
+          );
+          emitTasks(tracker.liveTasks(), false);
           continue;
         }
-
-        if (message.type === "stream_event") {
-          if (!firstStreamEventLogged) {
-            firstStreamEventLogged = true;
-            debugClaude(
-              "★ first stream_event (%dms since execute start)",
-              Date.now() - executeStartedAt,
-            );
-          }
-          const partial = message as SDKPartialAssistantMessage;
-          // Subagent partials (forwarded when `forwardSubagentText` is on)
-          // must not leak into the main run's normalized text/reasoning
-          // stream or its accumulated final-answer fallback. The raw event
-          // already carries the nested transcript for assembler consumers.
-          if (partial.parent_tool_use_id) continue;
-          // A new main-agent message resets the accumulated fallback text so
-          // cancelled/failed runs surface the latest message instead of a
-          // concatenation of every text delta in the run.
-          const streamType = (partial.event as { type?: string } | undefined)
-            ?.type;
-          if (streamType === "message_start") {
-            accumulatedText = "";
-            streamedThinkingChars = 0;
-          }
-          const { text, thinking } = extractStreamDeltas(partial);
-          if (thinking) {
-            streamedThinkingChars += thinking.length;
-            sink.emitEvent(
-              createNormalizedEvent(
-                "reasoning.delta",
-                { provider: request.provider, runId: request.runId },
-                { delta: thinking },
-              ),
-            );
-          }
-          if (text) {
-            if (!firstTextDeltaLogged) {
-              firstTextDeltaLogged = true;
-              debugClaude(
-                "★ first text delta (%dms since execute start)",
-                Date.now() - executeStartedAt,
-              );
-            }
-            accumulatedText += text;
-            sink.emitEvent(
-              createNormalizedEvent(
-                "text.delta",
-                { provider: request.provider, runId: request.runId },
-                { delta: text },
-              ),
-            );
-          }
-          continue;
-        }
-
-        if (message.type === "assistant") {
-          const asst = message as SDKAssistantMessage;
-          // Forwarded subagent messages (parent_tool_use_id set) are not part
-          // of the main conversation: emitting them as message.completed
-          // would surface the subagent's final answer as a top-level message
-          // (it is already rendered inside the Task tool's result).
-          if (asst.parent_tool_use_id) continue;
-          const thinking = extractAssistantThinking(asst);
-          // Thinking already streamed via thinking_delta events would be
-          // double-emitted here (the CLI repeats the full block content on
-          // the per-block assistant message). Only backfill when no deltas
-          // were observed for this message.
-          if (thinking && streamedThinkingChars === 0) {
-            sink.emitEvent(
-              createNormalizedEvent(
-                "reasoning.delta",
-                { provider: request.provider, runId: request.runId },
-                { delta: thinking },
-              ),
-            );
-          }
-          const text = extractAssistantText(asst);
-          sink.emitEvent(
-            createNormalizedEvent(
-              "message.completed",
-              { provider: request.provider, runId: request.runId },
-              {
-                text,
-                ...(asst.uuid ? { messageId: String(asst.uuid) } : {}),
-              },
+        if ("_notice" in ctrl) {
+          // Daemon-side advisories that aren't SDKMessages. Currently:
+          //   { _notice: "resume_session_missing", sessionId: "<uuid>" }
+          //     → daemon dropped a stale `resume` because the session
+          //       file wasn't on disk; a fresh session was started under
+          //       the same id. The host can clear its resume hint.
+          //   { _notice: "no_parked_run" | "no_parked_turn" }
+          //     → a `resumeParked` run found nothing to stream.
+          if (
+            ctrl._notice === "no_parked_run" ||
+            ctrl._notice === "no_parked_turn"
+          )
+            nothingParked = true;
+          debugClaude("daemon notice: %o", ctrl);
+          sink.emitRaw(
+            toRawEvent(
+              request.runId,
+              ctrl,
+              `daemon.${String(ctrl._notice ?? "notice")}`,
             ),
           );
           continue;
         }
-
-        if (message.type === "result") {
-          sawResult = true;
-          const result = message as SDKResultMessage;
-          lastTerminalReason = result.terminal_reason;
-          lastIsError = result.is_error;
-          const resultText =
-            result.subtype === "success" ? result.result : accumulatedText;
-          if (resultText && resultText !== accumulatedText) {
-            accumulatedText = resultText;
-          }
-          const live = tracker.liveTasks();
-          // Nothing ever ran in the background: the turn end is the run end.
-          if (timeoutMs === 0 || !tracker.hasSeenBackgroundWork() || isAborted()) break;
-          // Stay open for live tasks and their queued notification turns.
-          // On current CLIs session_state_changed/idle is the completion
-          // barrier. Use the grace only if no session-state event was emitted.
-          debugClaude("★ turn ended with %d background task(s); waiting", live.length);
-          endWait();
-          pendingWait = new BackgroundWait(graceMs, Math.max(0, timeoutMs - waitedMs));
-          pendingWait.setIdle(!sawSessionState && live.length === 0);
-          emitTasks(live, true);
-          continue;
-        }
       }
-
-      if (expiry === "ceiling") {
-        // Mirrors the CLI's own "Background tasks still running; terminating":
-        // stop what is left (best effort, bounded — an unanswered stop_task
-        // must not hold the run open) and complete with the last result.
-        const ids = tracker.liveTasks()
-          .filter((task) => task.type !== "scheduled_wakeup")
-          .map((task) => task.id);
-        debugClaude("★ background wait ceiling (%dms) hit; stopping %d task(s)", timeoutMs, ids.length);
-        if (wait.stopTasks) {
-          await withTimeout(wait.stopTasks(ids), wait.stopTimeoutMs ?? STOP_TASKS_TIMEOUT_MS).catch(() => undefined);
-        }
-      } else if (expiry === "grace") {
-        debugClaude("★ background set emptied with no follow-up turn; settling");
-      }
-      if (pendingWait) {
-        // However the wait ended, nothing is pending once the run settles.
+      const message = item as SDKMessage;
+      rawPayloads.push(message as unknown as Record<string, unknown>);
+      sink.emitRaw(toRawEvent(request.runId, message, message.type));
+      if (tracker.ingest(message) && pendingWait) {
+        debugClaude(
+          "★ follow-up turn started; background wait over (%dms since execute start)",
+          Date.now() - executeStartedAt,
+        );
         endWait();
-        emitTasks([], false);
       }
-      await cleanup();
-      if (!sawResult && !wasCancelled()) throw new Error("Claude Code closed before reporting a result");
-      const finalText = accumulatedText;
-      const isCancelled = isAborted();
-      // is_error is the authoritative error signal — it covers both
-      // explicit error subtypes and cases where subtype=success but
-      // the run failed (e.g. auth errors after retries exhausted).
-      // Cancel is checked first since aborted runs also have is_error=true.
-      const isError = !isCancelled && lastIsError;
+      emitTasks(tracker.liveTasks(), pendingWait !== undefined);
+      // The CLI's idle event follows notification draining. Empty task
+      // snapshots and results alone are not a completion barrier.
+      const sessionState =
+        message.type === "system" && message.subtype === "session_state_changed"
+          ? message.state
+          : undefined;
+      if (sessionState) sawSessionState = true;
+      pendingWait?.setIdle(
+        !sawSessionState && tracker.liveTasks().length === 0,
+      );
+      // Idle is the barrier either way: nothing live ends the run and the
+      // harness with it; work still live is handed to a parked harness
+      // when there is one, else the run keeps waiting for it.
+      if (
+        sessionState === "idle" &&
+        pendingWait &&
+        (tracker.liveTasks().length === 0 || (await tryPark()))
+      )
+        break;
 
-      if (isCancelled) {
-        debugClaude(
-          "★ run.cancelled (%dms since execute start) reason=%s",
-          Date.now() - executeStartedAt,
-          lastTerminalReason,
-        );
-        sink.cancel({
-          text: finalText,
-          costData: extractClaudeCostData(rawPayloads),
-        });
-      } else if (isError) {
-        debugClaude(
-          "★ run.error (%dms since execute start) reason=%s",
-          Date.now() - executeStartedAt,
-          lastTerminalReason,
-        );
-        sink.fail(
-          new Error(
-            finalText ||
-              `claude-code run failed (terminal_reason: ${lastTerminalReason})`,
-          ),
-        );
-      } else {
-        debugClaude(
-          "★ run.completed (%dms since execute start) chars=%d",
-          Date.now() - executeStartedAt,
-          finalText.length,
-        );
+      if (message.type === "system") {
+        // The CLI surfaces several message variants under `type: "system"`:
+        // `init` (SDKSystemMessage), `hook_started`/`hook_response`
+        // (SDKHookStartedMessage / SDKHookResponseMessage), and others.
+        // Discriminate on `subtype` against the union so each branch
+        // narrows correctly.
+        const sub = (message as { subtype?: string }).subtype;
+        if (sub === "init") {
+          const sys = message as SDKSystemMessage;
+          // Session id is already set on the sink (pre-minted before
+          // POSTing /start). The init message arrives confirming what
+          // claude assigned — should match `presetSessionId`.
+          if (
+            request.run.goal &&
+            !sys.slash_commands.some(
+              (command) => command.replace(/^\//, "") === "goal",
+            )
+          ) {
+            await cleanup();
+            throw new Error(
+              "This Claude Code installation does not expose the native /goal command.",
+            );
+          }
+          if (sys.session_id) {
+            debugClaude(
+              "★ session.init session_id=%s (%dms)",
+              sys.session_id.slice(0, 8),
+              Date.now() - executeStartedAt,
+            );
+          }
+        } else if (sub === "hook_started") {
+          const h = message as SDKHookStartedMessage;
+          debugClaude(
+            "hook.started name=%s event=%s hook_id=%s",
+            h.hook_name,
+            h.hook_event,
+            h.hook_id,
+          );
+        } else if (sub === "hook_response") {
+          const h = message as SDKHookResponseMessage;
+          // `stderr` is where users typically `echo` from their hook
+          // commands (per Claude Code's hook protocol). Surface it
+          // verbatim so a misconfigured hook (e.g. `yarn` not on PATH)
+          // shows its real error message in agentbox DEBUG logs.
+          const stderr =
+            h.stderr && h.stderr.length > 0
+              ? h.stderr.replace(/\s+$/, "")
+              : undefined;
+          debugClaude(
+            "hook.response name=%s exit=%s outcome=%s%s",
+            h.hook_name,
+            h.exit_code,
+            h.outcome,
+            stderr ? ` stderr=${JSON.stringify(stderr).slice(0, 200)}` : "",
+          );
+        }
+        continue;
+      }
+
+      if (message.type === "stream_event") {
+        if (!firstStreamEventLogged) {
+          firstStreamEventLogged = true;
+          debugClaude(
+            "★ first stream_event (%dms since execute start)",
+            Date.now() - executeStartedAt,
+          );
+        }
+        const partial = message as SDKPartialAssistantMessage;
+        // Subagent partials (forwarded when `forwardSubagentText` is on)
+        // must not leak into the main run's normalized text/reasoning
+        // stream or its accumulated final-answer fallback. The raw event
+        // already carries the nested transcript for assembler consumers.
+        if (partial.parent_tool_use_id) continue;
+        // A new main-agent message resets the accumulated fallback text so
+        // cancelled/failed runs surface the latest message instead of a
+        // concatenation of every text delta in the run.
+        const streamType = (partial.event as { type?: string } | undefined)
+          ?.type;
+        if (streamType === "message_start") {
+          accumulatedText = "";
+          streamedThinkingChars = 0;
+        }
+        const { text, thinking } = extractStreamDeltas(partial);
+        if (thinking) {
+          streamedThinkingChars += thinking.length;
+          sink.emitEvent(
+            createNormalizedEvent(
+              "reasoning.delta",
+              { provider: request.provider, runId: request.runId },
+              { delta: thinking },
+            ),
+          );
+        }
+        if (text) {
+          if (!firstTextDeltaLogged) {
+            firstTextDeltaLogged = true;
+            debugClaude(
+              "★ first text delta (%dms since execute start)",
+              Date.now() - executeStartedAt,
+            );
+          }
+          accumulatedText += text;
+          sink.emitEvent(
+            createNormalizedEvent(
+              "text.delta",
+              { provider: request.provider, runId: request.runId },
+              { delta: text },
+            ),
+          );
+        }
+        continue;
+      }
+
+      if (message.type === "assistant") {
+        const asst = message as SDKAssistantMessage;
+        // Forwarded subagent messages (parent_tool_use_id set) are not part
+        // of the main conversation: emitting them as message.completed
+        // would surface the subagent's final answer as a top-level message
+        // (it is already rendered inside the Task tool's result).
+        if (asst.parent_tool_use_id) continue;
+        const thinking = extractAssistantThinking(asst);
+        // Thinking already streamed via thinking_delta events would be
+        // double-emitted here (the CLI repeats the full block content on
+        // the per-block assistant message). Only backfill when no deltas
+        // were observed for this message.
+        if (thinking && streamedThinkingChars === 0) {
+          sink.emitEvent(
+            createNormalizedEvent(
+              "reasoning.delta",
+              { provider: request.provider, runId: request.runId },
+              { delta: thinking },
+            ),
+          );
+        }
+        const text = extractAssistantText(asst);
         sink.emitEvent(
           createNormalizedEvent(
-            "run.completed",
+            "message.completed",
             { provider: request.provider, runId: request.runId },
-            { text: finalText },
+            {
+              text,
+              ...(asst.uuid ? { messageId: String(asst.uuid) } : {}),
+            },
           ),
         );
-        sink.complete({
-          text: finalText,
-          costData: extractClaudeCostData(rawPayloads),
-        });
+        continue;
       }
-    } finally {
-      pendingWait?.clear();
-      await cleanup();
+
+      if (message.type === "result") {
+        // A turn the parked harness began before this run's own: the harness
+        // moves on to the next one, and so does the run. Checked before any
+        // of it is recorded — a foreign turn is not this run's answer, and
+        // letting it set `sawResult`/`accumulatedText` would let a later
+        // transport failure settle this run on the previous turn's text.
+        // Nothing resets the fallback otherwise: `writeFrame` drops
+        // stream_event while parked, so no message_start ever arrives.
+        if (foreignResults > 0) {
+          foreignResults--;
+          accumulatedText = "";
+          streamedThinkingChars = 0;
+          continue;
+        }
+        sawResult = true;
+        const result = message as SDKResultMessage;
+        lastTerminalReason = result.terminal_reason;
+        lastIsError = result.is_error;
+        const resultText =
+          result.subtype === "success" ? result.result : accumulatedText;
+        if (resultText && resultText !== accumulatedText) {
+          accumulatedText = resultText;
+        }
+        const live = tracker.liveTasks();
+        // Nothing ever ran in the background: the turn end is the run end.
+        if (timeoutMs === 0 || !tracker.hasSeenBackgroundWork() || isAborted())
+          break;
+        // Stay open for live tasks and their queued notification turns.
+        // On current CLIs session_state_changed/idle is the completion
+        // barrier. Use the grace only if no session-state event was emitted.
+        debugClaude(
+          "★ turn ended with %d background task(s); waiting",
+          live.length,
+        );
+        endWait();
+        pendingWait = finishWait.watch(
+          new BackgroundWait(graceMs, Math.max(0, timeoutMs - waitedMs)),
+        );
+        pendingWait.setIdle(!sawSessionState && live.length === 0);
+        emitTasks(live, true);
+        continue;
+      }
     }
 
-}
+    if (expiry === "ceiling" || expiry === "finished") {
+      // Mirrors the CLI's own "Background tasks still running; terminating":
+      // stop what is left (best effort, bounded — an unanswered stop_task
+      // must not hold the run open) and complete with the last result.
+      const ids = tracker
+        .liveTasks()
+        .filter((task) => task.type !== "scheduled_wakeup")
+        .map((task) => task.id);
+      if (expiry === "ceiling")
+        debugClaude(
+          "★ background wait ceiling (%dms) hit; stopping %d task(s)",
+          timeoutMs,
+          ids.length,
+        );
+      else
+        debugClaude(
+          "★ host finished the background wait; stopping %d task(s)",
+          ids.length,
+        );
+      if (wait.stopTasks) {
+        await withTimeout(
+          wait.stopTasks(ids),
+          wait.stopTimeoutMs ?? STOP_TASKS_TIMEOUT_MS,
+        ).catch(() => undefined);
+      }
+    } else if (expiry === "grace") {
+      debugClaude("★ background set emptied with no follow-up turn; settling");
+    }
+    if (pendingWait) {
+      // However the wait ended, nothing is pending once the run settles;
+      // parked work goes on, and the last event says so.
+      endWait();
+      if (parked) emitTasks(tracker.liveTasks(), false, true);
+      else emitTasks([], false);
+    }
+    // A parked harness must survive this run: leave without winding it down.
+    if (parked && wait.detach) {
+      await wait.detach();
+      leave = wait.detach;
+    } else await cleanup();
+    // An attach that found nothing parked has no turn to report.
+    if (nothingParked && !sawResult) sawResult = true;
+    if (!sawResult && !wasCancelled())
+      throw new Error("Claude Code closed before reporting a result");
+    const finalText = accumulatedText;
+    const isCancelled = isAborted();
+    // is_error is the authoritative error signal — it covers both
+    // explicit error subtypes and cases where subtype=success but
+    // the run failed (e.g. auth errors after retries exhausted).
+    // Cancel is checked first since aborted runs also have is_error=true.
+    const isError = !isCancelled && lastIsError;
 
+    if (isCancelled) {
+      debugClaude(
+        "★ run.cancelled (%dms since execute start) reason=%s",
+        Date.now() - executeStartedAt,
+        lastTerminalReason,
+      );
+      sink.cancel({
+        text: finalText,
+        costData: extractClaudeCostData(rawPayloads),
+      });
+    } else if (isError) {
+      debugClaude(
+        "★ run.error (%dms since execute start) reason=%s",
+        Date.now() - executeStartedAt,
+        lastTerminalReason,
+      );
+      sink.fail(
+        new Error(
+          finalText ||
+            `claude-code run failed (terminal_reason: ${lastTerminalReason})`,
+        ),
+      );
+    } else {
+      debugClaude(
+        "★ run.completed (%dms since execute start) chars=%d",
+        Date.now() - executeStartedAt,
+        finalText.length,
+      );
+      sink.emitEvent(
+        createNormalizedEvent(
+          "run.completed",
+          { provider: request.provider, runId: request.runId },
+          { text: finalText },
+        ),
+      );
+      sink.complete({
+        text: finalText,
+        costData: extractClaudeCostData(rawPayloads),
+        // Told, not guessed: an attach that found nothing parked ran no turn
+        // at all, which from the outside looks exactly like a real tool-only
+        // turn that produced no answer text and no usage.
+        ...(nothingParked ? { nothingParked: true } : {}),
+      });
+    }
+  } finally {
+    pendingWait?.clear();
+    await leave();
+  }
+}
 
 /** Native transport owns its CLI process and uses the CLI's local sign-in. */
 export async function executeNativeClaude(
@@ -1650,7 +2265,10 @@ export async function executeNativeClaude(
 ): Promise<() => Promise<void>> {
   const { query } = await import("@anthropic-ai/claude-agent-sdk");
   const claudeDir = claudeConfigDir(request.options);
-  const input = await validateProviderUserInput(request.provider, request.run.input);
+  const input = await validateProviderUserInput(
+    request.provider,
+    request.run.input,
+  );
   const prompt = new AsyncQueue<SDKUserMessage>();
   const sessionId = request.run.resumeSessionId ?? randomUUID();
   const controller = new AbortController();
@@ -1659,29 +2277,56 @@ export async function executeNativeClaude(
   let processHandle: SpawnedProcess | undefined;
   let stopped: Promise<void> | undefined;
   let cancelled = false;
-  const stop = () => stopped ??= (async () => {
-    prompt.finish();
-    handle?.close();
-    controller.abort();
-    if (processHandle) await processHandle.kill();
-  })();
-  sink.setAbort(async () => { cancelled = true; await stop(); });
+  const stop = () =>
+    (stopped ??= (async () => {
+      prompt.finish();
+      handle?.close();
+      controller.abort();
+      if (processHandle) await processHandle.kill();
+    })());
+  sink.setAbort(async () => {
+    cancelled = true;
+    await stop();
+  });
   sink.setSessionId(sessionId);
   const messageId = randomUUID();
-  prompt.push({ type: "user", uuid: messageId, message: { role: "user", content: mapToClaudeUserContent(input) as SDKUserMessage["message"]["content"] }, parent_tool_use_id: null });
-  const hostEnv = Object.fromEntries(Object.entries({ ...process.env, ...request.options.env }).filter((entry): entry is [string, string] => entry[1] !== undefined));
+  prompt.push({
+    type: "user",
+    uuid: messageId,
+    message: {
+      role: "user",
+      content: mapToClaudeUserContent(
+        input,
+      ) as SDKUserMessage["message"]["content"],
+    },
+    parent_tool_use_id: null,
+  });
+  const hostEnv = Object.fromEntries(
+    Object.entries({ ...process.env, ...request.options.env }).filter(
+      (entry): entry is [string, string] => entry[1] !== undefined,
+    ),
+  );
   applyCliBackgroundWaitCeiling(hostEnv);
   hostEnv.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS ??= "1";
   if (request.options.customHeaders) {
-    const headers = Object.entries(request.options.customHeaders).map(([name, value]) => `${name}: ${value}`).join("\n");
-    hostEnv.ANTHROPIC_CUSTOM_HEADERS = [hostEnv.ANTHROPIC_CUSTOM_HEADERS, headers].filter(Boolean).join("\n");
+    const headers = Object.entries(request.options.customHeaders)
+      .map(([name, value]) => `${name}: ${value}`)
+      .join("\n");
+    hostEnv.ANTHROPIC_CUSTOM_HEADERS = [
+      hostEnv.ANTHROPIC_CUSTOM_HEADERS,
+      headers,
+    ]
+      .filter(Boolean)
+      .join("\n");
   }
   const options = buildClaudeQueryOptions({
     request,
-    ...(request.options.configuration === "native" ? {} : {
-      settingsPath: path.join(claudeDir, "settings.json"),
-      mcpConfigPath: path.join(claudeDir, "agentbox-mcp.json"),
-    }),
+    ...(request.options.configuration === "native"
+      ? {}
+      : {
+          settingsPath: path.join(claudeDir, "settings.json"),
+          mcpConfigPath: path.join(claudeDir, "agentbox-mcp.json"),
+        }),
     // Auth is deliberately CLI-owned. Never copy the user's credential files
     // into the generated configuration directory or a task artifact.
     env: hostEnv,
@@ -1690,64 +2335,165 @@ export async function executeNativeClaude(
   const interactiveQuestions = hasInteractiveQuestions(request.options);
   let planning = options.permissionMode === "plan";
   try {
-    handle = query({ prompt, options: {
-      ...options,
-      // Use the SDK-matched CLI by default; an installed CLI is an explicit override.
-      pathToClaudeCodeExecutable: request.options.provider?.binary,
-      abortController: controller,
-      // `sessionId` is rejected alongside `resume` unless `forkSession` is
-      // set, where it names the forked session. Stamping it on forks keeps
-      // the pre-minted id reported via `sink.setSessionId` truthful, so a
-      // later run can resume the fork.
-      ...(request.run.resumeSessionId ? {} : { sessionId }),
-      ...(request.options.configuration === "native" ? {} : { plugins: [{ type: "local" as const, path: claudeDir }] }),
-      spawnClaudeCodeProcess(spawnOptions) {
-        if (cancelled || controller.signal.aborted) throw new Error("Local run was cancelled before startup");
-        processHandle = spawnCommand({ ...spawnOptions, processGroup: request.options.processGroup !== "inherited" });
-        return processHandle.child;
-      },
-      hooks: { ...options.hooks, PreToolUse: [...(options.hooks?.PreToolUse ?? []), { hooks: [async (input) => {
-        if (input.hook_event_name !== "PreToolUse") return {};
-        planning = input.permission_mode === "plan";
-        return interactiveQuestions && ["AskUserQuestion", "ExitPlanMode"].includes(input.tool_name)
-          ? { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask" as const } } : {};
-      }] }] },
-      async canUseTool(toolName, input, context) {
-        if (cancelled || context.signal.aborted) return { behavior: "deny", message: "Run cancelled", interrupt: true };
-        const isQuestion = toolName === "AskUserQuestion";
-        const isPlan = toolName === "ExitPlanMode";
-        if ((isQuestion || isPlan) && !interactiveQuestions) return { behavior: "deny", message: "No interactive user is available." };
-        if (!isQuestion && !isPlan && planning && toolName !== "EnterPlanMode") return { behavior: "deny", message: "Finish planning before requesting write access." };
-        if (!isQuestion && !isPlan && autoApprove) return { behavior: "allow", updatedInput: input };
-        try {
-          const response = await sink.requestPermission({
-            type: "permission.requested", provider: request.provider, runId: request.runId,
-            timestamp: new Date().toISOString(), requestId: context.toolUseID,
-            kind: isQuestion ? "question" : isPlan ? "plan" : "tool", toolName,
-            ...(isQuestion ? { questions: normalizeUserQuestions("claude-code", input) } : {}),
-            title: isQuestion ? "Your input is needed" : isPlan ? "Review the plan" : context.title ?? `Allow ${toolName}?`,
-            message: context.description ?? context.decisionReason, input, canRemember: false,
+    handle = query({
+      prompt,
+      options: {
+        ...options,
+        // Use the SDK-matched CLI by default; an installed CLI is an explicit override.
+        pathToClaudeCodeExecutable: request.options.provider?.binary,
+        abortController: controller,
+        // `sessionId` is rejected alongside `resume` unless `forkSession` is
+        // set, where it names the forked session. Stamping it on forks keeps
+        // the pre-minted id reported via `sink.setSessionId` truthful, so a
+        // later run can resume the fork.
+        ...(request.run.resumeSessionId ? {} : { sessionId }),
+        ...(request.options.configuration === "native"
+          ? {}
+          : { plugins: [{ type: "local" as const, path: claudeDir }] }),
+        spawnClaudeCodeProcess(spawnOptions) {
+          if (cancelled || controller.signal.aborted)
+            throw new Error("Local run was cancelled before startup");
+          processHandle = spawnCommand({
+            ...spawnOptions,
+            processGroup: request.options.processGroup !== "inherited",
           });
-          if (isPlan && response.decision === "allow") planning = false;
-          if (!cancelled && !context.signal.aborted && response.decision === "allow") return {
-            behavior: "allow",
-            updatedInput: isQuestion ? { ...input, answers: questionReply("claude-code", input, response.answers ?? []) } : input,
-          };
-          return { behavior: "deny", message: "The user denied this action" };
-        } catch {
-          return { behavior: "deny", message: "Run cancelled", interrupt: true };
-        }
+          return processHandle.child;
+        },
+        hooks: {
+          ...options.hooks,
+          PreToolUse: [
+            ...(options.hooks?.PreToolUse ?? []),
+            {
+              hooks: [
+                async (input) => {
+                  if (input.hook_event_name !== "PreToolUse") return {};
+                  planning = input.permission_mode === "plan";
+                  return interactiveQuestions &&
+                    ["AskUserQuestion", "ExitPlanMode"].includes(
+                      input.tool_name,
+                    )
+                    ? {
+                        hookSpecificOutput: {
+                          hookEventName: "PreToolUse" as const,
+                          permissionDecision: "ask" as const,
+                        },
+                      }
+                    : {};
+                },
+              ],
+            },
+          ],
+        },
+        async canUseTool(toolName, input, context) {
+          if (cancelled || context.signal.aborted)
+            return {
+              behavior: "deny",
+              message: "Run cancelled",
+              interrupt: true,
+            };
+          const isQuestion = toolName === "AskUserQuestion";
+          const isPlan = toolName === "ExitPlanMode";
+          if ((isQuestion || isPlan) && !interactiveQuestions)
+            return {
+              behavior: "deny",
+              message: "No interactive user is available.",
+            };
+          if (
+            !isQuestion &&
+            !isPlan &&
+            planning &&
+            toolName !== "EnterPlanMode"
+          )
+            return {
+              behavior: "deny",
+              message: "Finish planning before requesting write access.",
+            };
+          if (!isQuestion && !isPlan && autoApprove)
+            return { behavior: "allow", updatedInput: input };
+          try {
+            const response = await sink.requestPermission({
+              type: "permission.requested",
+              provider: request.provider,
+              runId: request.runId,
+              timestamp: new Date().toISOString(),
+              requestId: context.toolUseID,
+              kind: isQuestion ? "question" : isPlan ? "plan" : "tool",
+              toolName,
+              ...(isQuestion
+                ? { questions: normalizeUserQuestions("claude-code", input) }
+                : {}),
+              title: isQuestion
+                ? "Your input is needed"
+                : isPlan
+                  ? "Review the plan"
+                  : (context.title ?? `Allow ${toolName}?`),
+              message: context.description ?? context.decisionReason,
+              input,
+              canRemember: false,
+            });
+            if (isPlan && response.decision === "allow") planning = false;
+            if (
+              !cancelled &&
+              !context.signal.aborted &&
+              response.decision === "allow"
+            )
+              return {
+                behavior: "allow",
+                updatedInput: isQuestion
+                  ? {
+                      ...input,
+                      answers: questionReply(
+                        "claude-code",
+                        input,
+                        response.answers ?? [],
+                      ),
+                    }
+                  : input,
+              };
+            return { behavior: "deny", message: "The user denied this action" };
+          } catch {
+            return {
+              behavior: "deny",
+              message: "Run cancelled",
+              interrupt: true,
+            };
+          }
+        },
       },
-    } });
+    });
     const live = handle;
     sink.setRaw({ query: live, claudeDir, runId: request.runId });
-    sink.emitEvent(createNormalizedEvent("run.started", { provider: request.provider, runId: request.runId }));
-    sink.emitEvent(createNormalizedEvent("message.started", { provider: request.provider, runId: request.runId }, { messageId }));
-    await consumeClaudeMessages(request, sink, live, Date.now(), stop, () => cancelled, {
-      ...wait,
-      // Native owns the CLI: ask it to stop leftover tasks before closing it.
-      stopTasks: async (ids) => { await Promise.all(ids.map((id) => live.stopTask(id).catch(() => undefined))); },
-    }, tracker);
+    sink.emitEvent(
+      createNormalizedEvent("run.started", {
+        provider: request.provider,
+        runId: request.runId,
+      }),
+    );
+    sink.emitEvent(
+      createNormalizedEvent(
+        "message.started",
+        { provider: request.provider, runId: request.runId },
+        { messageId },
+      ),
+    );
+    await consumeClaudeMessages(
+      request,
+      sink,
+      live,
+      Date.now(),
+      stop,
+      () => cancelled,
+      {
+        ...wait,
+        // Native owns the CLI: ask it to stop leftover tasks before closing it.
+        stopTasks: async (ids) => {
+          await Promise.all(
+            ids.map((id) => live.stopTask(id).catch(() => undefined)),
+          );
+        },
+      },
+      tracker,
+    );
   } catch (error) {
     await stop();
     if (cancelled) sink.cancel();

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   BackgroundTaskTracker,
+  BackgroundWait,
+  BackgroundWaitFinish,
   DEFAULT_BACKGROUND_TASK_TIMEOUT_MS,
   applyCliBackgroundWaitCeiling,
   resolveBackgroundTaskTimeoutMs,
@@ -230,6 +232,65 @@ describe("BackgroundTaskTracker", () => {
   });
 });
 
+describe("a CLI that emits no task snapshot", () => {
+  // Claude Code 2.1.197 (and anything older than `background_tasks_changed`)
+  // reports a foreground command being moved to the background as two edges
+  // and no snapshot. Frames below are copied verbatim from a live 2.1.197
+  // sandbox run. Missing this promotion means the run never learns work is
+  // live, settles at the turn end, and the CLI is torn down with it.
+  const started = system("task_started", {
+    task_id: "b4nk77xvy",
+    description: "Run background test node script in foreground",
+    task_type: "local_bash",
+  });
+  const promoted = system("task_updated", {
+    task_id: "b4nk77xvy",
+    patch: { is_backgrounded: true },
+  });
+
+  it("tracks a foreground command promoted to the background", () => {
+    const tracker = new BackgroundTaskTracker();
+    tracker.ingest(started);
+    // Not background work yet: a foreground command is just the turn.
+    expect(ids(tracker)).toEqual([]);
+    expect(tracker.hasSeenBackgroundWork()).toBe(false);
+    tracker.ingest(promoted);
+    expect(ids(tracker)).toEqual(["b4nk77xvy"]);
+    expect(tracker.hasSeenBackgroundWork()).toBe(true);
+    // The description and type come from `task_started`; the patch has neither.
+    expect(tracker.liveTasks()[0]).toEqual({
+      id: "b4nk77xvy",
+      type: "local_bash",
+      description: "Run background test node script in foreground",
+    });
+  });
+
+  it("drops it again when it finishes", () => {
+    const tracker = new BackgroundTaskTracker();
+    tracker.ingest(started);
+    tracker.ingest(promoted);
+    tracker.ingest(system("task_notification", { task_id: "b4nk77xvy", status: "completed" }));
+    expect(ids(tracker)).toEqual([]);
+    // Still true: the run has to stay open for the turn the CLI queues for it.
+    expect(tracker.hasSeenBackgroundWork()).toBe(true);
+  });
+
+  it("never lets a promotion resurrect work a snapshot already accounted for", () => {
+    const tracker = new BackgroundTaskTracker();
+    tracker.ingest(started);
+    tracker.ingest(changed([]));
+    tracker.ingest(promoted);
+    expect(ids(tracker)).toEqual([]);
+  });
+
+  it("ignores a subagent's own foreground command", () => {
+    const tracker = new BackgroundTaskTracker();
+    tracker.ingest(system("task_started", { task_id: "sub1", owned_by_subagent: true }));
+    tracker.ingest(system("task_updated", { task_id: "sub1", patch: { is_backgrounded: true } }));
+    expect(ids(tracker)).toEqual([]);
+  });
+});
+
 describe("background task settings", () => {
   it("resolves the timeout with a 30 minute default and rejects negatives", () => {
     expect(DEFAULT_BACKGROUND_TASK_TIMEOUT_MS).toBe(30 * 60_000);
@@ -247,5 +308,60 @@ describe("background task settings", () => {
     const custom = { CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: "0" };
     applyCliBackgroundWaitCeiling(custom);
     expect(custom.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS).toBe("0");
+  });
+});
+
+describe("finishing a background wait on the host's request", () => {
+  it("ends the current wait as finished, ahead of the grace and the ceiling", async () => {
+    const wait = new BackgroundWait(60_000, 60_000);
+    wait.setIdle(true);
+    const finish = new BackgroundWaitFinish();
+    finish.watch(wait);
+    finish.request();
+    await expect(wait.expired).resolves.toBe("finished");
+    wait.clear();
+  });
+
+  it("latches a request made mid-turn so the next wait ends at once", async () => {
+    const finish = new BackgroundWaitFinish();
+    finish.request();
+    const wait = finish.watch(new BackgroundWait(60_000, 60_000));
+    await expect(wait.expired).resolves.toBe("finished");
+    wait.clear();
+  });
+
+  it("leaves a wait alone until asked, and never touches one it stopped following", async () => {
+    const finish = new BackgroundWaitFinish();
+    const resumed = finish.watch(new BackgroundWait(60_000, 5));
+    // A follow-up turn started: the run dropped that wait.
+    finish.watch(undefined);
+    await expect(resumed.expired).resolves.toBe("ceiling");
+    resumed.clear();
+  });
+});
+
+describe("attaching to a parked harness", () => {
+  it("restores what was live so the first result is not mistaken for the end of the run", () => {
+    const tracker = new BackgroundTaskTracker();
+    expect(tracker.hasSeenBackgroundWork()).toBe(false);
+    tracker.restore([
+      { id: "bg1", type: "local_bash", description: "slow search" },
+      { id: "toolu_wake", type: "scheduled_wakeup", description: "check the deploy" },
+    ]);
+    expect(tracker.hasSeenBackgroundWork()).toBe(true);
+    expect(tracker.liveTasks().map((task) => task.id)).toEqual(["bg1", "toolu_wake"]);
+    // What replays afterwards supersedes it: a snapshot replaces the tasks,
+    // a fired schedule consumes the wake-up.
+    tracker.ingest(system("background_tasks_changed", { tasks: [] }));
+    expect(tracker.liveTasks().map((task) => task.id)).toEqual(["toolu_wake"]);
+    tracker.ingest({ type: "command_lifecycle", state: "started" });
+    expect(tracker.liveTasks()).toEqual([]);
+  });
+
+  it("restoring nothing leaves an ordinary run ordinary", () => {
+    const tracker = new BackgroundTaskTracker();
+    tracker.restore([]);
+    expect(tracker.hasSeenBackgroundWork()).toBe(false);
+    expect(tracker.liveTasks()).toEqual([]);
   });
 });

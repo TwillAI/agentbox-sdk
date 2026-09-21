@@ -1,0 +1,192 @@
+[
+  {
+    "type": "system",
+    "state": "running",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "init",
+    "session_id": "s",
+    "slash_commands": []
+  },
+  {
+    "type": "system",
+    "state": "requires_action",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "state": "running",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "task_started",
+    "task_id": "brwfi3g8f",
+    "task_type": "local_bash",
+    "description": "Search both repos for \"gotta go\" occurrences",
+    "is_backgrounded": false
+  },
+  {
+    "type": "system",
+    "status": "completed",
+    "subtype": "task_notification",
+    "task_id": "brwfi3g8f"
+  },
+  {
+    "type": "system",
+    "state": "requires_action",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "state": "running",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "task_started",
+    "task_id": "b7ijs7ayg",
+    "task_type": "local_bash",
+    "description": "Show all \"gotta go\" matching lines",
+    "is_backgrounded": false
+  },
+  {
+    "type": "system",
+    "tasks": [
+      {
+        "task_id": "b7ijs7ayg",
+        "task_type": "local_bash",
+        "description": "Show all \"gotta go\" matching lines"
+      }
+    ],
+    "subtype": "background_tasks_changed"
+  },
+  {
+    "type": "system",
+    "patch": {
+      "is_backgrounded": true
+    },
+    "subtype": "task_updated",
+    "task_id": "b7ijs7ayg"
+  },
+  {
+    "type": "system",
+    "state": "requires_action",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "state": "running",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "state": "requires_action",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "state": "running",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "state": "requires_action",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "state": "running",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "state": "requires_action",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "state": "running",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "state": "requires_action",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "state": "running",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "task_started",
+    "task_id": "bsdh57t2m",
+    "task_type": "local_bash",
+    "description": "Verify spec edit, diff, and typecheck the changed component",
+    "is_backgrounded": false
+  },
+  {
+    "type": "system",
+    "status": "completed",
+    "subtype": "task_notification",
+    "task_id": "bsdh57t2m"
+  },
+  {
+    "type": "result",
+    "subtype": "success",
+    "is_error": false,
+    "terminal_reason": "completed",
+    "result": "Renamed the button."
+  },
+  {
+    "type": "system",
+    "state": "idle",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "tasks": [],
+    "subtype": "background_tasks_changed"
+  },
+  {
+    "type": "system",
+    "patch": {
+      "status": "completed"
+    },
+    "subtype": "task_updated",
+    "task_id": "b7ijs7ayg"
+  },
+  {
+    "type": "system",
+    "status": "completed",
+    "subtype": "task_notification",
+    "task_id": "b7ijs7ayg"
+  },
+  {
+    "type": "system",
+    "state": "running",
+    "subtype": "session_state_changed"
+  },
+  {
+    "type": "system",
+    "subtype": "init",
+    "session_id": "s",
+    "slash_commands": []
+  },
+  {
+    "type": "result",
+    "subtype": "success",
+    "is_error": false,
+    "terminal_reason": "completed",
+    "result": "The slow search finished; nothing else to change."
+  },
+  {
+    "type": "system",
+    "state": "idle",
+    "subtype": "session_state_changed"
+  }
+]

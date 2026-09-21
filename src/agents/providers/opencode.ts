@@ -23,6 +23,8 @@ import { isInteractiveApproval, hasInteractiveQuestions } from "../approval";
 import {
   BACKGROUND_TASK_GRACE_MS,
   BackgroundWait,
+  BackgroundWaitFinish,
+  type BackgroundWaitExpiry,
   resolveBackgroundTaskTimeoutMs,
   withTimeout,
 } from "../background-tasks";
@@ -1186,7 +1188,11 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
     let pendingWait: BackgroundWait | undefined;
     // Time already spent waiting: the ceiling bounds the run, not each wait.
     let waitedMs = 0;
-    let expiry: "grace" | "ceiling" | "transport" | undefined;
+    let expiry: BackgroundWaitExpiry | "transport" | undefined;
+    // The host moved on (finishBackgroundWait): latched, so a request made
+    // while the parent is busy ends the wait its next idle would start.
+    const finishWait = new BackgroundWaitFinish();
+    sink.setFinishBackgroundWait?.(() => finishWait.request());
     let sawParentIdle = false;
     let lastTasksKey = JSON.stringify({ tasks: [], waiting: false });
     const emitTasks = (tasks: BackgroundTask[], waiting: boolean) => {
@@ -1205,7 +1211,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
       if (!pendingWait) return;
       waitedMs += pendingWait.elapsedMs();
       pendingWait.clear();
-      pendingWait = undefined;
+      pendingWait = finishWait.watch(undefined);
     };
     const onChildrenChanged = () => {
       if (!pendingWait) return;
@@ -1287,6 +1293,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
         expiry = reason;
         resolveSessionTerminal();
       });
+      finishWait.watch(wait);
       emitTasks(live, true);
     };
     // opencode re-ran the parent (the child's result was injected): the run
@@ -2055,6 +2062,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
       // is left (best effort). The abort handler already did on cancel.
       if (
         expiry === "ceiling" ||
+        expiry === "finished" ||
         ((sessionErrorFromSse || dispatchError) && liveChildren().length > 0)
       ) {
         debugOpencode(
