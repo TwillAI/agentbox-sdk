@@ -4,6 +4,39 @@ import { ProviderLogAssembler } from "../src/events";
 
 const MSG_ID = "msg_01abc";
 
+describe("Claude message model metadata", () => {
+  it("preserves synthetic goal identity through assembly and replay", () => {
+    const assembler = new ProviderLogAssembler();
+    const [goal] = assembler.process("claude-code", {
+      type: "assistant",
+      message: {
+        id: "goal",
+        model: "<synthetic>",
+        content: [{ type: "text", text: "Goal set: ship it" }],
+      },
+    });
+    expect(goal?.message).toMatchObject({ model: "<synthetic>" });
+    const replay = new ProviderLogAssembler();
+    replay.seedFromSnapshots("claude-code", assembler.getSnapshots("claude-code"));
+    const [updated] = replay.process("claude-code", {
+      type: "assistant",
+      message: {
+        id: "goal",
+        content: [{ type: "text", text: "Goal set: ship it today" }],
+      },
+    });
+    expect(updated?.message).toMatchObject({ model: "<synthetic>" });
+  });
+
+  it("retains the streamed model on subsequent content deltas", () => {
+    const assembler = new ProviderLogAssembler();
+    const [start] = assembler.process("claude-code", streamStart(MSG_ID));
+    expect(start?.message).toMatchObject({ model: "claude-sonnet" });
+    const [delta] = assembler.process("claude-code", streamTextDelta("Hello"));
+    expect(delta?.message).toMatchObject({ model: "claude-sonnet" });
+  });
+});
+
 function streamStart(messageId: string) {
   return {
     type: "stream_event",

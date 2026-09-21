@@ -729,6 +729,7 @@ function isClaudeNoiseEvent(event: JsonRecord): boolean {
 
 class ClaudeCodeLogAssembler {
   private currentMessageId: string | null = null;
+  private readonly modelByMessageId = new Map<string, string>();
   private readonly textByMessageId = new Map<string, string>();
   private readonly thinkingByMessageId = new Map<string, string>();
   private readonly parentToolUseIdByMessageId = new Map<
@@ -778,6 +779,9 @@ class ClaudeCodeLogAssembler {
           message && typeof message.id === "string" ? message.id : null;
         if (!id) return [];
         this.currentMessageId = id;
+        if (typeof message?.model === "string") {
+          this.modelByMessageId.set(id, message.model);
+        }
         this.setParentToolUseId(id, event);
         if (!this.textByMessageId.has(id)) this.textByMessageId.set(id, "");
         if (!this.thinkingByMessageId.has(id))
@@ -825,6 +829,9 @@ class ClaudeCodeLogAssembler {
         return [this.pushPassThrough(event)];
       }
 
+      if (typeof message.model === "string") {
+        this.modelByMessageId.set(id, message.model);
+      }
       this.setParentToolUseId(id, event);
       const final = extractClaudeAssistantContent(message);
       // The CLI emits one `assistant` SDKMessage PER CONTENT BLOCK (all
@@ -868,6 +875,7 @@ class ClaudeCodeLogAssembler {
 
   seed(snapshots: JsonRecord[]): void {
     this.currentMessageId = null;
+    this.modelByMessageId.clear();
     this.textByMessageId.clear();
     this.thinkingByMessageId.clear();
     this.parentToolUseIdByMessageId.clear();
@@ -906,6 +914,9 @@ class ClaudeCodeLogAssembler {
           : null;
       this.parentToolUseIdByMessageId.set(messageId, parentToolUseId);
       const message = isRecord(snapshot.message) ? snapshot.message : null;
+      if (typeof message?.model === "string") {
+        this.modelByMessageId.set(messageId, message.model);
+      }
       const content =
         message && Array.isArray(message.content) ? message.content : [];
       let text = "";
@@ -983,6 +994,9 @@ class ClaudeCodeLogAssembler {
       message: {
         id: messageId,
         role: "assistant",
+        ...(this.modelByMessageId.has(messageId)
+          ? { model: this.modelByMessageId.get(messageId) }
+          : {}),
         content,
       },
     };
