@@ -5,9 +5,11 @@ import type {
   AgentUserQuestion,
   AgentUserAnswer,
 } from "../agents/types";
+import type { HarnessCommandDescriptor } from "../agents/harness-commands";
 
 export type NormalizedAgentEventType =
   | "plan.completed"
+  | "harness.commands"
   | "run.started"
   | "message.started"
   | "message.injected"
@@ -164,8 +166,20 @@ export interface NativePlanEvent extends NormalizedAgentEventBase {
   text: string;
 }
 
+/**
+ * Slash commands the harness reports for this session: built-ins usable
+ * headlessly plus the skills, custom commands, plugin commands, and MCP
+ * prompts discovered in its environment. Emitted once a run knows them
+ * (Claude Code `system/init`, Codex `skills/list`, OpenCode `GET /command`).
+ */
+export interface HarnessCommandsEvent extends NormalizedAgentEventBase {
+  type: "harness.commands";
+  commands: HarnessCommandDescriptor[];
+}
+
 export type NormalizedAgentEvent =
   | NativePlanEvent
+  | HarnessCommandsEvent
   | RunStartedEvent
   | MessageStartedEvent
   | MessageInjectedEvent

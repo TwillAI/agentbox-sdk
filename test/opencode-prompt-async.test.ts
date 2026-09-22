@@ -17,6 +17,7 @@ type SseFrame = { event: string; data: unknown; id?: string };
 interface FakeOpenCodeServer {
   baseUrl: string;
   promptAsyncRequests: Array<{ body: unknown; sessionId: string }>;
+  commandRequests: Array<{ body: unknown; sessionId: string }>;
   permissionResponses: Array<{
     sessionId: string;
     permissionId: string;
@@ -52,6 +53,7 @@ async function startFakeOpenCodeServer(): Promise<FakeOpenCodeServer> {
   const fake: FakeOpenCodeServer = {
     baseUrl: "",
     promptAsyncRequests,
+    commandRequests: [],
     permissionResponses,
     questionResponses,
     sessions,
@@ -99,6 +101,24 @@ async function startFakeOpenCodeServer(): Promise<FakeOpenCodeServer> {
     if (method === "GET" && url === "/session") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(sessions));
+      return;
+    }
+
+    if (method === "GET" && url === "/command") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify([{ name: "inspect" }]));
+      return;
+    }
+    if (method === "GET" && url === "/skill") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("[]");
+      return;
+    }
+    const commandMatch = url.match(/^\/session\/([^/]+)\/command$/);
+    if (method === "POST" && commandMatch) {
+      fake.commandRequests.push({ body: await readJson(req), sessionId: decodeURIComponent(commandMatch[1] ?? "") });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
       return;
     }
 
@@ -285,6 +305,41 @@ describe("opencode prompt_async + SSE", () => {
       await fake.close();
       fake = undefined;
     }
+  });
+
+  it("forwards image and file attachments to configured commands", async () => {
+    fake = await startFakeOpenCodeServer();
+    const { sink, finished } = makeCapturingSink();
+    const image = "data:image/png;base64,AAAA";
+    const file = "data:text/plain;base64,aGVsbG8=";
+    const executing = new OpenCodeAgentAdapter().execute(makeRequest({
+      options: { cwd: "/tmp", sandbox: makeFakeSandbox(fake.baseUrl) },
+      run: {
+        input: [{ type: "text", text: "/inspect explain attachments" }, { type: "image", image }, { type: "file", data: file, filename: "notes.txt", mediaType: "text/plain" }],
+        command: { name: "inspect", args: "explain attachments" },
+        model: "openai/gpt-5",
+      },
+    }), sink);
+    await vi.waitFor(() => expect(fake!.commandRequests).toHaveLength(1));
+    expect(fake.commandRequests[0]?.body).toMatchObject({
+      command: "inspect", arguments: "explain attachments", model: "openai/gpt-5",
+      parts: [{ type: "file", mime: "image/png", url: image }, { type: "file", mime: "text/plain", url: file, filename: "notes.txt" }],
+    });
+    expect(fake.promptAsyncRequests).toEqual([]);
+    fake.pushEvent({ event: "session.idle", data: { type: "session.idle", properties: { sessionID: "ses_test" } } });
+    expect((await finished).kind).toBe("complete");
+    await executing;
+  });
+
+  it("rejects command system overrides before dispatching any work", async () => {
+    fake = await startFakeOpenCodeServer();
+    const { sink } = makeCapturingSink();
+    await expect(new OpenCodeAgentAdapter().execute(makeRequest({
+      options: { cwd: "/tmp", sandbox: makeFakeSandbox(fake.baseUrl) },
+      run: { input: "/inspect", command: { name: "inspect", args: "" }, systemPrompt: "Only inspect packages/api." },
+    }), sink)).rejects.toThrow("OpenCode commands do not support a per-run systemPrompt");
+    expect(fake.commandRequests).toEqual([]);
+    expect(fake.promptAsyncRequests).toEqual([]);
   });
 
   it("runs a turn end-to-end via prompt_async and SSE session.idle", async () => {

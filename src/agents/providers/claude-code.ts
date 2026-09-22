@@ -24,6 +24,7 @@ import {
 } from "../../events";
 import { sleep } from "../../shared/network";
 import { shellQuote } from "../../shared/shell";
+import { claudeHarnessCommands } from "../harness-commands";
 import {
   AgentProvider,
   type AgentAttachRequest,
@@ -1986,6 +1987,15 @@ async function consumeClaudeMessages(
               "This Claude Code installation does not expose the native /goal command.",
             );
           }
+          // The headless CLI lists the commands and skills of this
+          // environment once per session; hosts use it for their `/` menu.
+          sink.emitEvent(
+            createNormalizedEvent(
+              "harness.commands",
+              { provider: request.provider, runId: request.runId },
+              { commands: claudeHarnessCommands(sys) },
+            ),
+          );
           if (sys.session_id) {
             debugClaude(
               "★ session.init session_id=%s (%dms)",

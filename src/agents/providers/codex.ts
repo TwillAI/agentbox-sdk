@@ -20,6 +20,13 @@ import {
 } from "../types";
 import { SandboxProvider } from "../../sandboxes/types";
 import { isInteractiveApproval, hasInteractiveQuestions } from "../approval";
+import {
+  builtinHarnessCommands,
+  codexHarnessCommands,
+  codexSkillMention,
+  type HarnessCommandDescriptor,
+  type HarnessCommandInvocation,
+} from "../harness-commands";
 import { normalizeUserQuestions, questionReply } from "../questions";
 import {
   joinTextParts,
@@ -210,6 +217,22 @@ export function buildCodexSandboxMode(
   return options.fullAccess ? "danger-full-access" : options.provider?.sandboxMode ?? (options.configuration === "native" ? undefined : options.sandbox ? "workspace-write" : "read-only");
 }
 
+/**
+ * Thread-level config overrides, same shape as `codex -c key=value`.
+ *
+ * `effort` is turn-scoped in the protocol, and `thread/compact/start` and
+ * `review/start` take no parameters beyond the thread (and a review
+ * target), so their server-started turns run at the thread default. Naming
+ * the effort here makes that default match what the run asked for. The
+ * active collaboration mode has no such knob — it is turn-scoped with no
+ * config equivalent — so compact and review always run in the default mode.
+ */
+function buildCodexThreadConfig(request: AgentExecutionRequest<"codex">) {
+  return request.run.reasoning
+    ? { config: { model_reasoning_effort: request.run.reasoning } }
+    : {};
+}
+
 function buildThreadParams(
   cwd: string,
   options: AgentExecutionRequest<"codex">["options"],
@@ -221,6 +244,7 @@ function buildThreadParams(
     ...(request.options.provider?.serviceTier !== undefined ? { serviceTier: request.options.provider.serviceTier } : {}),
     ...(options.provider?.approvalPolicy ? { approvalPolicy: options.provider.approvalPolicy } : options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
     sandbox: buildCodexSandboxMode(options),
+    ...buildCodexThreadConfig(request),
     serviceName: "agentbox",
     // Persist the rollout on disk so follow-up runs can call `thread/resume`.
     // `ephemeral: true` threads have no rollout file and resume fails with
@@ -242,6 +266,7 @@ function buildResumeParams(
     ...(request.options.provider?.serviceTier !== undefined ? { serviceTier: request.options.provider.serviceTier } : {}),
     ...(options.provider?.approvalPolicy ? { approvalPolicy: options.provider.approvalPolicy } : options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
     sandbox: buildCodexSandboxMode(options),
+    ...buildCodexThreadConfig(request),
     ...(request.run.systemPrompt ? { developerInstructions: request.run.systemPrompt } : options.configuration === "native" ? {} : { developerInstructions: null }),
     // We only need the thread id back; we never read `thread.turns`.
     // Without this Codex hydrates the full history into the response and
@@ -279,6 +304,7 @@ function buildForkParams(
     ...(request.options.provider?.serviceTier !== undefined ? { serviceTier: request.options.provider.serviceTier } : {}),
     ...(options.provider?.approvalPolicy ? { approvalPolicy: options.provider.approvalPolicy } : options.configuration === "native" && !options.fullAccess ? {} : { approvalPolicy: !options.fullAccess && isInteractiveApproval(options) ? "untrusted" : "never" }),
     sandbox: buildCodexSandboxMode(options),
+    ...buildCodexThreadConfig(request),
     ...(request.run.systemPrompt ? { developerInstructions: request.run.systemPrompt } : options.configuration === "native" ? {} : { developerInstructions: null }),
     excludeTurns: true,
   };
@@ -356,6 +382,87 @@ export function buildCodexTurnStartParams(params: {
  * originating run already treats as a cancel.
  */
 const CODEX_CANCEL_TURN_TEXT = "Run cancelled by the host.";
+
+/** What the Codex TUI sends for `/init`; the app-server has no equivalent. */
+const CODEX_INIT_PROMPT =
+  "Generate a file named AGENTS.md that serves as a contributor guide for this repository.";
+/** Commands resolved without the skill inventory. */
+const CODEX_BUILTIN_COMMAND_NAMES = new Set(
+  builtinHarnessCommands("codex").map((command) => command.name),
+);
+
+export type CodexCommandDispatch =
+  | { kind: "compact" }
+  | { kind: "review"; target: Record<string, unknown> }
+  | { kind: "turn"; inputItems: Array<Record<string, unknown>> };
+
+function replaceCodexPromptText(
+  inputItems: Array<Record<string, unknown>>,
+  text: string,
+): Array<Record<string, unknown>> {
+  let replaced = false;
+  const next = inputItems.map((item) => {
+    if (item.type !== "text" || replaced) return item;
+    replaced = true;
+    return { ...item, text };
+  });
+  return replaced ? next : [{ type: "text", text, text_elements: [] }, ...next];
+}
+
+/**
+ * Codex never parses slash commands on `turn/start`, so a leading `/name`
+ * maps here: `/compact` and `/review` become app-server calls, `/init`
+ * becomes the TUI's canned prompt, a skill name becomes its `$name` mention,
+ * and anything else stays plain text exactly as typed.
+ */
+export function resolveCodexCommandDispatch(
+  command: HarnessCommandInvocation | undefined,
+  inputItems: Array<Record<string, unknown>>,
+  skillNames: ReadonlySet<string>,
+): CodexCommandDispatch {
+  if (!command) return { kind: "turn", inputItems };
+  const args = command.args;
+  switch (command.name) {
+    case "compact":
+      return { kind: "compact" };
+    case "review":
+      return {
+        kind: "review",
+        target: args ? { type: "custom", instructions: args } : { type: "uncommittedChanges" },
+      };
+    case "init":
+      return { kind: "turn", inputItems: replaceCodexPromptText(inputItems, args ? `${CODEX_INIT_PROMPT} ${args}` : CODEX_INIT_PROMPT) };
+    default:
+      if (skillNames.has(command.name)) {
+        const mention = codexSkillMention(command.name);
+        return { kind: "turn", inputItems: replaceCodexPromptText(inputItems, args ? `${mention} ${args}` : mention) };
+      }
+      return { kind: "turn", inputItems };
+  }
+}
+
+/**
+ * How long a finished run waits for a still-pending skills listing before it
+ * settles. See the emit in `execute` for why the wait exists at all.
+ */
+const HARNESS_COMMANDS_SETTLE_GRACE_MS = 500;
+
+/**
+ * Built-in commands plus the skills the app-server discovers for `cwd`. An
+ * app-server without `skills/list` (or without the experimental API, which
+ * answers -32600) still runs: the built-ins alone are reported.
+ */
+async function listCodexHarnessCommands(client: CodexRpcClient, cwd: string): Promise<HarnessCommandDescriptor[]> {
+  type SkillsList = Parameters<typeof codexHarnessCommands>[0];
+  try {
+    const list = await withTimeout(client.request<SkillsList>("skills/list", { cwds: [cwd] }), 5_000);
+    if (!list) throw new Error("skills/list timed out");
+    return codexHarnessCommands(list);
+  } catch (error) {
+    debugCodex("skills/list unavailable; reporting built-in commands only: %o", error);
+    return builtinHarnessCommands("codex");
+  }
+}
 
 /**
  * Best-effort, bounded stop of every unified-exec process the app-server
@@ -1431,21 +1538,13 @@ async function buildCodexInputItems(
   options: AgentOptions<"codex">,
   inputParts: Awaited<ReturnType<typeof validateProviderUserInput>>,
 ): Promise<Array<Record<string, unknown>>> {
-  const textPrompt = joinTextParts(
-    inputParts.filter(
-      (part): part is Extract<typeof part, { type: "text" }> =>
-        part.type === "text",
-    ),
+  // Keep text blocks separate: command dispatch replaces only the first
+  // block, and later blocks may carry additional instructions or context.
+  const inputItems: Array<Record<string, unknown>> = inputParts.flatMap(
+    (part) => part.type === "text" && part.text.trim().length > 0
+      ? [{ type: "text", text: part.text, text_elements: [] }]
+      : [],
   );
-  const inputItems: Array<Record<string, unknown>> = [];
-
-  if (textPrompt.trim().length > 0) {
-    inputItems.push({
-      type: "text",
-      text: textPrompt,
-      text_elements: [],
-    });
-  }
 
   inputItems.push(
     ...(await mapToCodexPromptParts(inputParts, async (part, index) =>
@@ -1970,17 +2069,53 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
         const modes = await client.request<{ data: Array<{ mode: string }> }>("collaborationMode/list", {});
         if (!modes.data.some((mode) => mode.mode === request.run.mode)) throw new Error("This Codex installation does not support the requested planning mode.");
       }
+      // Skills are the only per-environment commands Codex exposes; the
+      // inventory feeds the host's `/` menu and resolves skill invocations.
+      // Requested alongside the turn so an app-server that never answers
+      // (older builds, test fixtures) cannot hold the turn back; only a
+      // skill invocation must wait for the names. The run waits for it once
+      // more before it settles: a short turn (`/compact`, a one-liner) can
+      // otherwise end first, and an emit into a closed sink reaches nobody,
+      // leaving the host's palette on the built-ins forever.
+      const emitHarnessCommands = (commands: HarnessCommandDescriptor[]) =>
+        sink.emitEvent(
+          createNormalizedEvent(
+            "harness.commands",
+            { provider: request.provider, runId: request.runId },
+            { commands },
+          ),
+        );
+      const inventory = listCodexHarnessCommands(client, cwd).then((commands) => {
+        emitHarnessCommands(commands);
+        return commands;
+      });
+      inventory.catch(() => undefined);
       if (request.run.goal) {
         await client.request("thread/goal/set", { threadId: threadResponse.thread.id, objective: request.run.goal, status: "active" });
       }
-      await client.request<{ turn?: { id?: string } }>(
-        "turn/start",
-        buildCodexTurnStartParams({
-          threadId: threadResponse.thread.id,
-          inputItems: runtime.inputItems,
-          request,
-        }),
+      const command = request.run.command;
+      const skillNames = new Set(
+        command && !CODEX_BUILTIN_COMMAND_NAMES.has(command.name)
+          ? (await inventory).filter((entry) => entry.source !== "builtin").map((entry) => entry.name)
+          : [],
       );
+      const dispatch = resolveCodexCommandDispatch(command, runtime.inputItems, skillNames);
+      // Compaction and review are app-server methods, not turns the model
+      // reads; each still runs as a turn, so the completion path is shared.
+      if (dispatch.kind === "compact") {
+        await client.request("thread/compact/start", { threadId: threadResponse.thread.id });
+      } else if (dispatch.kind === "review") {
+        await client.request("review/start", { threadId: threadResponse.thread.id, target: dispatch.target, delivery: "inline" });
+      } else {
+        await client.request<{ turn?: { id?: string } }>(
+          "turn/start",
+          buildCodexTurnStartParams({
+            threadId: threadResponse.thread.id,
+            inputItems: dispatch.inputItems,
+            request,
+          }),
+        );
+      }
 
       let completionResult:
         | {
@@ -1996,6 +2131,15 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       } catch (err) {
         completionError = err;
       }
+
+      // The listing started before the turn did, so by now it has almost
+      // always landed; this only covers the turn that ended sooner. It is a
+      // grace, not the listing's own 5s budget: an app-server that never
+      // answers `skills/list` must not hold every run open for it.
+      await withTimeout(
+        inventory.catch(() => undefined),
+        HARNESS_COMMANDS_SETTLE_GRACE_MS,
+      );
 
       // However the run ended, nothing is pending once it settles (a no-op
       // unless a native goal wait was reported).

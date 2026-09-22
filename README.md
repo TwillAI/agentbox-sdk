@@ -133,6 +133,32 @@ a 15s grace as a compatibility fallback. A final
 default 30 minutes, `0` settles at the first turn end as before, `Infinity`
 waits forever. On expiry the tasks are stopped best-effort and the run
 completes with the last turn's text.
+
+### Harness commands
+
+A run whose input starts with `/name args` carries the harness's own slash
+command. `resolveHarnessCommand(provider, input)` keeps the text as typed and
+returns `command: { name, args }` for `AgentRunConfig.command`; `/plan`,
+`/agent`, and `/goal` stay harness modes as before. Each adapter dispatches
+what its CLI supports headlessly:
+
+- Claude Code parses slash commands from the user message itself (`/compact`,
+  `/context`, `/init`, skills, custom commands, plugin commands).
+- Codex maps `/compact` to `thread/compact/start`, `/review [instructions]` to
+  `review/start`, `/init` to the TUI's AGENTS.md prompt, and an installed skill
+  to its `$name` mention.
+- OpenCode maps `/compact` to `POST /session/:id/summarize`, a configured
+  command to `POST /session/:id/command`, and an installed skill to a
+  directive the model follows. Configured command calls preserve file and
+  image attachments. They reject a per-run `systemPrompt` because OpenCode's
+  command endpoint cannot accept it; use a normal prompt or the setup-time
+  `OpenCodeAgentOptions.systemPrompt` instead. This also applies to the runtime
+  system appendix generated from configured MCPs, skills, sub-agents, or commands.
+
+Anything the harness does not know is sent as plain text. Each run emits one
+`harness.commands` event listing what it can run (`HarnessCommandDescriptor[]`:
+name, description, argument hint, source), so a host can build its `/` menu;
+`builtinHarnessCommands(provider)` gives the static list before a run exists.
 Tasks marked ambient by Claude (such as live-update watchers) do not keep the
 run waiting. The SDK's full task snapshots take precedence over task start and
 finish events, whose ordering relative to those snapshots is unspecified.

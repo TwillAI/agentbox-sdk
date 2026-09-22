@@ -21,6 +21,15 @@ import {
 } from "../types";
 import { isInteractiveApproval, hasInteractiveQuestions } from "../approval";
 import {
+  builtinHarnessCommands,
+  openCodeHarnessCommands,
+  skillDirective,
+  type HarnessCommandDescriptor,
+  type HarnessCommandInvocation,
+  type OpenCodeCommandEntry,
+  type OpenCodeSkillEntry,
+} from "../harness-commands";
+import {
   BACKGROUND_TASK_GRACE_MS,
   BackgroundWait,
   BackgroundWaitFinish,
@@ -271,6 +280,97 @@ function toRawEvent(
  */
 function injectedTaskResultChild(text: string): string | undefined {
   return /<task id="?([^"\s>]+)"? state="?(?:completed|error)"?>/.exec(text)?.[1];
+}
+
+export type OpenCodeCommandDispatch =
+  | { kind: "summarize" }
+  | { kind: "command"; command: string; arguments: string }
+  /** A normal prompt; `text` replaces the first text part when set. */
+  | { kind: "prompt"; text?: string };
+
+/**
+ * OpenCode never parses slash commands on a prompt, so a leading `/name`
+ * maps here: `/compact` becomes `POST /session/:id/summarize`, a configured
+ * command (built-in `init`/`review`, `.opencode/command/*.md`, MCP prompts)
+ * becomes `POST /session/:id/command`, a skill becomes a directive the model
+ * follows through its `skill` tool, and anything else stays plain text.
+ */
+export function resolveOpenCodeCommandDispatch(
+  command: HarnessCommandInvocation | undefined,
+  harnessCommands: readonly HarnessCommandDescriptor[],
+): OpenCodeCommandDispatch {
+  if (!command) return { kind: "prompt" };
+  if (command.name === "compact") return { kind: "summarize" };
+  const known = harnessCommands.find((entry) => entry.name === command.name);
+  if (!known) return { kind: "prompt" };
+  if (known.source === "skill")
+    return { kind: "prompt", text: skillDirective(command.name, command.args) };
+  return { kind: "command", command: command.name, arguments: command.args };
+}
+
+function replaceOpenCodePromptText(
+  parts: OpenCodePromptPart[],
+  text: string,
+): OpenCodePromptPart[] {
+  let replaced = false;
+  const next = parts.map((part) => {
+    if (part.type !== "text" || replaced) return part;
+    replaced = true;
+    return { ...part, text };
+  });
+  return replaced ? next : [{ type: "text", text }, ...next];
+}
+
+/**
+ * `GET /command` fans out to every connected MCP server, so discovery is
+ * only as fast as the slowest one. It runs before the turn is dispatched
+ * and before the silence watchdog arms, so it is bounded twice over — an
+ * abort signal on the requests and a race on the whole listing — and a
+ * wedged server costs the run five seconds, not the run itself.
+ */
+const OPENCODE_COMMAND_DISCOVERY_TIMEOUT_MS = 5_000;
+
+/**
+ * Commands and skills the server exposes. `GET /skill` is newer than
+ * `GET /command`; either failing or timing out degrades to the built-in
+ * list so a run never fails on discovery alone.
+ */
+async function listOpenCodeHarnessCommands(
+  runtime: Pick<OpenCodeRuntime, "baseUrl" | "previewHeaders">,
+): Promise<HarnessCommandDescriptor[]> {
+  const init = {
+    headers: runtime.previewHeaders,
+    signal: AbortSignal.timeout(OPENCODE_COMMAND_DISCOVERY_TIMEOUT_MS),
+  };
+  try {
+    const listed = await withTimeout(
+      Promise.all([
+        fetchJson<OpenCodeCommandEntry[]>(`${runtime.baseUrl}/command`, init),
+        fetchJson<OpenCodeSkillEntry[]>(`${runtime.baseUrl}/skill`, init).catch(
+          () => [] as OpenCodeSkillEntry[],
+        ),
+      ]),
+      OPENCODE_COMMAND_DISCOVERY_TIMEOUT_MS,
+    );
+    if (!listed) {
+      debugOpencode(
+        "GET /command did not answer within %dms; reporting built-in commands only",
+        OPENCODE_COMMAND_DISCOVERY_TIMEOUT_MS,
+      );
+      return builtinHarnessCommands("open-code");
+    }
+    const [commands, skills] = listed;
+    return openCodeHarnessCommands(
+      Array.isArray(commands) ? commands : [],
+      Array.isArray(skills) ? skills : [],
+    );
+  } catch (error) {
+    debugOpencode(
+      "GET /command unavailable; reporting built-in commands only: %o",
+      error,
+    );
+    return builtinHarnessCommands("open-code");
+  }
 }
 
 function toOpenCodeModel(
@@ -1908,6 +2008,43 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
         const name = request.run.mode === "plan" ? "plan" : "build";
         if (!agents.some((agent) => agent.name === name)) throw new Error(`This OpenCode installation does not expose the ${name} agent.`);
       }
+      // The server never parses slash commands: its configured commands and
+      // skills are listed here for the host's `/` menu and to route a
+      // leading `/name` to the matching endpoint below.
+      const harnessCommands = await listOpenCodeHarnessCommands(runtime);
+      sink.emitEvent(
+        createNormalizedEvent(
+          "harness.commands",
+          { provider: request.provider, runId: request.runId },
+          { commands: harnessCommands },
+        ),
+      );
+      const commandDispatch = resolveOpenCodeCommandDispatch(request.run.command, harnessCommands);
+      // The native command endpoint does not accept a system override. Do
+      // not silently execute a command without the caller's instructions.
+      if (commandDispatch.kind === "command" && request.run.systemPrompt) {
+        throw new Error(
+          "OpenCode commands do not support a per-run systemPrompt. Use a normal prompt, or configure the systemPrompt on the Agent at setup time.",
+        );
+      }
+      // Unlike `prompt_async`, the command and summarize endpoints answer
+      // only once the turn ends. The request is not awaited: the turn is
+      // observed through SSE like any other, and a failed request (an
+      // unknown command answers 4xx at once) fails the run promptly.
+      const dispatchBlocking = (endpoint: string, body: Record<string, unknown>): void => {
+        void fetch(`${runtime.baseUrl}/session/${sessionId}/${endpoint}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...runtime.previewHeaders },
+          body: JSON.stringify(body),
+        })
+          .then((response) => {
+            if (!response.ok) throw new Error(`POST /session/${sessionId}/${endpoint} returned ${response.status}`);
+          })
+          .catch((error: unknown) => {
+            if (!dispatchError) dispatchError = error;
+            resolveSessionTerminal();
+          });
+      };
       const dispatchPrompt = async (
         parts: OpenCodePromptPart[],
       ): Promise<void> => {
@@ -2000,7 +2137,24 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
       // Initial dispatch. We await this one because if it fails we
       // want to surface the error before entering the wait loop.
       try {
-        await dispatchPrompt(mapToOpenCodeParts(inputParts));
+        if (commandDispatch.kind === "summarize") {
+          const model = toOpenCodeModel(request.run.model);
+          if (!model?.providerID) throw new Error("OpenCode compaction needs a provider-qualified model id.");
+          dispatchBlocking("summarize", { providerID: model.providerID, modelID: model.modelID });
+        } else if (commandDispatch.kind === "command") {
+          dispatchBlocking("command", {
+            command: commandDispatch.command,
+            arguments: commandDispatch.arguments,
+            parts: mapToOpenCodeParts(inputParts).filter((part) => part.type === "file"),
+            ...(request.run.model?.includes("/") ? { model: request.run.model } : {}),
+            ...(request.run.mode ? { agent: request.run.mode === "plan" ? "plan" : "build" } : request.options.configuration === "native" ? {} : { agent: agentSlug }),
+          });
+        } else {
+          const parts = mapToOpenCodeParts(inputParts);
+          await dispatchPrompt(
+            commandDispatch.text === undefined ? parts : replaceOpenCodePromptText(parts, commandDispatch.text),
+          );
+        }
       } catch (error) {
         if (!dispatchError) {
           dispatchError = error;

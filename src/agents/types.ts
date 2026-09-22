@@ -5,6 +5,7 @@ import type {
   RawAgentEvent,
 } from "../events";
 import type { Sandbox } from "../sandboxes";
+import type { HarnessCommandInvocation } from "./harness-commands";
 import type {
   AgentCommandConfig,
   AgentMcpConfig,
@@ -86,6 +87,14 @@ export interface AgentRunConfig {
   mode?: "plan" | "default";
   /** Native goal objective. Unsupported harnesses reject it. */
   goal?: string;
+  /**
+   * Leading `/name args` token of {@link input}, as parsed by
+   * `resolveHarnessCommand`. The input keeps the raw text: Claude Code
+   * dispatches slash commands itself, while the Codex and OpenCode adapters
+   * map known names to native calls (compaction, review, commands, skills)
+   * and send unknown ones as plain text.
+   */
+  command?: HarnessCommandInvocation;
 }
 
 export type AgentApprovalMode = "auto" | "interactive";

@@ -128,6 +128,24 @@ async function collect(
   return run.finished;
 }
 
+it("preserves separate context blocks when dispatching /init through the adapter", async () => {
+  const { directory, agent, requests } = await setup("init-context", { startCommand: false });
+  try {
+    const result = await collect(agent().stream({
+      input: [{ type: "text", text: "/init" }, { type: "text", text: "Only document packages/api." }],
+      command: { name: "init", args: "" },
+    }));
+    expect(result.error).toBeUndefined();
+    const turn = (await requests()).find((request) => request.method === "turn/start");
+    expect(turn?.params.input).toEqual([
+      { type: "text", text: expect.stringContaining("AGENTS.md"), text_elements: [] },
+      { type: "text", text: "Only document packages/api.", text_elements: [] },
+    ]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 const backgroundEvents = (events: NormalizedAgentEvent[]) =>
   events.flatMap((event) =>
     event.type === "background.tasks"
@@ -280,6 +298,7 @@ it.each(["complete", "blocked", undefined])(
       expect(recorded.map((request) => request.method)).toEqual([
         "initialize",
         "thread/start",
+        "skills/list",
         ...(status ? ["thread/goal/set"] : []),
         "turn/start",
       ]);
