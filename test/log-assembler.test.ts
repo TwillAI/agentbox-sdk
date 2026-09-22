@@ -1184,6 +1184,27 @@ describe("ProviderLogAssembler — claude-code per-block assistant events", () =
 });
 
 describe("ProviderLogAssembler — codex/opencode persistence parity", () => {
+  it("codex keeps the async-question fields of an agentMessage item in its snapshot", () => {
+    const assembler = new ProviderLogAssembler();
+    const item = {
+      id: "call_ask",
+      type: "agentMessage",
+      phase: "final_answer",
+      delivery: "async",
+      text: "Copy .env?\n- Saved settings only\n- Copy missing values",
+      questions: [{ title: "Copy .env?", options: ["Saved settings only", "Copy missing values"] }],
+    };
+    assembler.process("codex", { method: "item/started", params: { item } });
+    assembler.process("codex", { method: "item/completed", params: { item } });
+    const snapshots = assembler.getSnapshots("codex");
+    expect(snapshots).toHaveLength(1);
+    expect((snapshots[0]!.params as { item: typeof item }).item).toMatchObject({
+      id: "call_ask",
+      delivery: "async",
+      questions: item.questions,
+    });
+  });
+
   it("codex getSnapshots retains non-item passthroughs (turn/completed, error) in order", () => {
     const assembler = new ProviderLogAssembler();
     assembler.process("codex", {

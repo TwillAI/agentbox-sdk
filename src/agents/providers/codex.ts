@@ -27,7 +27,7 @@ import {
   type HarnessCommandDescriptor,
   type HarnessCommandInvocation,
 } from "../harness-commands";
-import { normalizeUserQuestions, questionReply } from "../questions";
+import { normalizeAsyncUserQuestions, normalizeUserQuestions, questionReply } from "../questions";
 import {
   joinTextParts,
   mapToCodexPromptParts,
@@ -594,8 +594,16 @@ function toNormalizedCodexEvents(
       // tracks the LAST message text as the final `result.text`, so a
       // narration message emitted before tool calls is superseded by the
       // final answer message — only the last one wins.
+      // A `request_user_input_async` call becomes an agentMessage with
+      // `delivery: "async"` and `questions`; the app-server answers the tool
+      // call itself and the turn continues, so the ask travels with the text
+      // instead of pausing as `permission.requested`.
+      const questions = normalizeAsyncUserQuestions(AgentProvider.Codex, item.questions);
       return [
-        createNormalizedEvent("message.completed", base, { text: item.text }),
+        createNormalizedEvent("message.completed", base, {
+          text: item.text,
+          ...(questions ? { questions } : {}),
+        }),
       ];
     }
 

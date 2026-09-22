@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeUserQuestions, questionReply, validateUserAnswers } from "../src/agents/questions";
+import { normalizeAsyncUserQuestions, normalizeUserQuestions, questionReply, validateUserAnswers } from "../src/agents/questions";
 
 describe("interactive question transport", () => {
   const questions = [
@@ -28,5 +28,14 @@ describe("interactive question transport", () => {
     for (const value of [{ questions: [] }, { questions: [{ ...questions[0], isSecret: true }] }, { questions: [{ ...questions[0], options: Array(31).fill({ label: "A" }) }] }])
       expect(() => normalizeUserQuestions("codex", value)).toThrow();
     expect(() => questionReply("codex", { questions: [questions[0], questions[0]] }, answers)).toThrow(/Duplicate/);
+  });
+
+  it("normalizes non-blocking Codex asks with bare-string options and drops malformed lists", () => {
+    expect(normalizeAsyncUserQuestions("codex", [{ title: "Copy .env?", options: ["Saved settings only", "Copy missing values"] }])).toEqual([
+      { id: "0", question: "Copy .env?", options: [{ label: "Saved settings only" }, { label: "Copy missing values" }], multiple: false, allowCustom: true },
+    ]);
+    expect(normalizeAsyncUserQuestions("codex", [{ title: "Free text?", options: [] }])).toEqual([{ id: "0", question: "Free text?", options: [], multiple: false, allowCustom: true }]);
+    for (const value of [undefined, [], "nope", [{ options: ["A"] }], [{ title: "Dup", options: ["A", "A"] }], [{ title: "Secret", options: [], isSecret: true }]])
+      expect(normalizeAsyncUserQuestions("codex", value)).toBeUndefined();
   });
 });

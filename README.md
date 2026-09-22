@@ -713,6 +713,15 @@ array containing each `questionId` and its selected or custom `values`, or use
 Question answers cannot modify unrelated tool arguments. Ordinary tool requests
 use the same API without `answers`.
 
+Codex can also ask without pausing (`request_user_input_async`): the app-server
+accepts the call itself and the turn keeps working. That ask is not a permission
+request; it arrives as a `message.completed` event carrying `questions` (same
+`AgentUserQuestion` shape, bare-string options become labels) next to the text
+Codex rendered for it. Nothing is pending, so there is nothing to respond to:
+relay the user's choice as a follow-up message (`run.sendMessage()` while the
+run is live, otherwise the next run of the session). Claude Code and OpenCode
+have no non-blocking ask; their questions always pause as `permission.requested`.
+
 Native runtimes own a POSIX process group by default. Termination is bounded and
 escalates to SIGKILL if the process ignores SIGTERM. A supervisor that launches
 each run in its own process group can set `processGroup: "inherited"`; that

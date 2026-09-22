@@ -37,6 +37,42 @@ export function normalizeUserQuestions(provider: AgentProviderName, input: unkno
   });
 }
 
+/**
+ * Questions attached to a message the harness did not pause on (Codex
+ * `request_user_input_async`: `[{ title, options: string[] }]`). They ride on
+ * `message.completed`, so a malformed list must not fail the run: it is
+ * dropped (`undefined`) instead of thrown. Blocking asks use
+ * {@link normalizeUserQuestions}, whose errors keep the request pending.
+ */
+export function normalizeAsyncUserQuestions(provider: AgentProviderName, questions: unknown): AgentUserQuestion[] | undefined {
+  if (!Array.isArray(questions) || !questions.length || questions.length > 10) return undefined;
+  try {
+    return questions.map((value, index) => {
+      const item = record(value);
+      if (item.isSecret === true) throw new Error("Secret questions cannot be relayed");
+      const options = item.options ?? [];
+      if (!Array.isArray(options) || options.length > 30) throw new Error("Unsupported agent question options");
+      const result: AgentUserQuestion = {
+        id: String(index),
+        question: text(item.title ?? item.question, 10_000),
+        ...(item.header ? { header: text(item.header, 200) } : {}),
+        // Codex async options are bare strings; blocking shapes use {label, description}.
+        options: options.map((value) => {
+          if (typeof value === "string") return { label: text(value, 1000) };
+          const option = record(value);
+          return { label: text(option.label, 1000), ...(option.description ? { description: text(option.description, 10_000) } : {}) };
+        }),
+        multiple: provider === "claude-code" ? item.multiSelect === true : provider === "open-code" && item.multiple === true,
+        allowCustom: provider === "open-code" ? item.custom !== false : true,
+      };
+      if (new Set(result.options.map((option) => option.label)).size !== result.options.length) throw new Error("Duplicate agent question options");
+      return result;
+    });
+  } catch {
+    return undefined;
+  }
+}
+
 export function validateUserAnswers(questions: AgentUserQuestion[] | undefined, answers: AgentUserAnswer[] | undefined): AgentUserAnswer[] {
   if (!questions?.length || !answers || answers.length !== questions.length || new Set(answers.map((answer) => answer.questionId)).size !== answers.length) throw new Error("Answer each agent question once");
   return questions.map((question) => {

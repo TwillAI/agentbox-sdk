@@ -122,6 +122,15 @@ export interface MessageCompletedEvent extends NormalizedAgentEventBase {
    * the assistant turn rather than the user one.
    */
   messageId?: string;
+  /**
+   * Questions the harness asked without pausing the turn (Codex
+   * `request_user_input_async`: an `agentMessage` item with
+   * `delivery: "async"`). Nothing is pending and the run keeps working;
+   * an answer, if any, is a follow-up user message (`AgentRun.sendMessage`
+   * while the run is live, or the next run). Blocking questions never use
+   * this field: they arrive as `permission.requested` with `kind: "question"`.
+   */
+  questions?: AgentUserQuestion[];
 }
 
 /** Work the harness left running past its turn (background shell, monitor,

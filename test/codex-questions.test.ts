@@ -54,3 +54,55 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+it("relays a non-blocking request_user_input_async ask on message.completed without pausing the run", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "agentbox-codex-async-questions-"));
+  const binary = path.join(directory, "codex-fixture");
+  await mkdir(path.join(directory, "codex"));
+  const item = {
+    id: "call_ask",
+    type: "agentMessage",
+    phase: "final_answer",
+    delivery: "async",
+    text: "Copy .env?\n- Saved settings only\n- Copy missing values",
+    questions: [{ title: "Copy .env?", options: ["Saved settings only", "Copy missing values"] }],
+  };
+  await writeFile(binary, `#!${process.execPath}
+import readline from 'node:readline';
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+const item = ${JSON.stringify(item)};
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const message = JSON.parse(line);
+  if (message.method === 'initialize') send({ id: message.id, result: {} });
+  else if (message.method === 'thread/start') send({ id: message.id, result: { thread: { id: 'thread-test' } } });
+  else if (message.method === 'turn/start') {
+    send({ id: message.id, result: { turn: { id: 'turn-test' } } });
+    send({ method: 'item/started', params: { threadId: 'thread-test', turnId: 'turn-test', item } });
+    send({ method: 'item/completed', params: { threadId: 'thread-test', turnId: 'turn-test', item } });
+    send({ method: 'item/completed', params: { threadId: 'thread-test', turnId: 'turn-test', item: { id: 'msg_final', type: 'agentMessage', text: 'Done without copying.' } } });
+    send({ method: 'turn/completed', params: { threadId: 'thread-test', turn: { id: 'turn-test', status: 'completed' } } });
+  }
+});
+`, { mode: 0o700 });
+  let active: AgentRun | undefined;
+  try {
+    const agent = new Agent("codex", { cwd: directory, stateDirectory: directory, approvalMode: "auto", fullAccess: true, interactiveQuestions: true, provider: { binary } });
+    active = agent.stream({ input: "Set up the workspace" });
+    const messages: Array<{ text?: string; questions?: unknown }> = [];
+    for await (const event of active) {
+      expect(event.type).not.toBe("permission.requested");
+      if (event.type === "message.completed") messages.push({ text: event.text, questions: event.questions });
+    }
+    expect(messages).toEqual([
+      { text: item.text, questions: [{ id: "0", question: "Copy .env?", options: [{ label: "Saved settings only" }, { label: "Copy missing values" }], multiple: false, allowCustom: true }] },
+      { text: "Done without copying.", questions: undefined },
+    ]);
+    const result = await active.finished;
+    expect(result.isCancelled).toBe(false);
+    expect(result.text).toBe("Done without copying.");
+    active = undefined;
+  } finally {
+    await active?.abort();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
