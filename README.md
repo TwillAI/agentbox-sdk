@@ -711,7 +711,9 @@ events with `kind: "question"`. Respond with `decision: "allow"` and an `answers
 array containing each `questionId` and its selected or custom `values`, or use
 `decision: "deny"` to skip. Invalid answers leave the request pending for correction.
 Question answers cannot modify unrelated tool arguments. Ordinary tool requests
-use the same API without `answers`.
+use the same API without `answers`. Denying a Codex command or file change sends
+`decline`, so the agent can continue without that action. Stopping the whole run
+is a separate operation (`run.abort()`).
 
 Codex can also ask without pausing (`request_user_input_async`): the app-server
 accepts the call itself and the turn keeps working. That ask is not a permission

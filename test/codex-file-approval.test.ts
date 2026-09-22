@@ -25,7 +25,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     send({ id: message.id, result: { turn: { id: 'turn-test' } } });
     send({ method: 'item/started', params: { threadId: 'thread-test', turnId: 'turn-test', item: { type: 'fileChange', id: 'item-test', changes: [{ path: '/fixture/sum.mjs', kind: { type: 'update' }, diff: '-return 0;\\n+return a+b;' }] } } });
     send({ method: 'item/started', params: { threadId: 'unrelated-thread', turnId: 'turn-test', item: { type: 'fileChange', id: 'item-test', changes: [{ path: '/unrelated/private-file' }] } } });
-    send({ id: 9001, method: 'item/fileChange/requestApproval', params: { threadId: 'thread-test', turnId: 'turn-test', itemId: 'item-test', availableDecisions: ['accept','cancel'] } });
+    send({ id: 9001, method: 'item/fileChange/requestApproval', params: { threadId: 'thread-test', turnId: 'turn-test', itemId: 'item-test' } });
   }
 });
 `, { mode: 0o700 });
@@ -43,9 +43,9 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
         await active.respondToPermission({ requestId: event.requestId, decision });
       }
       expect(asks).toBe(1);
-      expect((await active.finished).isCancelled).toBe(decision === "deny");
+      expect((await active.finished).isCancelled).toBe(false);
       const response = JSON.parse(await readFile(record, "utf8")) as { pid: number; decision: string };
-      expect(response.decision).toBe(decision === "allow" ? "accept" : "cancel");
+      expect(response.decision).toBe(decision === "allow" ? "accept" : "decline");
       expect(Object.keys(response).sort()).toEqual(["decision", "pid"]);
       await vi.waitFor(() => expect(() => process.kill(-response.pid, 0)).toThrow());
       active = undefined;

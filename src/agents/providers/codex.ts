@@ -824,7 +824,6 @@ function toCodexApprovalDecision(
   | "accept"
   | "acceptForSession"
   | "decline"
-  | "cancel"
   | {
       acceptWithExecpolicyAmendment: {
         execpolicy_amendment: string[];
@@ -843,7 +842,10 @@ function toCodexApprovalDecision(
     : [];
 
   if (response.decision === "deny") {
-    return availableDecisions.includes("decline") ? "decline" : "cancel";
+    // A denial refuses this action; cancellation interrupts the entire turn.
+    // availableDecisions is optional for commands and absent on file-change
+    // approvals, so its omission must never turn Deny into Stop.
+    return "decline";
   }
 
   if (response.remember && availableDecisions.includes("acceptForSession")) {
