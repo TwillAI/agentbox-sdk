@@ -635,9 +635,13 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
       throw new Error("AgentRunConfig.forkAtMessageId requires forkSessionId.");
     }
     if (runConfig.resumeParked) {
-      // Only a sandbox daemon can keep a harness alive between runs.
-      if (this.provider !== AgentProvider.ClaudeCode || !this.options.sandbox) {
-        throw new Error("AgentRunConfig.resumeParked is only supported for claude-code sandbox runs.");
+      // Only a sandbox daemon, or this process for a native CLI, can keep a
+      // harness alive between runs.
+      if (
+        this.provider !== AgentProvider.ClaudeCode ||
+        (!this.options.sandbox && this.options.configuration !== "native")
+      ) {
+        throw new Error("AgentRunConfig.resumeParked is only supported for claude-code sandbox or native runs.");
       }
       if (!runConfig.resumeSessionId) {
         throw new Error("AgentRunConfig.resumeParked requires resumeSessionId.");

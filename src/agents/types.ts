@@ -57,7 +57,7 @@ export interface AgentRunConfig {
   systemPrompt?: string;
   resumeSessionId?: string;
   /**
-   * claude-code sandbox runs: attach to the harness parked for
+   * claude-code sandbox and native runs: attach to the harness parked for
    * {@link resumeSessionId} without sending {@link input}, and stream the
    * turn it started on its own. Completes with empty text when nothing is
    * parked or no such turn exists. See `provider.parkBackgroundWork`.
@@ -291,18 +291,40 @@ export interface OpenCodeProviderOptions {
   plugins?: OpenCodePluginConfig[];
 }
 
+/**
+ * Parking for native (`configuration: "native"`) runs, where this process
+ * owns the CLI: the parked CLI lives on in this process, so the next run
+ * resuming the session must run in this same process to adopt it.
+ */
+export interface NativeParkBackgroundWork {
+  /**
+   * The parked CLI started a turn on its own with nobody attached. Start a
+   * run with `resumeParked` in this process to stream it. Resolve `false`
+   * (or throw) to be asked again with backoff; anything else counts as
+   * accepted until a run attaches.
+   */
+  onWake(): Promise<boolean | void> | boolean | void;
+  /** The parked CLI is gone: its work finished and it exited, or its budget ran out. */
+  onEnded?(): void;
+}
+
 export interface ClaudeCodeProviderOptions {
   /**
-   * Sandbox runs only. End a run at its answer even when background work is
-   * still live, and keep the CLI alive in the sandbox for it (a "parked"
-   * run) instead of holding the run open. A run whose turn ends with nothing
-   * live is unaffected. The next run resuming that session takes the CLI
-   * over. When the CLI starts a turn on its own with nobody attached (a task
-   * finished, a schedule fired) the daemon POSTs `{ runId, sessionId }` to
-   * `wakeUrl` with `Authorization: Bearer <wakeToken>`; stream that turn with
-   * `resumeParked`. The park lasts what is left of `backgroundTaskTimeoutMs`.
+   * End a run at its answer even when background work is still live, and
+   * keep the CLI alive for it (a "parked" run) instead of holding the run
+   * open. A run whose turn ends with nothing live is unaffected. The next run
+   * resuming that session takes the CLI over. The park lasts what is left of
+   * `backgroundTaskTimeoutMs`.
+   *
+   * Sandbox runs: when the CLI starts a turn on its own with nobody attached
+   * (a task finished, a schedule fired) the daemon POSTs
+   * `{ runId, sessionId }` to `wakeUrl` with
+   * `Authorization: Bearer <wakeToken>`; stream that turn with
+   * `resumeParked`. Native runs: see {@link NativeParkBackgroundWork}.
    */
-  parkBackgroundWork?: { wakeUrl: string; wakeToken: string };
+  parkBackgroundWork?:
+    | { wakeUrl: string; wakeToken: string }
+    | NativeParkBackgroundWork;
   /** Request fast mode explicitly; false overrides inherited fast settings. */
   fastMode?: boolean;
   binary?: string;

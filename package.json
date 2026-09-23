@@ -1,6 +1,6 @@
 {
   "name": "agentbox-sdk",
-  "version": "0.1.521",
+  "version": "0.1.522",
   "description": "Swappable coding agents and sandbox providers for Bun and TypeScript.",
   "license": "MIT",
   "repository": {

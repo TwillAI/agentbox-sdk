@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { AsyncQueue } from "../../shared/async-queue";
 import { spawnCommand, type SpawnedProcess } from "../transports/spawn";
 import path from "node:path";
 
@@ -79,6 +78,11 @@ import {
 } from "../background-tasks";
 import { debugClaude, debugRelay, time } from "../../shared/debug";
 import type { Sandbox } from "../../sandboxes";
+import {
+  findParkedNativeSession,
+  NativeClaudeSession,
+  type NativeRunHandlers,
+} from "./claude-native-session";
 
 /**
  * Daemon protocol version. Bumped whenever the daemon script's HTTP
@@ -1664,7 +1668,8 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         await Promise.allSettled([...pendingReplies]);
       }
     };
-    const parking = request.options.provider?.parkBackgroundWork;
+    const parkOption = request.options.provider?.parkBackgroundWork;
+    const parking = parkOption && "wakeUrl" in parkOption ? parkOption : undefined;
     await consumeClaudeMessages(
       request,
       sink,
@@ -1782,11 +1787,16 @@ export interface BackgroundWaitOptions {
   stopTimeoutMs?: number;
   /**
    * Keep the harness alive for `tasks` after this run settles instead of
-   * waiting on them (sandbox daemon only). `ttlMs` is what is left of the
-   * background budget. Resolves false when parking is unavailable, in which
-   * case the run waits as it always did.
+   * waiting on them. `ttlMs` is what is left of the background budget.
+   * `inflight` is a read of the message stream the run started but will not
+   * consume. Resolves false when parking is unavailable, in which case the
+   * run waits as it always did.
    */
-  park?: (tasks: BackgroundTask[], ttlMs: number) => Promise<boolean>;
+  park?: (
+    tasks: BackgroundTask[],
+    ttlMs: number,
+    inflight?: Promise<IteratorResult<unknown>>,
+  ) => Promise<boolean>;
   /** Leave a parked run: drop the stream without winding the harness down. */
   detach?: () => Promise<void>;
   /** This run sent no input of its own (`resumeParked`). */
@@ -1870,7 +1880,9 @@ async function consumeClaudeMessages(
     Math.max(0, timeoutMs - waitedMs - (pendingWait?.elapsedMs() ?? 0));
   // Parking replaces the wait whenever work is still live, so the harness
   // keeps it while the run ends at its answer.
-  const tryPark = async (): Promise<boolean> => {
+  const tryPark = async (
+    inflight?: Promise<IteratorResult<unknown>>,
+  ): Promise<boolean> => {
     const live = tracker.liveTasks();
     const ttlMs = budgetLeftMs();
     // No budget left is not something to park for: the harness would tear the
@@ -1878,7 +1890,7 @@ async function consumeClaudeMessages(
     // Fall through to the ordinary stop-what-is-left path instead.
     if (!wait.park || live.length === 0 || isAborted() || ttlMs <= 0)
       return false;
-    parked = await wait.park(live, ttlMs).catch(() => false);
+    parked = await wait.park(live, ttlMs, inflight).catch(() => false);
     if (parked)
       debugClaude(
         "★ parked the harness with %d background task(s); settling",
@@ -1929,8 +1941,9 @@ async function consumeClaudeMessages(
       }
       if ("reason" in step) {
         // Asked to stop waiting: a harness that can park keeps the work
-        // for the run that follows instead of ending it.
-        if (!(step.reason === "finished" && (await tryPark())))
+        // for the run that follows instead of ending it. The read still in
+        // flight goes with it.
+        if (!(step.reason === "finished" && (await tryPark(next))))
           expiry = step.reason;
         break;
       }
@@ -2377,32 +2390,43 @@ export async function executeNativeClaude(
 ): Promise<void> {
   const { query } = await import("@anthropic-ai/claude-agent-sdk");
   const claudeDir = claudeConfigDir(request.options);
-  const input = await validateProviderUserInput(
-    request.provider,
-    request.run.input,
-  );
-  const prompt = new AsyncQueue<SDKUserMessage>();
+  // An attach-only run sends nothing: it streams the turn a parked CLI
+  // started on its own.
+  const attachOnly = request.run.resumeParked === true;
+  const input = attachOnly
+    ? []
+    : await validateProviderUserInput(request.provider, request.run.input);
+  const parkOption = request.options.provider?.parkBackgroundWork;
+  const parking = parkOption && "onWake" in parkOption ? parkOption : undefined;
   const sessionId = request.run.resumeSessionId ?? randomUUID();
+  // The conversation is being rewound: work started on the abandoned branch
+  // goes with it.
+  if (request.run.forkSessionId)
+    await findParkedNativeSession(request.run.forkSessionId)?.end();
+  // A CLI parked for this session is taken over rather than a second one
+  // started on it.
+  const adopting = request.run.resumeSessionId
+    ? findParkedNativeSession(request.run.resumeSessionId)
+    : undefined;
   const controller = new AbortController();
   const tracker = new BackgroundTaskTracker();
   let handle: Query | undefined;
   let processHandle: SpawnedProcess | undefined;
-  let stopped: Promise<void> | undefined;
   let cancelled = false;
-  const stop = () =>
-    (stopped ??= (async () => {
-      prompt.finish();
-      handle?.close();
-      controller.abort();
-      if (processHandle) await processHandle.kill();
-    })());
+  // The run ended with its background work handed to a parked CLI, which
+  // must outlive it.
+  let parked = false;
+  // The CLI this run owns, started or adopted. An attach that finds no turn
+  // to stream owns none and leaves the park alone.
+  let session: NativeClaudeSession | undefined;
+  const stop = () => session?.end() ?? Promise.resolve();
   sink.setAbort(async () => {
     cancelled = true;
     await stop();
   });
   sink.setSessionId(sessionId);
   const messageId = randomUUID();
-  prompt.push({
+  const userMessage: SDKUserMessage = {
     type: "user",
     uuid: messageId,
     message: {
@@ -2412,7 +2436,7 @@ export async function executeNativeClaude(
       ) as SDKUserMessage["message"]["content"],
     },
     parent_tool_use_id: null,
-  });
+  };
   const hostEnv = Object.fromEntries(
     Object.entries({ ...process.env, ...request.options.env }).filter(
       (entry): entry is [string, string] => entry[1] !== undefined,
@@ -2446,9 +2470,104 @@ export async function executeNativeClaude(
   const autoApprove = shouldAutoApproveClaudeTools(request.options);
   const interactiveQuestions = hasInteractiveQuestions(request.options);
   let planning = options.permissionMode === "plan";
-  try {
+  // What this run decides for the CLI while it is attached; a run that adopts
+  // a parked CLI brings its own.
+  const handlers: NativeRunHandlers = {
+    async preToolUse(input) {
+      if (input.hook_event_name !== "PreToolUse") return {};
+      planning = input.permission_mode === "plan";
+      return interactiveQuestions &&
+        ["AskUserQuestion", "ExitPlanMode"].includes(input.tool_name)
+        ? {
+            hookSpecificOutput: {
+              hookEventName: "PreToolUse" as const,
+              permissionDecision: "ask" as const,
+            },
+          }
+        : {};
+    },
+    async canUseTool(toolName, input, context) {
+      if (cancelled || context.signal.aborted)
+        return {
+          behavior: "deny",
+          message: "Run cancelled",
+          interrupt: true,
+        };
+      const isQuestion = toolName === "AskUserQuestion";
+      const isPlan = toolName === "ExitPlanMode";
+      if ((isQuestion || isPlan) && !interactiveQuestions)
+        return {
+          behavior: "deny",
+          message: "No interactive user is available.",
+        };
+      if (!isQuestion && !isPlan && planning && toolName !== "EnterPlanMode")
+        return {
+          behavior: "deny",
+          message: "Finish planning before requesting write access.",
+        };
+      if (!isQuestion && !isPlan && autoApprove)
+        return { behavior: "allow", updatedInput: input };
+      try {
+        const response = await sink.requestPermission({
+          type: "permission.requested",
+          provider: request.provider,
+          runId: request.runId,
+          timestamp: new Date().toISOString(),
+          requestId: context.toolUseID,
+          kind: isQuestion ? "question" : isPlan ? "plan" : "tool",
+          toolName,
+          ...(isQuestion
+            ? { questions: normalizeUserQuestions("claude-code", input) }
+            : {}),
+          title: isQuestion
+            ? "Your input is needed"
+            : isPlan
+              ? "Review the plan"
+              : (context.title ?? `Allow ${toolName}?`),
+          message: context.description ?? context.decisionReason,
+          input,
+          canRemember: false,
+        });
+        if (isPlan && response.decision === "allow") planning = false;
+        if (
+          !cancelled &&
+          !context.signal.aborted &&
+          response.decision === "allow"
+        )
+          return {
+            behavior: "allow",
+            updatedInput: isQuestion
+              ? {
+                  ...input,
+                  answers: questionReply(
+                    "claude-code",
+                    input,
+                    response.answers ?? [],
+                  ),
+                }
+              : input,
+          };
+        return { behavior: "deny", message: "The user denied this action" };
+      } catch {
+        return {
+          behavior: "deny",
+          message: "Run cancelled",
+          interrupt: true,
+        };
+      }
+    },
+  };
+  const startCli = (): AsyncIterable<unknown> => {
+    const fresh = new NativeClaudeSession(sessionId, async () => {
+      fresh.prompt.finish();
+      handle?.close();
+      controller.abort();
+      if (processHandle) await processHandle.kill();
+    });
+    session = fresh;
+    fresh.prompt.push(userMessage);
     handle = query({
-      prompt,
+      prompt: fresh.prompt,
       options: {
         ...options,
         // Use the SDK-matched CLI by default; an installed CLI is an explicit override.
@@ -2471,109 +2590,45 @@ export async function executeNativeClaude(
           });
           return processHandle.child;
         },
+        // Routed through the session so that whichever run is attached
+        // decides, and a parked CLI with nobody attached is never left
+        // waiting on a decision.
         hooks: {
           ...options.hooks,
           PreToolUse: [
             ...(options.hooks?.PreToolUse ?? []),
-            {
-              hooks: [
-                async (input) => {
-                  if (input.hook_event_name !== "PreToolUse") return {};
-                  planning = input.permission_mode === "plan";
-                  return interactiveQuestions &&
-                    ["AskUserQuestion", "ExitPlanMode"].includes(
-                      input.tool_name,
-                    )
-                    ? {
-                        hookSpecificOutput: {
-                          hookEventName: "PreToolUse" as const,
-                          permissionDecision: "ask" as const,
-                        },
-                      }
-                    : {};
-                },
-              ],
-            },
+            { hooks: [fresh.preToolUse] },
           ],
         },
-        async canUseTool(toolName, input, context) {
-          if (cancelled || context.signal.aborted)
-            return {
-              behavior: "deny",
-              message: "Run cancelled",
-              interrupt: true,
-            };
-          const isQuestion = toolName === "AskUserQuestion";
-          const isPlan = toolName === "ExitPlanMode";
-          if ((isQuestion || isPlan) && !interactiveQuestions)
-            return {
-              behavior: "deny",
-              message: "No interactive user is available.",
-            };
-          if (
-            !isQuestion &&
-            !isPlan &&
-            planning &&
-            toolName !== "EnterPlanMode"
-          )
-            return {
-              behavior: "deny",
-              message: "Finish planning before requesting write access.",
-            };
-          if (!isQuestion && !isPlan && autoApprove)
-            return { behavior: "allow", updatedInput: input };
-          try {
-            const response = await sink.requestPermission({
-              type: "permission.requested",
-              provider: request.provider,
-              runId: request.runId,
-              timestamp: new Date().toISOString(),
-              requestId: context.toolUseID,
-              kind: isQuestion ? "question" : isPlan ? "plan" : "tool",
-              toolName,
-              ...(isQuestion
-                ? { questions: normalizeUserQuestions("claude-code", input) }
-                : {}),
-              title: isQuestion
-                ? "Your input is needed"
-                : isPlan
-                  ? "Review the plan"
-                  : (context.title ?? `Allow ${toolName}?`),
-              message: context.description ?? context.decisionReason,
-              input,
-              canRemember: false,
-            });
-            if (isPlan && response.decision === "allow") planning = false;
-            if (
-              !cancelled &&
-              !context.signal.aborted &&
-              response.decision === "allow"
-            )
-              return {
-                behavior: "allow",
-                updatedInput: isQuestion
-                  ? {
-                      ...input,
-                      answers: questionReply(
-                        "claude-code",
-                        input,
-                        response.answers ?? [],
-                      ),
-                    }
-                  : input,
-              };
-            return { behavior: "deny", message: "The user denied this action" };
-          } catch {
-            return {
-              behavior: "deny",
-              message: "Run cancelled",
-              interrupt: true,
-            };
-          }
-        },
+        canUseTool: fresh.canUseTool,
       },
     });
-    const live = handle;
+    fresh.bind(handle);
+    return fresh.open(handlers);
+  };
+  const notice = (item: Record<string, unknown>): AsyncIterable<unknown> =>
+    (async function* () {
+      yield item;
+    })();
+  try {
+    let messages: AsyncIterable<unknown>;
+    const adopted = adopting?.adopt(handlers, attachOnly);
+    if (adopted) {
+      debugClaude("★ adopting the CLI parked for session %s", sessionId);
+      session = adopting;
+      if (!attachOnly) adopting!.prompt.push(userMessage);
+      messages = adopted;
+    } else if (attachOnly) {
+      // Nothing parked here (its budget ran out, the process restarted), or
+      // nothing happened while parked: leave it for the wake that will.
+      messages = notice({
+        _notice: adopting ? "no_parked_turn" : "no_parked_run",
+        sessionId,
+      });
+    } else {
+      messages = startCli();
+    }
+    const live = session?.query;
     sink.setRaw({ query: live, claudeDir, runId: request.runId });
     sink.emitEvent(
       createNormalizedEvent("run.started", {
@@ -2588,29 +2643,40 @@ export async function executeNativeClaude(
         { messageId },
       ),
     );
+    const owned = session;
     await consumeClaudeMessages(
       request,
       sink,
-      live,
+      messages,
       Date.now(),
       stop,
       () => cancelled,
       {
         ...wait,
+        attachOnly,
         // Native owns the CLI: ask it to stop leftover tasks before closing it.
         stopTasks: async (ids) => {
+          if (!live) return;
           await Promise.all(
             ids.map((id) => live.stopTask(id).catch(() => undefined)),
           );
         },
+        ...(parking && owned
+          ? {
+              park: async (tasks, ttlMs, inflight) =>
+                (parked = owned.park(tasks, ttlMs, parking, inflight)),
+              // The CLI lives on in the session; nothing to let go of.
+              detach: async () => undefined,
+            }
+          : {}),
       },
       tracker,
     );
   } catch (error) {
-    await stop();
+    if (!parked) await stop();
     if (cancelled) sink.cancel();
     else throw error;
   } finally {
-    await stop();
+    if (!parked) await stop();
   }
 }
