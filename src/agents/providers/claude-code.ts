@@ -65,7 +65,7 @@ import {
   resolveCapabilityToken,
   withBearerToken,
 } from "../config/capability-token";
-import { extractClaudeCostData } from "../cost";
+import { createClaudeCostAccumulator } from "../cost";
 import {
   BACKGROUND_TASK_GRACE_MS,
   BackgroundTaskTracker,
@@ -108,7 +108,10 @@ import type { Sandbox } from "../../sandboxes";
 // Bumped 9 -> 10: a park carries its deadline across adoptions (`_parked`
 // reports the budget left), an adopting run's permission mode replaces the
 // parking run's, and an unattended CLI never blocks on a permission.
-const DAEMON_PROTOCOL_VERSION = "10";
+// Bumped 10 -> 11: every route is guarded and the process survives a stray
+// rejection/exception, so one bad request can no longer take down the live
+// and parked runs sharing this daemon.
+const DAEMON_PROTOCOL_VERSION = "11";
 const DAEMON_PORT = 43180;
 const DAEMON_PATH = "/tmp/agentbox/claude-code/daemon.mjs";
 const DAEMON_LOG_PATH = "/tmp/agentbox/claude-code/daemon.log";
@@ -879,7 +882,7 @@ async function handleAbort(_req, res, runId) {
     res.end();
     return;
   }
-  await run.query.interrupt().catch(() => {});
+  await run.query?.interrupt().catch(() => {});
   res.writeHead(204);
   res.end();
 }
@@ -893,6 +896,20 @@ async function handleDelete(_req, res, runId) {
   }
   res.writeHead(204);
   res.end();
+}
+
+// Every route runs through this. A handler that throws must never become an
+// unhandled rejection: this process owns every live run in the sandbox plus
+// whatever background work is parked here, and a default-exit would take all
+// of it down over one bad request.
+function guard(promise, res) {
+  promise.catch((error) => {
+    console.error("[claude-code-daemon] request failed:", error?.stack ?? error);
+    try {
+      if (!res.headersSent) res.writeHead(500, { "content-type": "text/plain" });
+      if (!res.writableEnded) res.end();
+    } catch {}
+  });
 }
 
 const server = http.createServer((req, res) => {
@@ -912,42 +929,58 @@ const server = http.createServer((req, res) => {
   const url = req.url ?? "";
   const permissionRoute = url.match(/^\\/runs\\/([^/]+)\\/permission$/);
   if (req.method === "POST" && permissionRoute) {
-    handlePermission(req, res, decodeURIComponent(permissionRoute[1])).catch(() => { if (!res.headersSent) res.writeHead(400); res.end(); });
+    guard(handlePermission(req, res, decodeURIComponent(permissionRoute[1])), res);
     return;
   }
   let m;
   if (req.method === "POST" && (m = url.match(/^\\/runs\\/([^/]+)\\/start$/))) {
-    handleStart(req, res, decodeURIComponent(m[1]));
+    guard(handleStart(req, res, decodeURIComponent(m[1])), res);
     return;
   }
   if (req.method === "POST" && (m = url.match(/^\\/runs\\/([^/]+)\\/sendMessage$/))) {
-    handleSendMessage(req, res, decodeURIComponent(m[1]));
+    guard(handleSendMessage(req, res, decodeURIComponent(m[1])), res);
     return;
   }
   if (req.method === "POST" && (m = url.match(/^\\/runs\\/([^/]+)\\/abort$/))) {
-    handleAbort(req, res, decodeURIComponent(m[1]));
+    guard(handleAbort(req, res, decodeURIComponent(m[1])), res);
     return;
   }
   if (req.method === "POST" && (m = url.match(/^\\/runs\\/([^/]+)\\/park$/))) {
-    handlePark(req, res, decodeURIComponent(m[1])).catch(() => { if (!res.headersSent) res.writeHead(400); res.end(); });
+    guard(handlePark(req, res, decodeURIComponent(m[1])), res);
     return;
   }
   if (req.method === "DELETE" && (m = url.match(/^\\/runs\\/([^/]+)$/))) {
-    handleDelete(req, res, decodeURIComponent(m[1]));
+    guard(handleDelete(req, res, decodeURIComponent(m[1])), res);
     return;
   }
   res.writeHead(404, { "content-type": "text/plain" });
   res.end("not found");
 });
 
+server.on("error", (error) => {
+  console.error("[claude-code-daemon] server error:", error?.stack ?? error);
+});
+
 server.listen(port, "0.0.0.0", () => {
   console.error("[claude-code-daemon] listening on :" + port + " v" + VERSION);
+});
+
+// Last line of defence. Node's default is to exit on either of these, which
+// would tear down every live run and every parked CLI in this sandbox over
+// one stray error (a write to a socket that just died, a malformed frame).
+// Staying up costs nothing: a run whose own stream is broken still unwinds
+// through its sink's "close" handler.
+process.on("unhandledRejection", (reason) => {
+  console.error("[claude-code-daemon] unhandled rejection:", reason?.stack ?? reason);
+});
+process.on("uncaughtException", (error) => {
+  console.error("[claude-code-daemon] uncaught exception:", error?.stack ?? error);
 });
 
 const shutdown = () => {
   for (const r of liveRuns.values()) {
     r.prompt.end();
-    r.query.interrupt().catch(() => {});
+    r.query?.interrupt().catch(() => {});
   }
   server.close();
   setTimeout(() => process.exit(0), 100).unref();
@@ -1356,12 +1389,15 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
   async execute(
     request: AgentExecutionRequest<"claude-code">,
     sink: AgentRunSink,
-  ): Promise<() => Promise<void>> {
+  ): Promise<void> {
     const executeStartedAt = Date.now();
     debugClaude("execute() start runId=%s", request.runId);
 
     const sandbox = request.options.sandbox;
-    if (!sandbox) return executeNativeClaude(request, sink);
+    if (!sandbox) {
+      await executeNativeClaude(request, sink);
+      return;
+    }
 
     const claudeDir = claudeConfigDir(request.options);
     const settingsPath = path.join(claudeDir, "settings.json");
@@ -1533,73 +1569,99 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
     );
 
     const tracker = new BackgroundTaskTracker();
+    type PermissionAsk = {
+      requestId: string;
+      toolName: string;
+      input: Record<string, unknown>;
+      title?: string;
+    };
+    // Asking the host is a side channel, never a pause in the read loop: the
+    // CLI can have several tool calls in flight, and awaiting one decision
+    // inline would leave every later frame — including a second request — sat
+    // unread in the socket until the first was answered. Each ask runs on its
+    // own, and the first failed reply surfaces on the next frame.
+    const pendingReplies = new Set<Promise<void>>();
+    let replyError: unknown;
+    const answerPermission = async (ask: PermissionAsk): Promise<void> => {
+      const isQuestion = ask.toolName === "AskUserQuestion";
+      const isPlan = ask.toolName === "ExitPlanMode";
+      const answer = await sink.requestPermission({
+        type: "permission.requested",
+        provider: request.provider,
+        runId: request.runId,
+        timestamp: new Date().toISOString(),
+        requestId: ask.requestId,
+        kind: isQuestion ? "question" : isPlan ? "plan" : "tool",
+        toolName: ask.toolName,
+        title: isQuestion
+          ? "Your input is needed"
+          : isPlan
+            ? "Review the plan"
+            : (ask.title ?? `Allow ${ask.toolName}?`),
+        input: ask.input,
+        ...(isQuestion
+          ? { questions: normalizeUserQuestions("claude-code", ask.input) }
+          : {}),
+      });
+      const reply = await fetch(
+        `${baseUrl}/runs/${encodeURIComponent(request.runId)}/permission`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", ...authHeaders },
+          signal: fetchAbort.signal,
+          body: JSON.stringify({
+            requestId: ask.requestId,
+            response:
+              answer.decision === "allow"
+                ? {
+                    behavior: "allow",
+                    updatedInput: isQuestion
+                      ? {
+                          ...ask.input,
+                          answers: questionReply(
+                            "claude-code",
+                            ask.input,
+                            answer.answers ?? [],
+                          ),
+                        }
+                      : ask.input,
+                  }
+                : {
+                    behavior: "deny",
+                    message: "The user declined this request.",
+                  },
+          }),
+        },
+      );
+      if (!reply.ok)
+        throw new Error(`Claude permission response failed: ${reply.status}`);
+    };
     const permissionMessages = async function* () {
-      for await (const item of parseNdjsonStream(response.body!)) {
-        const control = item as {
-          _permission?: {
-            requestId: string;
-            toolName: string;
-            input: Record<string, unknown>;
-            title?: string;
-          };
-        };
-        if (!control._permission) {
-          yield item;
-          continue;
+      try {
+        for await (const item of parseNdjsonStream(response.body!)) {
+          if (replyError !== undefined) throw replyError;
+          const control = item as { _permission?: PermissionAsk };
+          if (!control._permission) {
+            yield item;
+            continue;
+          }
+          const pending = answerPermission(control._permission).catch(
+            (error: unknown) => {
+              // An abort rejects both the outstanding ask (the sink clears
+              // its pending permissions) and the reply fetch; that is the run
+              // ending, not a transport failure. A run that settles on its
+              // own rejects its asks too, but nothing pulls this generator
+              // afterwards, so the recorded error simply never surfaces.
+              if (replyError === undefined && !cancelled) replyError = error;
+            },
+          );
+          pendingReplies.add(pending);
+          void pending.finally(() => pendingReplies.delete(pending));
         }
-        const ask = control._permission;
-        const isQuestion = ask.toolName === "AskUserQuestion";
-        const isPlan = ask.toolName === "ExitPlanMode";
-        const answer = await sink.requestPermission({
-          type: "permission.requested",
-          provider: request.provider,
-          runId: request.runId,
-          timestamp: new Date().toISOString(),
-          requestId: ask.requestId,
-          kind: isQuestion ? "question" : isPlan ? "plan" : "tool",
-          toolName: ask.toolName,
-          title: isQuestion
-            ? "Your input is needed"
-            : isPlan
-              ? "Review the plan"
-              : (ask.title ?? `Allow ${ask.toolName}?`),
-          input: ask.input,
-          ...(isQuestion
-            ? { questions: normalizeUserQuestions("claude-code", ask.input) }
-            : {}),
-        });
-        const reply = await fetch(
-          `${baseUrl}/runs/${encodeURIComponent(request.runId)}/permission`,
-          {
-            method: "POST",
-            headers: { "content-type": "application/json", ...authHeaders },
-            signal: fetchAbort.signal,
-            body: JSON.stringify({
-              requestId: ask.requestId,
-              response:
-                answer.decision === "allow"
-                  ? {
-                      behavior: "allow",
-                      updatedInput: isQuestion
-                        ? {
-                            ...ask.input,
-                            answers: questionReply(
-                              "claude-code",
-                              ask.input,
-                              answer.answers ?? [],
-                            ),
-                          }
-                        : ask.input,
-                    }
-                  : {
-                      behavior: "deny",
-                      message: "The user declined this request.",
-                    },
-            }),
-          },
-        );
-        if (!reply.ok)
-          throw new Error(`Claude permission response failed: ${reply.status}`);
+        if (replyError !== undefined) throw replyError;
+      } finally {
+        // Never leave a decision in flight once the stream is done with.
+        await Promise.allSettled([...pendingReplies]);
       }
     };
     const parking = request.options.provider?.parkBackgroundWork;
@@ -1645,8 +1707,6 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       },
       tracker,
     );
-
-    return async () => undefined;
   }
 
   /**
@@ -1754,7 +1814,9 @@ async function consumeClaudeMessages(
   let firstTextDeltaLogged = false;
   let lastTerminalReason: string | undefined;
   let lastIsError = false;
-  const rawPayloads: Array<Record<string, unknown>> = [];
+  // Cost is accumulated as payloads stream: a run no longer retains its
+  // whole transcript in memory just to read usage off the last `result`.
+  const cost = createClaudeCostAccumulator();
   const timeoutMs = resolveBackgroundTaskTimeoutMs(
     request.options.backgroundTaskTimeoutMs,
   );
@@ -1779,6 +1841,10 @@ async function consumeClaudeMessages(
   // run with nothing to do.
   let foreignResults = 0;
   let nothingParked = false;
+  // Commands the CLI has queued for this run but not started yet, by
+  // `command_uuid`. While one is outstanding the run's own prompt has not
+  // run, so a turn the CLI started for itself is not the answer to it.
+  const queuedCommands = new Set<string>();
   let lastTasksKey = JSON.stringify({
     tasks: [],
     waiting: false,
@@ -1934,7 +2000,7 @@ async function consumeClaudeMessages(
         }
       }
       const message = item as SDKMessage;
-      rawPayloads.push(message as unknown as Record<string, unknown>);
+      cost.add(message as unknown as Record<string, unknown>);
       sink.emitRaw(toRawEvent(request.runId, message, message.type));
       if (tracker.ingest(message) && pendingWait) {
         debugClaude(
@@ -1963,6 +2029,20 @@ async function consumeClaudeMessages(
         (tracker.liveTasks().length === 0 || (await tryPark()))
       )
         break;
+
+      // Not part of the SDKMessage union: read it off the wire shape.
+      if ((message as { type?: string }).type === "command_lifecycle") {
+        const lifecycle = message as unknown as {
+          state?: string;
+          command_uuid?: string;
+        };
+        const id = lifecycle.command_uuid;
+        if (id) {
+          if (lifecycle.state === "queued") queuedCommands.add(id);
+          else queuedCommands.delete(id);
+        }
+        continue;
+      }
 
       if (message.type === "system") {
         // The CLI surfaces several message variants under `type: "system"`:
@@ -2135,6 +2215,28 @@ async function consumeClaudeMessages(
           streamedThinkingChars = 0;
           continue;
         }
+        // A turn the CLI started for itself while this run's prompt is still
+        // queued. On resume the CLI replays the notifications a previous
+        // session left behind — a background command it could not finish —
+        // and delivers them as a turn of their own, ahead of the queued
+        // command. That turn's result is not this run's answer: take it for
+        // one and the run completes empty and tears the CLI down before the
+        // prompt ever starts. `sawResult` still counts it, so a stream that
+        // ends here settles rather than reporting a missing result. Only the
+        // notification origin qualifies: the wake turn of this run's own
+        // background work carries it too, but by then nothing is queued.
+        // Attach-only runs queue no command, so the turns they stream to
+        // report parked work still settle them.
+        const origin = (message as { origin?: { kind?: string } }).origin;
+        if (origin?.kind === "task-notification" && queuedCommands.size > 0) {
+          debugClaude(
+            "★ notification turn ended while this run's prompt is still queued; not its answer",
+          );
+          sawResult = true;
+          accumulatedText = "";
+          streamedThinkingChars = 0;
+          continue;
+        }
         sawResult = true;
         const result = message as SDKResultMessage;
         lastTerminalReason = result.terminal_reason;
@@ -2225,7 +2327,7 @@ async function consumeClaudeMessages(
       );
       sink.cancel({
         text: finalText,
-        costData: extractClaudeCostData(rawPayloads),
+        costData: cost.result(),
       });
     } else if (isError) {
       debugClaude(
@@ -2254,7 +2356,7 @@ async function consumeClaudeMessages(
       );
       sink.complete({
         text: finalText,
-        costData: extractClaudeCostData(rawPayloads),
+        costData: cost.result(),
         // Told, not guessed: an attach that found nothing parked ran no turn
         // at all, which from the outside looks exactly like a real tool-only
         // turn that produced no answer text and no usage.
@@ -2272,7 +2374,7 @@ export async function executeNativeClaude(
   request: AgentExecutionRequest<"claude-code">,
   sink: AgentRunSink,
   wait: Pick<BackgroundWaitOptions, "graceMs" | "stopTimeoutMs"> = {},
-): Promise<() => Promise<void>> {
+): Promise<void> {
   const { query } = await import("@anthropic-ai/claude-agent-sdk");
   const claudeDir = claudeConfigDir(request.options);
   const input = await validateProviderUserInput(
@@ -2511,5 +2613,4 @@ export async function executeNativeClaude(
   } finally {
     await stop();
   }
-  return stop;
 }

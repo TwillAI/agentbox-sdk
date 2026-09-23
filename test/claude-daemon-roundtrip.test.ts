@@ -783,3 +783,53 @@ it("completes an attach that finds nothing parked with no text, and waits as bef
     await daemon.stop();
   }
 });
+
+// Two tool calls in flight at once, each blocking on its own approval.
+const PARALLEL_PERMISSIONS_SDK = `
+export const getSessionInfo = async () => undefined;
+export function query({ options }) {
+  const controller = new AbortController();
+  const ask = (id) => options.canUseTool("Bash", { command: id }, { signal: controller.signal, toolUseID: id });
+  const iterator = (async function* () {
+    yield { type: "system", subtype: "init", session_id: "test" };
+    const decided = await Promise.all([ask("first"), ask("second")]);
+    yield { type: "result", subtype: "success", result: decided.map((d) => d.behavior).join(",") };
+  })();
+  return Object.assign(iterator, { interrupt: async () => controller.abort(), close() { controller.abort(); } });
+}
+`;
+
+it("surfaces concurrent permission requests instead of serializing them behind the transport read", async () => {
+  const daemon = await startDaemon(PARALLEL_PERMISSIONS_SDK);
+  try {
+    const sandbox = { getPreviewLink: async () => daemon.url, previewHeaders: {}, run: async () => ({ exitCode: 0, stdout: "test-token", stderr: "", combinedOutput: "test-token" }) } as unknown as Sandbox;
+    const seen: string[] = [];
+    let releaseFirst!: () => void;
+    const bothAsked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const state: { text?: string } = {};
+    const sink: AgentRunSink = {
+      setRaw: vi.fn(), setAbort: vi.fn(), emitRaw: vi.fn(), onMessage: vi.fn(),
+      fail: vi.fn(), emitEvent: vi.fn(), setSessionId: vi.fn(), cancel: vi.fn(),
+      complete: (result) => { state.text = result?.text; },
+      // The first decision is withheld until the second request has arrived.
+      // Serialized behind the read loop, the second frame never arrives and
+      // this deadlocks until the suite times out.
+      requestPermission: async (event) => {
+        seen.push(String((event.input as { command?: string }).command));
+        if (seen.length >= 2) releaseFirst();
+        else await bothAsked;
+        return { requestId: event.requestId, decision: "allow" as const };
+      },
+    };
+    await new ClaudeCodeAgentAdapter().execute({
+      provider: "claude-code",
+      runId: randomUUID(),
+      options: { sandbox, cwd: daemon.cwd, approvalMode: "interactive" },
+      run: { input: "Go", model: "sonnet" },
+    }, sink);
+    expect(seen.sort()).toEqual(["first", "second"]);
+    expect(state.text).toBe("allow,allow");
+  } finally {
+    await daemon.stop();
+  }
+});

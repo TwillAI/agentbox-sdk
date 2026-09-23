@@ -67,7 +67,7 @@ import { fetchJson, streamSseResilient } from "../transports/app-server";
 import { spawnCommand, type SpawnedProcess } from "../transports/spawn";
 import { sleep, waitFor, getAvailablePort } from "../../shared/network";
 import { shellQuote } from "../../shared/shell";
-import { extractOpenCodeCostData } from "../cost";
+import { createOpenCodeCostAccumulator } from "../cost";
 import { debugOpencode, time } from "../../shared/debug";
 
 /**
@@ -1100,7 +1100,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
   async execute(
     request: AgentExecutionRequest<"open-code">,
     sink: AgentRunSink,
-  ): Promise<() => Promise<void>> {
+  ): Promise<void> {
     const executeStartedAt = Date.now();
     debugOpencode("execute() start runId=%s", request.runId);
     const inputParts = await time(
@@ -1133,8 +1133,8 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
     // Cost/tokens for the run. Captured on each `message.updated`
     // SSE event for our session's assistant messages (see SSE handler
     // below) and surfaced via `sink.complete` at run end. The
-    // `extractOpenCodeCostData` fallback over `rawPayloads` covers the
-    // step-finish part shape if it's the only carrier.
+    // `createOpenCodeCostAccumulator` fallback covers the step-finish part
+    // shape if it's the only carrier.
     let dispatchError: unknown;
     let firstSseEventLogged = false;
 
@@ -1183,7 +1183,8 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
         runId: request.runId,
       }),
     );
-    const rawPayloads: Array<Record<string, unknown>> = [];
+    // Cost totals accumulate as events stream; nothing is retained.
+    const cost = createOpenCodeCostAccumulator();
 
     const sseAbort = new AbortController();
     let sseTask: Promise<void> | undefined;
@@ -1554,7 +1555,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
               typeof payload === "object" &&
               !Array.isArray(payload)
             ) {
-              rawPayloads.push(payload as Record<string, unknown>);
+              cost.add(payload as Record<string, unknown>);
             }
             sink.emitRaw(raw);
 
@@ -1980,7 +1981,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
         ),
       );
       if (createdSession) {
-        rawPayloads.push(createdSession);
+        cost.add(createdSession);
       }
       sink.emitEvent(
         createNormalizedEvent("message.started", {
@@ -2238,7 +2239,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
         );
         sink.cancel({
           text: streamedTextFromSse || undefined,
-          costData: extractOpenCodeCostData(rawPayloads),
+          costData: cost.result(),
         });
       } else if (sessionErrorFromSse) {
         sink.fail(sessionErrorFromSse);
@@ -2285,7 +2286,7 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
         );
         sink.complete({
           text: lastAssistantText,
-          costData: extractOpenCodeCostData(rawPayloads),
+          costData: cost.result(),
         });
       } else if (sseSilent) {
         sink.fail(
@@ -2305,7 +2306,6 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
       // down via the abort controller above.
     }
 
-    return async () => undefined;
   }
 
   /**

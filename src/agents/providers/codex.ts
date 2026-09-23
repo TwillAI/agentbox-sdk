@@ -58,7 +58,7 @@ import { linesFromNodeStream, spawnCommand } from "../transports/spawn";
 import { linesFromTextChunks } from "../../shared/streams";
 import { shellQuote } from "../../shared/shell";
 import { sleep } from "../../shared/network";
-import { extractCodexCostData } from "../cost";
+import { createCodexCostAccumulator } from "../cost";
 import { debugCodex, time } from "../../shared/debug";
 import {
   BACKGROUND_TASK_GRACE_MS,
@@ -1647,7 +1647,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
   async execute(
     request: AgentExecutionRequest<"codex">,
     sink: AgentRunSink,
-  ): Promise<() => Promise<void>> {
+  ): Promise<void> {
     const executeStartedAt = Date.now();
     debugCodex("execute() start runId=%s", request.runId);
     const inputParts = await time(debugCodex, "validateProviderUserInput", () =>
@@ -1764,7 +1764,8 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
 
     sink.onMessage(sendTurn);
 
-    const rawPayloads: Array<Record<string, unknown>> = [];
+    // Usage totals accumulate as notifications stream; nothing is retained.
+    const cost = createCodexCostAccumulator();
     // File approval frames only contain an item ID; the preceding item event
     // carries paths and diffs. Keep a bounded, thread/turn-scoped preview for
     // human review without changing the approval decision sent to Codex.
@@ -1869,7 +1870,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
             );
           }
           const raw = toRawEvent(request.runId, message, message.method);
-          rawPayloads.push(message);
+          cost.add(message);
           sink.emitRaw(raw);
 
           const item = message.params?.item as Record<string, unknown> | undefined;
@@ -2070,7 +2071,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
         client.bindThread(threadResponse.thread.id);
       }
       sink.setSessionId(threadResponse.thread.id);
-      rawPayloads.push(threadResponse);
+      cost.add(threadResponse);
       sink.emitRaw(
         toRawEvent(request.runId, threadResponse, threadResultEventName),
       );
@@ -2162,7 +2163,7 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
           );
           sink.cancel({
             text: streamedText || lastTurn?.text || undefined,
-            costData: extractCodexCostData(rawPayloads),
+            costData: cost.result(),
           });
         } else {
           sink.fail(completionError);
@@ -2175,14 +2176,14 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
             Date.now() - executeStartedAt,
             interrupted,
           );
-          sink.cancel({ text, costData: extractCodexCostData(rawPayloads) });
+          sink.cancel({ text, costData: cost.result() });
         } else {
           debugCodex(
             "★ run.completed (%dms since execute start) chars=%d",
             Date.now() - executeStartedAt,
             text?.length ?? 0,
           );
-          sink.complete({ costData: extractCodexCostData(rawPayloads) });
+          sink.complete({ costData: cost.result() });
         }
       }
     } finally {
@@ -2190,7 +2191,6 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       await runtime.cleanup().catch(() => undefined);
     }
 
-    return async () => undefined;
   }
 
   /**

@@ -103,7 +103,9 @@ async function setup(name: string, options: FixtureOptions = {}) {
   );
   const record = path.join(directory, "requests.jsonl");
   const binary = await fixture(directory, options);
-  const agent = (options: { backgroundTaskTimeoutMs?: number } = {}) =>
+  const agent = (
+    options: { backgroundTaskTimeoutMs?: number; retainEvents?: boolean } = {},
+  ) =>
     new Agent("codex", {
       cwd: directory,
       stateDirectory: directory,
@@ -775,5 +777,38 @@ it("attachAbort only interrupts when the turn is active", async () => {
     ]);
   } finally {
     await fake.close();
+  }
+});
+
+it("streams every event but retains none when retainEvents is off", async () => {
+  const { directory, agent } = await setup("retain-events", { startCommand: false });
+  try {
+    const retained = await collect(agent().stream({ input: "hello" }));
+    expect(retained.error).toBeUndefined();
+    expect(retained.events.length).toBeGreaterThan(0);
+    expect(retained.rawEvents.length).toBeGreaterThan(0);
+
+    const streamed: string[] = [];
+    const rawSeen: string[] = [];
+    const run = agent({ retainEvents: false }).stream({ input: "hello" });
+    const rawDone = (async () => {
+      for await (const raw of run.rawEvents()) rawSeen.push(raw.type);
+    })();
+    const lean = await collect(run, async (event) => {
+      streamed.push(event.type);
+    });
+    await rawDone;
+
+    // Live consumers see exactly what they saw before; only the replay arrays
+    // (which a streaming host never reads) are dropped.
+    expect(lean.error).toBeUndefined();
+    expect(streamed).toEqual(retained.events.map((event) => event.type));
+    expect(rawSeen).toEqual(retained.rawEvents.map((event) => event.type));
+    expect(lean.events).toEqual([]);
+    expect(lean.rawEvents).toEqual([]);
+    expect(lean.text).toBe(retained.text);
+    expect(lean.costData).toEqual(retained.costData);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });

@@ -36,25 +36,36 @@ export class AsyncQueue<T> implements AsyncIterable<T>, AsyncIterator<T> {
     }
   }
 
+  /**
+   * Fail the queue for whatever has not been delivered yet.
+   *
+   * A queue that already {@link finish}ed stays finished: every event reached
+   * the consumer and the transport merely closed afterwards (a websocket
+   * "error" landing right behind its "close"), which is not a run failure.
+   * Buffered items also survive — {@link next} drains them before it throws —
+   * so a transport that dies mid-stream still hands over everything it
+   * received instead of discarding the tail.
+   */
   fail(error: unknown): void {
-    if (this.failure) {
+    if (this.closed || this.failure) {
       return;
     }
 
     this.failure = asError(error);
+    // A consumer only waits once `items` is empty, so nothing is lost here.
     while (this.resolvers.length > 0) {
       this.resolvers.shift()?.reject(this.failure);
     }
   }
 
   async next(): Promise<IteratorResult<T>> {
-    if (this.failure) {
-      throw this.failure;
-    }
-
     if (this.items.length > 0) {
       const value = this.items.shift() as T;
       return { done: false, value };
+    }
+
+    if (this.failure) {
+      throw this.failure;
     }
 
     if (this.closed) {
