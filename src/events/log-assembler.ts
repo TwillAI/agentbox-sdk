@@ -438,10 +438,19 @@ class OpenCodeLogAssembler {
 
       const text = (this.textByPartId.get(partId) ?? "") + delta;
       this.textByPartId.set(partId, text);
+      // Reasoning parts also stream via `field: "text"`; only the part's
+      // snapshot knows its type. Build on it so a reasoning part isn't
+      // re-emitted as a text part (the UI would then render it twice).
+      const previous = this.byPartId.get(partId);
+      const previousPart = isRecord(
+        (previous?.properties as JsonRecord | undefined)?.part,
+      )
+        ? ((previous?.properties as JsonRecord).part as JsonRecord)
+        : null;
       const part: JsonRecord = {
+        ...(previousPart ? clone(previousPart) : { type: "text" }),
         id: partId,
-        messageID: messageId ?? undefined,
-        type: "text",
+        messageID: messageId ?? previousPart?.messageID ?? undefined,
         text,
       };
       if (parentTaskCallId) {

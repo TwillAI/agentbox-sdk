@@ -957,6 +957,44 @@ describe("ProviderLogAssembler — opencode sub-agent linkage", () => {
     });
   });
 
+  it("keeps a reasoning part's type while its text streams via field=text deltas", () => {
+    const a = new ProviderLogAssembler();
+    a.process("opencode", ocUserMessage(MAIN_SID, "u1"));
+    a.process("opencode", {
+      type: "message.part.updated",
+      properties: {
+        part: {
+          id: "part_reasoning",
+          messageID: "m_parent",
+          sessionID: MAIN_SID,
+          type: "reasoning",
+          text: "",
+          time: { start: 1 },
+        },
+      },
+    });
+    const [first] = a.process(
+      "opencode",
+      ocTextDelta(MAIN_SID, "m_parent", "part_reasoning", "Think"),
+    );
+    const [second] = a.process(
+      "opencode",
+      ocTextDelta(MAIN_SID, "m_parent", "part_reasoning", "ing"),
+    );
+    const [answer] = a.process(
+      "opencode",
+      ocTextDelta(MAIN_SID, "m_parent", "part_text", "Hi"),
+    );
+
+    expect(partOf(first)).toMatchObject({ type: "reasoning", text: "Think" });
+    expect(partOf(second)).toMatchObject({
+      type: "reasoning",
+      text: "Thinking",
+      time: { start: 1 },
+    });
+    expect(partOf(answer)).toMatchObject({ type: "text", text: "Hi" });
+  });
+
   it("seedFromSnapshots restores parentTaskCallId so later child deltas keep nesting", () => {
     const a = new ProviderLogAssembler();
     a.process("opencode", ocUserMessage(MAIN_SID, "u1"));
