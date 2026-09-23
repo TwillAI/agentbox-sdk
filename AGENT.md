@@ -101,7 +101,16 @@ Provisioning is **explicit**: `new Sandbox(...)` only stores config; the live sa
 - Host Codex can opt into `provider.prewarm`: `setup()` initializes a process without a thread or prompt, the next run consumes it, and ordinary run cleanup still stops it. `killServer()` also cancels unused or in-flight preparation.
 - A run owns its harness process, so background work keeps the run open rather than outliving it. `AgentRun.finishBackgroundWait()` is the shared way for a host to end that wait and complete with the existing answer; providers register it through the optional `AgentRunSink.setFinishBackgroundWait`. Do not add model-side cleanup prompts to shorten waits.
 - The exception is the claude-code sandbox daemon, which outlives runs: with `provider.parkBackgroundWork` a run ends at its answer and the daemon *parks* the CLI **only while background work is live**, hands it to the next run for that session, and wakes the host (`wakeUrl`) when the CLI starts a turn nobody is watching. The host decides whether a wake becomes a run (`resumeParked`). Native runs still own their process.
+- Not every turn a resumed session runs belongs to the run that resumed it. Claude Code replays the notifications a previous session left behind — a background command it never finished — as a turn of their own, ahead of the command this run queued. Such a `result` carries `origin.kind === "task-notification"`; while this run's own `command_lifecycle` is still queued it is not the answer, and the adapter keeps reading for the real turn instead of completing empty and tearing the CLI down.
 - Harness slash commands are text: `resolveHarnessCommand` keeps `/name args` in the input and sets `AgentRunConfig.command`. Claude Code dispatches the text itself; the Codex and OpenCode adapters map known names to native calls (`thread/compact/start`, `review/start`, `POST /session/:id/summarize|command`, skill mentions) and send unknown names verbatim. Every run emits one `harness.commands` event (see `src/agents/harness-commands.ts`); hosts must not depend on its timing relative to the first turn.
+- A provider adapter's `execute()` drives one run to completion and resolves
+  only once the run has settled; it returns nothing. Cancellation is registered
+  through `AgentRunSink.setAbort` as soon as a transport exists — returning a
+  cleanup from `execute` would only ever arrive after the run was already over.
+- Runs retain every normalized and raw event for `AgentResult` by default.
+  `retainEvents: false` keeps the live streams intact and settles both arrays
+  as `[]`; cost is accumulated as payloads arrive (`src/agents/cost.ts`
+  `create*CostAccumulator`), never recomputed from a retained transcript.
 - Resume support is run-scoped and uses `resumeSessionId`.
 - Fork-at-message is run-scoped and uses `forkSessionId` + `forkAtMessageId`.
   The message id comes from the unified `messageId` field on `message.started`

@@ -134,6 +134,22 @@ default 30 minutes, `0` settles at the first turn end as before, `Infinity`
 waits forever. On expiry the tasks are stopped best-effort and the run
 completes with the last turn's text.
 
+### Event retention
+
+`AgentResult.events` and `AgentResult.rawEvents` replay everything a run
+emitted, which means a run holds its whole transcript — every tool result,
+every file the agent read — in memory until it settles. A host that consumes
+the live stream (`for await (const event of run)` / `run.rawEvents()`) never
+reads those arrays, so it can turn retention off:
+
+```ts
+const agent = new Agent("claude-code", { sandbox, retainEvents: false });
+```
+
+Both arrays then settle as `[]`. Streamed events, `text` and `costData` are
+unaffected — cost is accumulated as payloads arrive rather than recomputed
+from a retained transcript.
+
 ### Harness commands
 
 A run whose input starts with `/name args` carries the harness's own slash

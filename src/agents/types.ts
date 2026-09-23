@@ -199,6 +199,20 @@ export interface AgentOptionsBase {
    * settles immediately.
    */
   backgroundTaskTimeoutMs?: number;
+  /**
+   * Keep every normalized and raw event in memory for the life of the run so
+   * {@link AgentResult.events} / {@link AgentResult.rawEvents} can replay it
+   * (default `true`).
+   *
+   * Set `false` when the caller consumes the live stream (`for await (const
+   * event of run)` / `run.rawEvents()`) and never reads the arrays off the
+   * result. A long run's transcript — every tool result, every file the agent
+   * read — is otherwise retained twice over and copied once more when the run
+   * settles, which dominates memory for a host running many concurrent runs
+   * in one process. With retention off both arrays settle as `[]`; `text`,
+   * `costData` and every streamed event are unaffected.
+   */
+  retainEvents?: boolean;
   approvalMode?: AgentApprovalMode;
   /** Route questions and plan approvals to the caller even with automatic tool approval. */
   interactiveQuestions?: boolean;
@@ -400,7 +414,9 @@ export interface AgentResult {
   text: string;
   isCancelled: boolean;
   error?: string;
+  /** Empty when {@link AgentOptionsBase.retainEvents} is `false`. */
   rawEvents: RawAgentEvent[];
+  /** Empty when {@link AgentOptionsBase.retainEvents} is `false`. */
   events: NormalizedAgentEvent[];
   costData?: AgentCostData | null;
   /**
@@ -567,10 +583,19 @@ export interface AgentProviderAdapter<
    * app-server per run).
    */
   killServer(request: AgentSetupRequest<P>): Promise<void>;
+  /**
+   * Drive one run to completion. Resolves only once the run has settled
+   * (`sink.complete` / `cancel` / `fail`), so it must not be awaited before
+   * the caller starts reading the sink's streams.
+   *
+   * Cancellation is registered through `sink.setAbort` the moment a
+   * transport exists — not returned from here, which would only ever arrive
+   * after the run was already over.
+   */
   execute(
     request: AgentExecutionRequest<P>,
     sink: AgentRunSink,
-  ): Promise<() => Promise<void> | void>;
+  ): Promise<void>;
   /**
    * Stateless abort. Dial the in-sandbox provider server, issue the
    * provider's "interrupt the in-flight turn" primitive, close.

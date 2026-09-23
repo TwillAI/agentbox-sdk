@@ -86,121 +86,163 @@ function compactCostData(costData: AgentCostData): AgentCostData | null {
   return Object.keys(compacted).length > 0 ? compacted : null;
 }
 
+/**
+ * Incremental cost extraction.
+ *
+ * Providers feed every provider payload through `add()` as it streams and
+ * read `result()` when the run settles. Accumulators retain only what the
+ * arithmetic needs — a single payload for claude-code, running totals for
+ * codex/opencode — so a run no longer has to hold its whole transcript in
+ * memory just to report cost at the end. The array-based `extract*`
+ * functions below are thin wrappers, kept for callers that already have the
+ * payloads in hand.
+ */
+export interface CostAccumulator {
+  add(event: Record<string, unknown> | null | undefined): void;
+  result(): AgentCostData | null;
+}
+
+/** Only the last `result` message carries claude-code's cost; keep just it. */
+export function createClaudeCostAccumulator(): CostAccumulator {
+  let lastResult: Record<string, unknown> | undefined;
+  return {
+    add(event) {
+      if (event && event.type === "result") lastResult = event;
+    },
+    result() {
+      const event = lastResult;
+      if (!event) return null;
+
+      const totalCost =
+        typeof event.total_cost_usd === "number"
+          ? event.total_cost_usd
+          : undefined;
+      const usage: UsageTotals = {};
+      const modelUsage = asRecord(event.modelUsage);
+      if (modelUsage) {
+        for (const value of Object.values(modelUsage)) {
+          mergeUsage(usage, asRecord(value));
+        }
+      } else {
+        mergeUsage(usage, asRecord(event.usage));
+      }
+
+      return compactCostData({
+        ...(totalCost !== undefined ? { total_cost_usd: totalCost } : {}),
+        duration_ms:
+          typeof event.duration_ms === "number" ? event.duration_ms : undefined,
+        duration_api_ms:
+          typeof event.duration_api_ms === "number"
+            ? event.duration_api_ms
+            : undefined,
+        num_turns:
+          typeof event.num_turns === "number" ? event.num_turns : undefined,
+        usage,
+      });
+    },
+  };
+}
+
 export function extractClaudeCostData(
   events: Array<Record<string, unknown>>,
 ): AgentCostData | null {
-  for (let i = events.length - 1; i >= 0; i--) {
-    const event = events[i];
-    if (!event) {
-      continue;
-    }
-    if (event.type !== "result") {
-      continue;
-    }
+  const accumulator = createClaudeCostAccumulator();
+  for (const event of events) accumulator.add(event);
+  return accumulator.result();
+}
 
-    const totalCost =
-      typeof event.total_cost_usd === "number"
-        ? event.total_cost_usd
-        : undefined;
-    const usage: UsageTotals = {};
-    const modelUsage = asRecord(event.modelUsage);
-    if (modelUsage) {
-      for (const value of Object.values(modelUsage)) {
-        mergeUsage(usage, asRecord(value));
+/** Codex sums per-turn usage across the run; keep the running totals only. */
+export function createCodexCostAccumulator(): CostAccumulator {
+  const usage: UsageTotals = {};
+  let sawUsage = false;
+
+  return {
+    add(event) {
+      if (!event) return;
+      const params = asRecord(event.params);
+      // Codex (codex-rs ≥ 0.116) emits a `thread/tokenUsage/updated`
+      // notification at the end of each turn whose
+      // `params.tokenUsage.last` is the per-turn token counts and
+      // `params.tokenUsage.total` is the cumulative thread total.
+      // Summing `last` across this run's events gives "this run's
+      // cost" even when resuming a thread or queuing follow-up turns
+      // via `sendMessage`. Older codex builds shipped usage either at
+      // the top level, on `params.usage`, on `params.turn.usage`, or
+      // directly on `params.tokenUsage`, so we keep probing those
+      // paths as fallbacks.
+      const tokenUsage = asRecord(params?.tokenUsage);
+      const turn = asRecord(params?.turn);
+      const turnTokenUsage = asRecord(turn?.tokenUsage);
+      const usageCandidate =
+        asRecord(event.usage) ??
+        asRecord(params?.usage) ??
+        asRecord(tokenUsage?.last) ??
+        asRecord(tokenUsage?.total) ??
+        tokenUsage ??
+        asRecord(turn?.usage) ??
+        asRecord(turnTokenUsage?.last) ??
+        asRecord(turnTokenUsage?.total) ??
+        turnTokenUsage;
+
+      if (usageCandidate) {
+        sawUsage = true;
+        mergeUsage(usage, usageCandidate);
       }
-    } else {
-      mergeUsage(usage, asRecord(event.usage));
-    }
-
-    return compactCostData({
-      ...(totalCost !== undefined ? { total_cost_usd: totalCost } : {}),
-      duration_ms:
-        typeof event.duration_ms === "number" ? event.duration_ms : undefined,
-      duration_api_ms:
-        typeof event.duration_api_ms === "number"
-          ? event.duration_api_ms
-          : undefined,
-      num_turns:
-        typeof event.num_turns === "number" ? event.num_turns : undefined,
-      usage,
-    });
-  }
-
-  return null;
+    },
+    result() {
+      return sawUsage ? compactCostData({ usage }) : null;
+    },
+  };
 }
 
 export function extractCodexCostData(
   events: Array<Record<string, unknown>>,
 ): AgentCostData | null {
+  const accumulator = createCodexCostAccumulator();
+  for (const event of events) accumulator.add(event);
+  return accumulator.result();
+}
+
+/** OpenCode sums `step-finish` parts; keep the running totals only. */
+export function createOpenCodeCostAccumulator(): CostAccumulator {
   const usage: UsageTotals = {};
-  let sawUsage = false;
+  let totalCost = 0;
+  let sawCostData = false;
 
-  for (const event of events) {
-    const params = asRecord(event.params);
-    // Codex (codex-rs ≥ 0.116) emits a `thread/tokenUsage/updated`
-    // notification at the end of each turn whose
-    // `params.tokenUsage.last` is the per-turn token counts and
-    // `params.tokenUsage.total` is the cumulative thread total.
-    // Summing `last` across this run's events gives "this run's
-    // cost" even when resuming a thread or queuing follow-up turns
-    // via `sendMessage`. Older codex builds shipped usage either at
-    // the top level, on `params.usage`, on `params.turn.usage`, or
-    // directly on `params.tokenUsage`, so we keep probing those
-    // paths as fallbacks.
-    const tokenUsage = asRecord(params?.tokenUsage);
-    const turn = asRecord(params?.turn);
-    const turnTokenUsage = asRecord(turn?.tokenUsage);
-    const usageCandidate =
-      asRecord(event.usage) ??
-      asRecord(params?.usage) ??
-      asRecord(tokenUsage?.last) ??
-      asRecord(tokenUsage?.total) ??
-      tokenUsage ??
-      asRecord(turn?.usage) ??
-      asRecord(turnTokenUsage?.last) ??
-      asRecord(turnTokenUsage?.total) ??
-      turnTokenUsage;
+  return {
+    add(event) {
+      if (!event) return;
+      const properties = asRecord(event.properties);
+      const part = asRecord(properties?.part) ?? asRecord(event.part);
+      if (part?.type !== "step-finish") return;
 
-    if (usageCandidate) {
-      sawUsage = true;
-      mergeUsage(usage, usageCandidate);
-    }
-  }
+      if (typeof part.cost === "number") {
+        totalCost += part.cost;
+        sawCostData = true;
+      }
 
-  return sawUsage ? compactCostData({ usage }) : null;
+      const tokens = asRecord(part.tokens);
+      if (tokens) {
+        sawCostData = true;
+        mergeUsage(usage, tokens);
+      }
+    },
+    result() {
+      return sawCostData
+        ? compactCostData({
+            ...(totalCost > 0 ? { total_cost_usd: totalCost } : {}),
+            usage,
+          })
+        : null;
+    },
+  };
 }
 
 export function extractOpenCodeCostData(
   events: Array<Record<string, unknown>>,
 ): AgentCostData | null {
-  const usage: UsageTotals = {};
-  let totalCost = 0;
-  let sawCostData = false;
-
-  for (const event of events) {
-    const properties = asRecord(event.properties);
-    const part = asRecord(properties?.part) ?? asRecord(event.part);
-    if (part?.type !== "step-finish") {
-      continue;
-    }
-
-    if (typeof part.cost === "number") {
-      totalCost += part.cost;
-      sawCostData = true;
-    }
-
-    const tokens = asRecord(part.tokens);
-    if (tokens) {
-      sawCostData = true;
-      mergeUsage(usage, tokens);
-    }
-  }
-
-  return sawCostData
-    ? compactCostData({
-        ...(totalCost > 0 ? { total_cost_usd: totalCost } : {}),
-        usage,
-      })
-    : null;
+  const accumulator = createOpenCodeCostAccumulator();
+  for (const event of events) accumulator.add(event);
+  return accumulator.result();
 }
 

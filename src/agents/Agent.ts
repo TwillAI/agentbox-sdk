@@ -145,6 +145,12 @@ function prepareAgentOptions<P extends AgentProviderName>(
 class AgentRunController implements AgentRun, AgentRunSink {
   readonly id: string;
   readonly provider: AgentProviderName;
+  /**
+   * Whether to keep every event for {@link AgentResult}. Off, the queues
+   * still deliver to live consumers but nothing is retained — see
+   * {@link AgentOptionsBase.retainEvents}.
+   */
+  private readonly retainEvents: boolean;
   sessionId?: string;
   raw?: unknown;
   readonly sessionIdReady: Promise<string>;
@@ -176,9 +182,10 @@ class AgentRunController implements AgentRun, AgentRunSink {
   private readonly rejectSessionIdReady: (reason?: unknown) => void;
   private readonly resolveFinished: (value: AgentResult) => void;
 
-  constructor(provider: AgentProviderName, id: string) {
+  constructor(provider: AgentProviderName, id: string, retainEvents = true) {
     this.provider = provider;
     this.id = id;
+    this.retainEvents = retainEvents;
 
     let resolveFinished!: (value: AgentResult) => void;
     let resolveSessionIdReady!: (value: string) => void;
@@ -224,12 +231,12 @@ class AgentRunController implements AgentRun, AgentRunSink {
   }
 
   emitRaw(event: RawAgentEvent): void {
-    this.rawEventsList.push(event);
+    if (this.retainEvents) this.rawEventsList.push(event);
     this.rawQueue.push(event);
   }
 
   private pushEvent(event: NormalizedAgentEvent): void {
-    this.events.push(event);
+    if (this.retainEvents) this.events.push(event);
     if (event.type === "text.delta") {
       this.text += event.delta;
     } else if (
@@ -640,7 +647,11 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
     const runId = runConfig.runId ?? randomUUID();
     const streamCalledAt = Date.now();
     debugAgent("stream() provider=%s runId=%s", this.provider, runId);
-    const run = new AgentRunController(this.provider, runId);
+    const run = new AgentRunController(
+      this.provider,
+      runId,
+      this.options.retainEvents !== false,
+    );
     // `agent.setup()` is purely a side-effect (uploads artifacts +
     // boots provider servers / relay). Adapters do NOT receive its
     // return value — execute recomputes every path it needs from
@@ -663,15 +674,17 @@ export class Agent<P extends AgentProviderName = AgentProviderName> {
           options,
           run: buildRunConfig(options, runConfig),
         };
-        const cleanup = await adapter.execute(request, run);
+        // `execute` owns the run end to end and only returns once the run has
+        // settled; the abort handler is registered through the sink
+        // (`AgentRunSink.setAbort`) as soon as a transport exists, which is
+        // long before that. Nothing is registered here — doing so would
+        // replace a live handler with one for an already-finished run.
+        await adapter.execute(request, run);
         debugAgent(
           "adapter.execute() returned for runId=%s after %dms",
           runId,
           Date.now() - streamCalledAt,
         );
-        run.setAbort(async () => {
-          await cleanup();
-        });
       } catch (error) {
         run.fail(error);
       }

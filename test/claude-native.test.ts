@@ -9,6 +9,7 @@ import type { BackgroundTasksEvent } from "../src/events";
 import { executeNativeClaude } from "../src/agents/providers/claude-code";
 import abandonedGrep from "./fixtures/claude-auto-backgrounded-abandoned.json";
 import orphanedPoll from "./fixtures/claude-orphaned-poll.json";
+import staleNotification from "./fixtures/claude-stale-notification-on-resume.json";
 
 const state = vi.hoisted(() => ({ query: vi.fn() }));
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({ query: state.query }));
@@ -338,6 +339,59 @@ describe("background tasks", () => {
       await executeNativeClaude(request(), target);
       expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "Done" }));
       expect(backgroundEvents(target)).toEqual([]);
+    });
+  });
+
+  // Staging task 37031990 (2026-09-23): the run above ended its wait and was
+  // torn down with the auto-backgrounded grep still live. The follow-up job
+  // resumed that session two seconds later, and the CLI replayed the orphan's
+  // notification as a turn of its own — an empty result, ahead of the queued
+  // "commit and push". Taking it for the answer completed the follow-up with
+  // no text at all ("No response available." in Twill). The fixture is that
+  // job's trace; the turn after it is the re-sent prompt's real turn, from
+  // the job that followed, re-stamped with this session and command id.
+  describe("a notification the previous session left behind, replayed on resume", () => {
+    const notified = staleNotification.findIndex((event) => (event as { subtype?: string }).subtype === "task_notification");
+    const started = staleNotification.findIndex((event) => (event as { state?: string }).state === "started");
+    const answer = "Committed and pushed to `origin/dev` as `54949e66`";
+
+    it("is about a task this run never saw start", () => {
+      expect(staleNotification[notified]).toMatchObject({ status: "stopped", summary: "Background shell command didn't finish before the previous session ended" });
+      expect(staleNotification[started - 1]).toMatchObject({ type: "result", result: "", num_turns: 0, origin: { kind: "task-notification" } });
+    });
+
+    it("answers the queued prompt instead of settling on the notification's empty turn", async () => {
+      const target = sink();
+      state.query.mockImplementation(() => Object.assign((async function* () {
+        for (const event of staleNotification) yield event as unknown as SDKMessage;
+        await hang();
+      })(), { close() {}, stopTask: vi.fn() }));
+      await executeNativeClaude(request(), target);
+      expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining(answer) }));
+    });
+
+    it("settles on the notification's turn when the CLI never starts the queued command", async () => {
+      const target = sink();
+      state.query.mockImplementation(() => Object.assign((async function* () {
+        for (const event of staleNotification.slice(0, started)) yield event as unknown as SDKMessage;
+      })(), { close() {}, stopTask: vi.fn() }));
+      await executeNativeClaude(request(), target);
+      expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "" }));
+      expect(target.fail).not.toHaveBeenCalled();
+    });
+
+    it("still takes a notification turn for the answer when no command is queued", async () => {
+      const target = sink();
+      // The wake turn of a run's own background work carries the same origin,
+      // as do the turns an attach-only run streams back: with nothing queued
+      // behind them, they are the answer.
+      const wake = { ...(staleNotification[started - 1] as object), result: "The search finished." };
+      state.query.mockImplementation(() => Object.assign((async function* () {
+        yield wake as unknown as SDKMessage;
+        await hang();
+      })(), { close() {}, stopTask: vi.fn() }));
+      await executeNativeClaude(request(), target);
+      expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "The search finished." }));
     });
   });
 
