@@ -1206,37 +1206,49 @@ async function fetchWithDaemonRetry(
   throw lastError ?? new Error("claude-code daemon request timed out");
 }
 
-async function* parseNdjsonStream(
+/**
+ * One JSON value per line. Linear in the stream: each chunk is searched once,
+ * and a line split across chunks is joined once, when it ends. A large tool
+ * output arrives as one line spread over many network chunks; appending them
+ * to one string and searching it again for each chunk made a single
+ * multi-megabyte frame cost seconds of the host's event loop.
+ */
+export async function* parseNdjsonStream(
   body: ReadableStream<Uint8Array>,
 ): AsyncGenerator<unknown> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
-  let buffer = "";
+  // The line in progress, as the pieces its chunks carried.
+  let pending: string[] = [];
+  const parse = (line: string) => {
+    try {
+      return { value: JSON.parse(line) as unknown };
+    } catch {
+      // Skip malformed lines; daemon should only emit clean JSON.
+      return undefined;
+    }
+  };
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let idx;
-    while ((idx = buffer.indexOf("\n")) !== -1) {
-      const line = buffer.slice(0, idx).trim();
-      buffer = buffer.slice(idx + 1);
-      if (line) {
-        try {
-          yield JSON.parse(line);
-        } catch {
-          // Skip malformed lines; daemon should only emit clean JSON.
-        }
-      }
+    const text = decoder.decode(value, { stream: true });
+    let start = 0;
+    let idx = text.indexOf("\n");
+    while (idx !== -1) {
+      pending.push(text.slice(start, idx));
+      const line = pending.join("").trim();
+      pending = [];
+      start = idx + 1;
+      const parsed = line ? parse(line) : undefined;
+      if (parsed) yield parsed.value;
+      idx = text.indexOf("\n", start);
     }
+    if (start < text.length) pending.push(text.slice(start));
   }
-  buffer += decoder.decode();
-  if (buffer.trim()) {
-    try {
-      yield JSON.parse(buffer);
-    } catch {
-      // ignore tail garbage
-    }
-  }
+  pending.push(decoder.decode());
+  const tail = pending.join("").trim();
+  const parsed = tail ? parse(tail) : undefined;
+  if (parsed) yield parsed.value;
 }
 
 async function daemonBaseUrl(sandbox: Sandbox): Promise<string> {
