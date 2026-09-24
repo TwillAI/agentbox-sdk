@@ -88,39 +88,3 @@ export async function time<T>(
     throw error;
   }
 }
-
-/**
- * Sync variant of `time()` for hot inline blocks. Most useful when wrapping
- * synchronous JSON.stringify / shell-quoting / hashing work that we suspect
- * is contributing to startup latency.
- */
-export function timeSync<T>(
-  log: Debugger,
-  label: string,
-  fn: () => T,
-  extra?: (result: T) => Record<string, unknown> | undefined,
-): T {
-  if (!log.enabled) {
-    return fn();
-  }
-  const start = Date.now();
-  try {
-    const result = fn();
-    const elapsed = Date.now() - start;
-    const meta = extra?.(result);
-    if (meta) {
-      log("· %s (%dms) %o", label, elapsed, meta);
-    } else {
-      log("· %s (%dms)", label, elapsed);
-    }
-    return result;
-  } catch (error) {
-    log(
-      "✗ %s (%dms): %s",
-      label,
-      Date.now() - start,
-      error instanceof Error ? error.message : String(error),
-    );
-    throw error;
-  }
-}

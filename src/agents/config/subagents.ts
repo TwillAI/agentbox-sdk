@@ -160,18 +160,3 @@ export function buildCodexSubagentArtifacts(
     enableMultiAgent: (subAgents?.length ?? 0) > 0,
   };
 }
-
-export function buildSubagentSystemAppendix(
-  subAgents: AgentSubAgentConfig[] | undefined,
-): string | undefined {
-  if (!subAgents || subAgents.length === 0) {
-    return undefined;
-  }
-
-  return [
-    "Configured sub-agents are available in this environment.",
-    ...subAgents.map(
-      (subAgent) => `- ${subAgent.name}: ${subAgent.description}`,
-    ),
-  ].join("\n");
-}

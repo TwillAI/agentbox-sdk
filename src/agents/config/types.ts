@@ -256,30 +256,6 @@ export interface PreparedSkill {
   skillFilePath: string;
 }
 
-export interface PreparedAgentConfig {
-  env: Record<string, string>;
-  artifacts: TextArtifact[];
-  installCommands: string[];
-  systemPrompt?: string;
-  skillReferences: PreparedSkill[];
-}
-
-export interface ClaudePreparedConfig extends PreparedAgentConfig {
-  args: string[];
-  initializeRequest?: Record<string, unknown>;
-}
-
-export interface OpenCodePreparedConfig extends PreparedAgentConfig {
-  configPath: string;
-  extraEnv?: Record<string, string>;
-  agentName: string;
-}
-
-export interface CodexPreparedConfig extends PreparedAgentConfig {
-  args: string[];
-  inputItems?: Array<Record<string, unknown>>;
-}
-
 import type { TarballEntry } from "../../sandboxes/tarball";
 import type { CommandResult } from "../../sandboxes/types";
 

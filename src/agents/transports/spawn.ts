@@ -1,8 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 
-import { waitFor } from "../../shared/network";
-
 export interface SpawnCommandOptions {
   command: string;
   args?: string[];
@@ -69,26 +67,6 @@ export function spawnCommand(options: SpawnCommandOptions): SpawnedProcess {
       if (!await waitForExit(3000)) throw new Error("The owned agent process did not stop");
     })(),
   };
-}
-
-export async function waitForHttpReady(
-  url: string,
-  options?: { timeoutMs?: number; intervalMs?: number; init?: RequestInit },
-): Promise<void> {
-  await waitFor(
-    async () => {
-      try {
-        const response = await fetch(url, options?.init);
-        return response.ok;
-      } catch {
-        return false;
-      }
-    },
-    {
-      timeoutMs: options?.timeoutMs,
-      intervalMs: options?.intervalMs,
-    },
-  );
 }
 
 export async function* linesFromNodeStream(

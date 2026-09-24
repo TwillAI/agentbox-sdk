@@ -4,7 +4,6 @@ import { AgentProvider, type AgentProviderName } from "../types";
 import { shellQuote } from "../../shared/shell";
 import type {
   AgentSkillConfig,
-  SetupTarget,
   PreparedSkill,
   SetupLayout,
   TextArtifact,
@@ -83,31 +82,4 @@ export async function prepareSkillArtifacts(
     installCommands,
     preparedSkills,
   };
-}
-
-export function buildSkillsSystemAppendix(
-  skills: PreparedSkill[],
-): string | undefined {
-  if (skills.length === 0) {
-    return undefined;
-  }
-
-  return [
-    "Configured skills are available for this run.",
-    "Use them when they meaningfully help complete the task.",
-    ...skills.map((skill) => `- ${skill.name}`),
-  ].join("\n");
-}
-
-export async function installSkills(
-  target: SetupTarget,
-  installCommands: string[],
-  extraEnv?: Record<string, string>,
-): Promise<void> {
-  // Each `npx skills add ...` install touches a distinct skill directory so
-  // they're safe to run concurrently. Sequential execution was costing
-  // multiple seconds per skill on remote sandboxes.
-  await Promise.all(
-    installCommands.map((command) => target.runCommand(command, extraEnv)),
-  );
 }

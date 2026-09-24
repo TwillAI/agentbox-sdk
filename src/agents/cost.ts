@@ -143,14 +143,6 @@ export function createClaudeCostAccumulator(): CostAccumulator {
   };
 }
 
-export function extractClaudeCostData(
-  events: Array<Record<string, unknown>>,
-): AgentCostData | null {
-  const accumulator = createClaudeCostAccumulator();
-  for (const event of events) accumulator.add(event);
-  return accumulator.result();
-}
-
 /** Codex sums per-turn usage across the run; keep the running totals only. */
 export function createCodexCostAccumulator(): CostAccumulator {
   const usage: UsageTotals = {};
@@ -195,14 +187,6 @@ export function createCodexCostAccumulator(): CostAccumulator {
   };
 }
 
-export function extractCodexCostData(
-  events: Array<Record<string, unknown>>,
-): AgentCostData | null {
-  const accumulator = createCodexCostAccumulator();
-  for (const event of events) accumulator.add(event);
-  return accumulator.result();
-}
-
 /** OpenCode sums `step-finish` parts; keep the running totals only. */
 export function createOpenCodeCostAccumulator(): CostAccumulator {
   const usage: UsageTotals = {};
@@ -236,13 +220,5 @@ export function createOpenCodeCostAccumulator(): CostAccumulator {
         : null;
     },
   };
-}
-
-export function extractOpenCodeCostData(
-  events: Array<Record<string, unknown>>,
-): AgentCostData | null {
-  const accumulator = createOpenCodeCostAccumulator();
-  for (const event of events) accumulator.add(event);
-  return accumulator.result();
 }
 

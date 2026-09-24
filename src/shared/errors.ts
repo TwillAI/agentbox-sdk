@@ -23,19 +23,6 @@ export class UnsupportedProviderError extends AgentBoxError {
   }
 }
 
-export function invariant(
-  condition: unknown,
-  message: string,
-  options?: { code?: string; details?: unknown },
-): asserts condition {
-  if (!condition) {
-    throw new AgentBoxError(message, {
-      code: options?.code ?? "INVARIANT_VIOLATION",
-      details: options?.details,
-    });
-  }
-}
-
 export function asError(error: unknown): Error {
   if (error instanceof Error) {
     return error;

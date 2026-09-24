@@ -370,18 +370,3 @@ export async function createSetupTarget<P extends AgentProviderName>(
     );
   });
 }
-
-export async function writeHostArtifact(
-  target: SetupTarget,
-  artifact: { path: string; content: string; executable?: boolean },
-): Promise<void> {
-  // Used by host-only paths (e.g. local Codex login) that need to write a
-  // single file without rebuilding the whole setup tarball. Sandbox
-  // targets shouldn't reach this — those paths bundle through
-  // `applyDifferentialSetup`.
-  await mkdir(path.dirname(artifact.path), { recursive: true });
-  await writeFile(artifact.path, artifact.content, "utf8");
-  if (artifact.executable) {
-    await chmod(artifact.path, 0o755);
-  }
-}

@@ -202,15 +202,6 @@ export function buildOpenCodePluginArtifacts(
   });
 }
 
-export function hasConfiguredHooks(options: unknown): boolean {
-  const providerPlugins = readProviderPlugins(options);
-  return (
-    readTopLevelHooks(options) !== undefined ||
-    hasHookEntries(readProviderHooks(options) as Record<string, unknown>) ||
-    (Array.isArray(providerPlugins) && providerPlugins.length > 0)
-  );
-}
-
 export function assertHooksSupported(
   provider: "claude-code",
   options: unknown,

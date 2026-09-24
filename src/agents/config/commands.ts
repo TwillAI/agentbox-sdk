@@ -61,19 +61,3 @@ export function assertCommandsSupported(
     );
   }
 }
-
-export function buildCommandsSystemAppendix(
-  commands: AgentCommandConfig[] | undefined,
-): string | undefined {
-  if (!commands || commands.length === 0) {
-    return undefined;
-  }
-
-  return [
-    "Custom commands are installed for this environment.",
-    ...commands.map(
-      (command) =>
-        `- /${command.name}${command.description ? `: ${command.description}` : ""}`,
-    ),
-  ].join("\n");
-}
