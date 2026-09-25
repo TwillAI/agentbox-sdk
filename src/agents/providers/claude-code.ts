@@ -173,7 +173,9 @@ export function buildClaudeQueryOptions(params: {
   for (const arg of provider?.args ?? []) {
     if (typeof arg !== "string") continue;
     if (arg.startsWith("--")) {
-      extraArgs[arg.slice(2)] = null;
+      const separator = arg.indexOf("=");
+      if (separator === -1) extraArgs[arg.slice(2)] = null;
+      else extraArgs[arg.slice(2, separator)] = arg.slice(separator + 1);
     }
   }
   if (run.systemPrompt) {

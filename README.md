@@ -746,6 +746,17 @@ each run in its own process group can set `processGroup: "inherited"`; that
 supervisor is then responsible for stopping the complete group before reporting
 that a run has stopped. This option is unavailable for cloud sandboxes.
 
+On Windows, host CLIs start through cross-spawn without a shell: it resolves
+`PATHEXT` and script shebangs, and escapes the arguments `cmd.exe` sees when the
+binary is a batch shim. Windows has no process groups or signals, so stopping a
+host CLI ends its whole process tree with `taskkill /T /F`; a supervisor using
+`processGroup: "inherited"` there still owns everything the tree left behind
+(for example through a Job Object).
+
+`provider.args` passes native CLI flags for a run without touching the user's
+configuration. Codex places them before its subcommand (`["-c", "key=value"]`);
+Claude Code accepts `--name` and `--name=value` entries.
+
 ## Packaging
 
 `npm pack` builds the package from maintained TypeScript source before creating

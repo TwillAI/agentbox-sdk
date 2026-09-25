@@ -1,5 +1,7 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams, type SpawnOptions } from "node:child_process";
+import path from "node:path";
 import { createInterface } from "node:readline";
+import crossSpawn from "cross-spawn";
 
 export interface SpawnCommandOptions {
   command: string;
@@ -17,15 +19,26 @@ export interface SpawnedProcess {
   kill(signal?: NodeJS.Signals): Promise<void>;
 }
 
+const windows = process.platform === "win32";
+
+/** Windows has no process groups or signals: end the child and everything it started. */
+function killWindowsTree(pid: number): void {
+  const taskkill = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe");
+  execFile(taskkill, ["/pid", String(pid), "/T", "/F"], { windowsHide: true }, () => undefined);
+}
+
 export function spawnCommand(options: SpawnCommandOptions): SpawnedProcess {
-  const child = spawn(options.command, options.args ?? [], {
+  const spawnOptions: SpawnOptions = {
     cwd: options.cwd,
     env: options.env,
     stdio: "pipe",
-    shell: process.platform === "win32",
     windowsHide: true,
-    detached: options.processGroup === true && process.platform !== "win32",
-  });
+    detached: options.processGroup === true && !windows,
+  };
+  // Windows starts package-manager shims (`codex.cmd`) only through cmd.exe,
+  // and a shell would re-parse every argument (paths with spaces, prompts).
+  // cross-spawn resolves PATHEXT and shebangs and escapes what cmd.exe sees.
+  const child = (windows ? crossSpawn : spawn)(options.command, options.args ?? [], spawnOptions) as ChildProcessWithoutNullStreams;
 
   const exitPromise = new Promise<number>((resolve, reject) => {
     child.once("error", reject);
@@ -36,7 +49,9 @@ export function spawnCommand(options: SpawnCommandOptions): SpawnedProcess {
   let killPromise: Promise<void> | undefined;
   const signalProcess = (signal: NodeJS.Signals) => {
     try {
-      if (options.processGroup && process.platform !== "win32" && child.pid) process.kill(-child.pid, signal);
+      // A shim's cmd.exe exits without its CLI, which keeps our pipes open.
+      if (windows && child.pid) killWindowsTree(child.pid);
+      else if (options.processGroup && child.pid) process.kill(-child.pid, signal);
       else child.kill(signal);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
@@ -60,7 +75,7 @@ export function spawnCommand(options: SpawnCommandOptions): SpawnedProcess {
       if (await waitForExit(options.terminationTimeoutMs ?? 3000)) {
         // A tool can ignore SIGTERM and close its inherited stdio before the
         // CLI exits. Terminate any remaining members of our own group too.
-        if (options.processGroup && process.platform !== "win32") signalProcess("SIGKILL");
+        if (options.processGroup && !windows) signalProcess("SIGKILL");
         return;
       }
       signalProcess("SIGKILL");

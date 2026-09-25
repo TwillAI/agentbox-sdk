@@ -37,6 +37,18 @@ describe("claude-code query options", () => {
     }
     expect(buildOptions(makeClaudeRequest()).settings).toBe("/tmp/agentbox/claude-code/.claude/settings.json");
   });
+  it("passes value-bearing native flags from provider.args", () => {
+    const options = buildClaudeQueryOptions({
+      request: makeClaudeRequest({
+        options: {
+          configuration: "native",
+          provider: { args: ["--verbose", "--mcp-config=C:\\Run Data\\mcp.json", "positional"] },
+        },
+      }),
+      env: {},
+    });
+    expect(options.extraArgs).toEqual({ verbose: null, "mcp-config": "C:\\Run Data\\mcp.json" });
+  });
   it("opts into full sub-agent transcript forwarding", () => {
     expect(buildOptions(makeClaudeRequest()).forwardSubagentText).toBe(true);
   });

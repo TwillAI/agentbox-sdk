@@ -510,6 +510,7 @@ function shouldIgnoreCodexError(notification: CodexNotification): boolean {
   return notification.params?.willRetry === true;
 }
 
+/** Arguments for `env`: the codex command, without `XDG_CONFIG_HOME` unless native. */
 function buildCodexCommandArgs(
   binary: string,
   args: string[],
@@ -521,7 +522,14 @@ function buildCodexCommandArgs(
   // before launching. We still strip `XDG_CONFIG_HOME` because some
   // sandbox base images set it to a system path that codex would
   // otherwise prefer over `CODEX_HOME`.
-  //
+  return [...(options?.configuration === "native" ? [] : ["-u", "XDG_CONFIG_HOME"]), ...buildCodexCommand(binary, args, options)];
+}
+
+function buildCodexCommand(
+  binary: string,
+  args: string[],
+  options?: AgentOptions<"codex">,
+): string[] {
   // `-c key=value` overrides are inserted before the subcommand so
   // they apply across both `codex app-server` and the regular
   // turn-based invocation. Codex parses each `-c` value as TOML.
@@ -530,7 +538,7 @@ function buildCodexCommandArgs(
     overrides.push(["supports_websockets", "false"]);
   }
   const overrideArgs = overrides.flatMap(([k, v]) => ["-c", `${k}=${v}`]);
-  return [...(options?.configuration === "native" ? [] : ["-u", "XDG_CONFIG_HOME"]), binary, ...overrideArgs, ...args];
+  return [binary, ...overrideArgs, ...(options?.provider?.args ?? []), ...args];
 }
 
 function toNormalizedCodexEvents(
@@ -1468,13 +1476,10 @@ async function createRuntime(
   // openai_base_url, model_instructions_file) now lives in
   // `config.toml` written by `setup()`, so the CLI args are
   // spawn-context only.
-  const codexArgs = buildCodexCommandArgs(
-    options.provider?.binary ?? "codex",
-    ["app-server"],
-    options,
-  );
+  const binary = options.provider?.binary ?? "codex";
 
   if (options.sandbox) {
+    const codexArgs = buildCodexCommandArgs(binary, ["app-server"], options);
     const handle = await options.sandbox.runAsync(["env", ...codexArgs], {
       cwd: runtimeCwd,
       env,
@@ -1511,15 +1516,16 @@ async function createRuntime(
     };
   }
 
+  // The host may have no `env` utility (Windows): unset its variable here.
+  const [command, ...args] = buildCodexCommand(binary, ["app-server"], options);
+  const hostEnv: NodeJS.ProcessEnv = { ...process.env, ...env };
+  if (options.configuration !== "native") delete hostEnv.XDG_CONFIG_HOME;
   const processHandle = spawnCommand({
     processGroup: options.processGroup !== "inherited",
-    command: "env",
-    args: codexArgs,
+    command: command!,
+    args,
     cwd: runtimeCwd,
-    env: {
-      ...process.env,
-      ...env,
-    },
+    env: hostEnv,
   });
 
   processHandle.child.stderr.resume();

@@ -1,6 +1,6 @@
 {
   "name": "agentbox-sdk",
-  "version": "0.1.523",
+  "version": "0.1.600",
   "description": "Swappable coding agents and sandbox providers for Bun and TypeScript.",
   "license": "MIT",
   "repository": {
@@ -63,6 +63,7 @@
     "@daytonaio/sdk": "^0.171.0",
     "@types/debug": "^4.1.13",
     "@vercel/sandbox": "2.0.0-beta.13",
+    "cross-spawn": "^7.0.6",
     "debug": "^4.4.3",
     "dockerode": "^4.0.10",
     "e2b": "^2.19.0",
@@ -74,6 +75,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@types/cross-spawn": "^6.0.6",
     "@types/dockerode": "^3.3.42",
     "@types/node": "^25.5.2",
     "@types/tar-stream": "^3.1.4",

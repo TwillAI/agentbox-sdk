@@ -240,6 +240,8 @@ export interface CodexProviderOptions {
   /** Network access for an explicit host workspace-write policy; defaults to false. */
   networkAccess?: boolean;
   binary?: string;
+  /** Global CLI arguments placed before the subcommand, e.g. `["-c", "key=value"]`. */
+  args?: string[];
   env?: Record<string, string>;
   brokerEndpoint?: string;
   useBroker?: boolean;
@@ -328,6 +330,7 @@ export interface ClaudeCodeProviderOptions {
   /** Request fast mode explicitly; false overrides inherited fast settings. */
   fastMode?: boolean;
   binary?: string;
+  /** CLI flags as `--name` or `--name=value`; other entries are ignored. */
   args?: string[];
   hooks?: ClaudeCodeHooksConfig;
   permissionMode?: string;

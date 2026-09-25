@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import readline from 'node:readline';
 const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
 const record = value => fs.appendFileSync(${JSON.stringify(record)}, JSON.stringify({ pid: process.pid, ...value }) + '\\n');
-record({ method: 'spawn' });
+record({ method: 'spawn', argv: process.argv.slice(2) });
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line);
   record(message);
@@ -29,9 +29,9 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
 });
 `, { mode: 0o700 });
   const agent = new Agent("codex", {
-    cwd: directory, configuration: "native", provider: { binary, prewarm: true },
+    cwd: directory, configuration: "native", provider: { binary, prewarm: true, args: ["-c", 'mcp_servers.twill={url="http://127.0.0.1:1/mcp"}'] },
   });
-  const records = async (): Promise<Array<{ pid: number; method: string }>> =>
+  const records = async (): Promise<Array<{ pid: number; method: string; argv?: string[] }>> =>
     (await readFile(record, "utf8")).trim().split("\n").map(line => JSON.parse(line));
   return { agent, records, async close() { await agent.killServer(); await rm(directory, { recursive: true, force: true }); } };
 }
@@ -55,6 +55,7 @@ it("prepares once without a thread or prompt, then consumes that process for the
     expect(result.text).toBe("READY");
     const records = await f.records();
     expect(records.filter(row => row.method === "spawn")).toHaveLength(1);
+    expect(records[0]!.argv).toEqual(["-c", 'mcp_servers.twill={url="http://127.0.0.1:1/mcp"}', "app-server"]);
     expect(records.filter(row => row.method === "initialize")).toHaveLength(1);
     expect(records.find(row => row.method === "turn/start")?.pid).toBe(prepared[0]!.pid);
     await exited(prepared[0]!.pid);
