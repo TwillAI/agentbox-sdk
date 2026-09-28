@@ -1368,8 +1368,13 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
     // app-server one) because the skills CLI is allowed to mutate
     // sandboxed paths. The skill files end up at
     // `<codexDir>/skills/<name>/SKILL.md` which codex auto-discovers.
+    let installed: boolean;
     try {
-      await applyDifferentialSetup(target, skillArtifacts, installCommands);
+      installed = await applyDifferentialSetup(
+        target,
+        skillArtifacts,
+        installCommands,
+      );
     } catch (error) {
       await target.cleanup().catch(() => undefined);
       throw error;
@@ -1379,7 +1384,7 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
       await time(debugCodex, "activateRtk", () => activateRtk(sharedTarget));
     }
 
-    await markSetupComplete(sharedTarget, setupId);
+    if (installed) await markSetupComplete(sharedTarget, setupId);
     return;
   }
 
@@ -1411,13 +1416,17 @@ async function setupCodex(request: AgentSetupRequest<"codex">): Promise<void> {
     throw error;
   }
 
-  await applyDifferentialSetup(target, allArtifacts, installCommands);
+  const installed = await applyDifferentialSetup(
+    target,
+    allArtifacts,
+    installCommands,
+  );
 
   if (enableRtk) {
     await time(debugCodex, "activateRtk", () => activateRtk(target));
   }
 
-  await markSetupComplete(target, setupId);
+  if (installed) await markSetupComplete(target, setupId);
 }
 
 async function createRuntime(

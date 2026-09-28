@@ -712,7 +712,11 @@ async function ensureSandboxOpenCodeServer(
       OPENCODE_ENABLE_QUESTION_TOOL: hasInteractiveQuestions(options) ? "true" : "false",
     };
 
-    await applyDifferentialSetup(target, allArtifacts, installCommands);
+    const installed = await applyDifferentialSetup(
+      target,
+      allArtifacts,
+      installCommands,
+    );
 
     // Activate RTK before launching `opencode serve` so the plugin file is
     // present when the server scans its plugins dir at boot.
@@ -920,7 +924,7 @@ async function ensureSandboxOpenCodeServer(
       );
     }
 
-    await markSetupComplete(target, setupId);
+    if (installed) await markSetupComplete(target, setupId);
   });
 }
 

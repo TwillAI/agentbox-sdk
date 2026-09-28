@@ -49,7 +49,9 @@ const MANIFEST_FILENAME = "setup-manifest.json";
 const TARGET_MANIFEST_FILENAME = "setup-target.json";
 const INSTALL_SCRIPT_FILENAME = "install.sh";
 const SETUP_ID_FILENAME = "setup.id";
-const MANIFEST_VERSION = 1;
+// v2: v1's install.sh never ran its last stale install command yet recorded
+// it as installed, so v1 manifests and setup ids must not be trusted.
+const MANIFEST_VERSION = 2;
 
 interface SetupManifest {
   version: number;
@@ -297,15 +299,36 @@ stale = [
     for key, hashed in target_cmds.items()
     if commands.get(key) is not None and existing_cmds.get(key) != hashed
 ]
-sys.stdout.write("\\0".join(stale))
+# Terminate every entry: \`read -d ''\` drops a last entry with no NUL.
+sys.stdout.write("".join(cmd + "\\0" for cmd in stale))
 PY
 
+# Run stale commands in parallel, then retry failures one at a time: parallel
+# \`npx\` calls race on a cold npx cache, and the cache is warm by the retry.
+FAILED=0
 if [ -s "$STALE_CMDS_FILE" ]; then
+  CMDS=()
+  PIDS=()
   while IFS= read -r -d '' CMD; do
     [ -z "$CMD" ] && continue
     bash -c "$CMD" &
+    CMDS+=("$CMD")
+    PIDS+=("$!")
   done < "$STALE_CMDS_FILE"
-  wait
+  for i in "\${!PIDS[@]}"; do
+    if ! wait "\${PIDS[$i]}"; then
+      echo "agentbox install failed, retrying: \${CMDS[$i]}" >&2
+      if ! bash -c "\${CMDS[$i]}"; then
+        echo "agentbox install failed: \${CMDS[$i]}" >&2
+        FAILED=1
+      fi
+    fi
+  done
+fi
+
+# Keep the old manifest when an install failed so the next run retries it.
+if [ "$FAILED" -ne 0 ]; then
+  exit 1
 fi
 
 # Persist target manifest as the new manifest atomically. Doing this last
@@ -321,13 +344,17 @@ mv "$TARGET_MANIFEST" "$EXISTING_MANIFEST"
  * one tarball, ships it through `Sandbox.uploadAndRun`, and lets the
  * sandbox do the manifest diff / parallel installs locally. The manifest
  * is atomically rotated only after installs succeed.
+ *
+ * Returns false when an install command still failed after its retry. The
+ * agent can run without it, but callers must not {@link markSetupComplete},
+ * so the next setup retries the install instead of skipping it.
  */
 export async function applyDifferentialSetup(
   target: SetupTarget,
   artifacts: TextArtifact[],
   installCommands: string[],
-): Promise<void> {
-  await time(
+): Promise<boolean> {
+  return time(
     debugSetup,
     `applyDifferentialSetup ${target.provider}`,
     async () => {
@@ -370,12 +397,21 @@ export async function applyDifferentialSetup(
 
       // Sandbox does its own manifest diff inside install.sh — no host-side
       // round-trip to fetch the existing manifest.
-      await target.uploadAndRun(
+      const result = await target.uploadAndRun(
         tarballEntries,
         `bash ${shellQuote(path.posix.join(rootDir, INSTALL_SCRIPT_FILENAME))}`,
       );
+      if (result.exitCode !== 0) {
+        const output = result.combinedOutput?.trim();
+        console.warn(
+          `[agentbox] ${target.provider} setup install failed (exit ${result.exitCode}); it will be retried on the next setup${output ? `:\n${output.slice(-2000)}` : ""}`,
+        );
+        return false;
+      }
+      return true;
     },
-    () => ({
+    (ok) => ({
+      ok,
       artifacts: artifacts.length,
       installCommands: installCommands.length,
     }),

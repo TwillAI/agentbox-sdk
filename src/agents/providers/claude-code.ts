@@ -1387,7 +1387,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
       }
 
       const env = { ...(options.env ?? {}), ...target.env };
-      await Promise.all([
+      const [installed] = await Promise.all([
         time(debugClaude, "applyDifferentialSetup", () =>
           applyDifferentialSetup(target, artifacts, installCommands),
         ),
@@ -1400,7 +1400,7 @@ export class ClaudeCodeAgentAdapter implements AgentProviderAdapter<"claude-code
         await time(debugClaude, "activateRtk", () => activateRtk(target));
       }
 
-      await markSetupComplete(target, setupId);
+      if (installed) await markSetupComplete(target, setupId);
     });
   }
 
