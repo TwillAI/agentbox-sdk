@@ -1,6 +1,14 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -70,6 +78,20 @@ describe("applyDifferentialSetup install commands", () => {
       true,
     );
     expect(await count("c")).toBe(1);
+  });
+
+  it("lets concurrent setups share a root dir", async () => {
+    const rootDir = path.join(dir, "root");
+    const commands = [mark("a"), mark("b")];
+
+    const results = await Promise.all(
+      Array.from({ length: 4 }, () =>
+        applyDifferentialSetup(localTarget(rootDir), [], commands),
+      ),
+    );
+    expect(results).toEqual([true, true, true, true]);
+    expect(await count("b")).toBeGreaterThanOrEqual(1);
+    expect((await readdir(rootDir)).sort()).toEqual(["setup-manifest.json"]);
   });
 
   it("retries a failed command and keeps it stale when it still fails", async () => {

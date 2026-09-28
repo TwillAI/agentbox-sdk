@@ -37,7 +37,7 @@
  * When both match, setup returns without uploading anything.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 
 import type { TarballEntry } from "../../sandboxes/tarball";
@@ -46,8 +46,8 @@ import type { SetupTarget, TextArtifact } from "./types";
 import { debugSetup, time } from "../../shared/debug";
 
 const MANIFEST_FILENAME = "setup-manifest.json";
-const TARGET_MANIFEST_FILENAME = "setup-target.json";
-const INSTALL_SCRIPT_FILENAME = "install.sh";
+const TARGET_MANIFEST_PREFIX = "setup-target.";
+const INSTALL_SCRIPT_PREFIX = "install.";
 const SETUP_ID_FILENAME = "setup.id";
 // v2: v1's install.sh never ran its last stale install command yet recorded
 // it as installed, so v1 manifests and setup ids must not be trusted.
@@ -251,6 +251,7 @@ export async function markSetupComplete(
  */
 function buildInstallScript(
   rootDir: string,
+  targetManifestPath: string,
   installCommandsByKey: Record<string, string>,
 ): string {
   // Embed the commands map as base64 inside the script so multi-line and
@@ -264,7 +265,7 @@ function buildInstallScript(
   return `#!/usr/bin/env bash
 set -e
 ROOT_DIR=${shellQuote(rootDir)}
-TARGET_MANIFEST="$ROOT_DIR/${TARGET_MANIFEST_FILENAME}"
+TARGET_MANIFEST=${shellQuote(targetManifestPath)}
 EXISTING_MANIFEST="$ROOT_DIR/${MANIFEST_FILENAME}"
 export TARGET_MANIFEST EXISTING_MANIFEST
 
@@ -273,7 +274,8 @@ export TARGET_MANIFEST EXISTING_MANIFEST
 # emits the commands themselves, NUL-separated, so bash never has to
 # deserialize JSON.
 STALE_CMDS_FILE="$(mktemp)"
-trap 'rm -f "$STALE_CMDS_FILE"' EXIT
+# This run's target manifest and script are per-run files; remove them.
+trap 'rm -f "$STALE_CMDS_FILE" "$TARGET_MANIFEST" "$0"' EXIT
 COMMANDS_B64=${shellQuote(commandsB64)} \\
 MANIFEST_VERSION=${MANIFEST_VERSION} \\
 python3 - <<'PY' > "$STALE_CMDS_FILE"
@@ -376,7 +378,18 @@ export async function applyDifferentialSetup(
         ),
       };
 
+      // Per-run names: concurrent setups share `rootDir`, and one run must
+      // not move or overwrite another run's target manifest or script.
+      const runId = randomUUID();
       const rootDir = target.layout.rootDir;
+      const targetManifestPath = path.posix.join(
+        rootDir,
+        `${TARGET_MANIFEST_PREFIX}${runId}.json`,
+      );
+      const installScriptPath = path.posix.join(
+        rootDir,
+        `${INSTALL_SCRIPT_PREFIX}${runId}.sh`,
+      );
       const tarballEntries: TarballEntry[] = [
         ...artifacts.map<TarballEntry>((artifact) => ({
           path: artifact.path,
@@ -384,13 +397,17 @@ export async function applyDifferentialSetup(
           mode: artifact.executable ? 0o755 : 0o644,
         })),
         {
-          path: path.posix.join(rootDir, TARGET_MANIFEST_FILENAME),
+          path: targetManifestPath,
           content: JSON.stringify(targetForSandbox),
           mode: 0o644,
         },
         {
-          path: path.posix.join(rootDir, INSTALL_SCRIPT_FILENAME),
-          content: buildInstallScript(rootDir, installCommandsByKey),
+          path: installScriptPath,
+          content: buildInstallScript(
+            rootDir,
+            targetManifestPath,
+            installCommandsByKey,
+          ),
           mode: 0o755,
         },
       ];
@@ -399,7 +416,7 @@ export async function applyDifferentialSetup(
       // round-trip to fetch the existing manifest.
       const result = await target.uploadAndRun(
         tarballEntries,
-        `bash ${shellQuote(path.posix.join(rootDir, INSTALL_SCRIPT_FILENAME))}`,
+        `bash ${shellQuote(installScriptPath)}`,
       );
       if (result.exitCode !== 0) {
         const output = result.combinedOutput?.trim();
