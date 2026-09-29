@@ -5,6 +5,7 @@ import type {
   CreateSandboxFromImageParams,
   CreateSandboxFromSnapshotParams,
 } from "@daytonaio/sdk";
+import type { CreateOptions as TenkiCreateOptions } from "@tenkicloud/sandbox";
 
 export type SandboxProviderName = SandboxProvider;
 
@@ -163,6 +164,22 @@ export interface VercelProviderOptions {
   protectionBypass?: string;
 }
 
+export interface TenkiProviderOptions {
+  apiKey?: string;
+  authToken?: string;
+  baseUrl?: string;
+  workspaceId?: string;
+  name?: string;
+  cpuCores?: number;
+  memoryMb?: number;
+  allowInbound?: boolean;
+  allowOutbound?: boolean;
+  sshAuthorizedKeys?: string[];
+  snapshotId?: string;
+  previewTtlMs?: number;
+  createParams?: Partial<TenkiCreateOptions>;
+}
+
 export interface E2bProviderOptions {
   apiKey?: string;
   accessToken?: string;
@@ -201,12 +218,17 @@ export interface E2bSandboxOptions extends SandboxOptionsBase {
   provider?: E2bProviderOptions;
 }
 
+export interface TenkiSandboxOptions extends SandboxOptionsBase {
+  provider?: TenkiProviderOptions;
+}
+
 export type SandboxOptionsMap = {
   "local-docker": LocalDockerSandboxOptions;
   modal: ModalSandboxOptions;
   daytona: DaytonaSandboxOptions;
   vercel: VercelSandboxOptions;
   e2b: E2bSandboxOptions;
+  tenki: TenkiSandboxOptions;
 };
 
 export type SandboxOptions<
@@ -219,6 +241,7 @@ export type SandboxRawMap = {
   daytona: import("./providers/daytona").DaytonaRaw;
   vercel: import("./providers/vercel").VercelRaw;
   e2b: import("./providers/e2b").E2bRaw;
+  tenki: import("./providers/tenki").TenkiRaw;
 };
 
 export type SandboxRaw<P extends SandboxProviderName = SandboxProviderName> =

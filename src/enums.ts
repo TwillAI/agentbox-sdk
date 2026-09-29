@@ -21,6 +21,7 @@ export const SandboxProvider = {
   Daytona: "daytona",
   Vercel: "vercel",
   E2B: "e2b",
+  Tenki: "tenki",
 } as const;
 export type SandboxProvider =
   (typeof SandboxProvider)[keyof typeof SandboxProvider];

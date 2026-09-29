@@ -16,7 +16,7 @@ import { buildSandboxImage } from "../../src/sandbox-images/build";
 
 export type LiveMatrixSandboxProvider = Extract<
   SandboxProviderName,
-  "local-docker" | "modal" | "daytona" | "e2b" | "vercel"
+  "local-docker" | "modal" | "daytona" | "e2b" | "vercel" | "tenki"
 >;
 
 export type LiveMatrixAgentProvider = AgentProviderName;
@@ -60,6 +60,7 @@ export const LIVE_MATRIX_SANDBOX_PROVIDERS = [
   SandboxProvider.Daytona,
   SandboxProvider.E2B,
   SandboxProvider.Vercel,
+  SandboxProvider.Tenki,
 ] as const satisfies readonly LiveMatrixSandboxProvider[];
 
 export const LIVE_MATRIX_AGENT_PROVIDERS = [
@@ -303,6 +304,16 @@ function getSandboxSkipReason(
     return null;
   }
 
+  if (sandboxProvider === SandboxProvider.Tenki) {
+    if (!ROOT_ENV.TENKI_API_KEY && !ROOT_ENV.TENKI_AUTH_TOKEN) {
+      return "requires TENKI_API_KEY or TENKI_AUTH_TOKEN.";
+    }
+    if (!ROOT_ENV.AGENTBOX_TENKI_IMAGE) {
+      return "requires AGENTBOX_TENKI_IMAGE (a Tenki registry image with the agent CLIs installed).";
+    }
+    return null;
+  }
+
   if (!ROOT_ENV.E2B_API_KEY) {
     return "requires E2B_API_KEY or E2B_ACCESS_TOKEN.";
   }
@@ -398,6 +409,12 @@ async function resolveSandboxImage(
         return ROOT_ENV.AGENTBOX_VERCEL_SNAPSHOT_ID;
       }
       return buildVercelMatrixSnapshot();
+    }
+
+    if (sandboxProvider === SandboxProvider.Tenki) {
+      // Tenki boots from a registry image ref rather than an agentbox-built
+      // image; the skip logic guarantees AGENTBOX_TENKI_IMAGE is set here.
+      return ROOT_ENV.AGENTBOX_TENKI_IMAGE!;
     }
 
     return buildSandboxImage({
@@ -518,6 +535,31 @@ function createSandboxForCombination(
           : {}),
         ...(ROOT_ENV.VERCEL_PROTECTION_BYPASS
           ? { protectionBypass: ROOT_ENV.VERCEL_PROTECTION_BYPASS }
+          : {}),
+      },
+    });
+  }
+
+  if (combination.sandboxProvider === SandboxProvider.Tenki) {
+    return new Sandbox(SandboxProvider.Tenki, {
+      workingDir: "/workspace",
+      image,
+      tags,
+      env: COMMON_SANDBOX_ENV,
+      idleTimeoutMs: 15 * 60_000,
+      resources: {
+        cpu: 2,
+        memoryMiB: 4096,
+      },
+      provider: {
+        allowInbound: true,
+        allowOutbound: true,
+        ...(ROOT_ENV.TENKI_API_KEY ? { apiKey: ROOT_ENV.TENKI_API_KEY } : {}),
+        ...(ROOT_ENV.TENKI_AUTH_TOKEN
+          ? { authToken: ROOT_ENV.TENKI_AUTH_TOKEN }
+          : {}),
+        ...(ROOT_ENV.TENKI_BASE_URL
+          ? { baseUrl: ROOT_ENV.TENKI_BASE_URL }
           : {}),
       },
     });
