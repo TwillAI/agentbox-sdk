@@ -1,10 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   BackgroundTaskTracker,
   BackgroundWait,
   BackgroundWaitFinish,
   DEFAULT_BACKGROUND_TASK_TIMEOUT_MS,
+  SUBAGENT_RESULT_GRACE_MS,
   applyCliBackgroundWaitCeiling,
+  holdsBackgroundCeiling,
   resolveBackgroundTaskTimeoutMs,
 } from "../src/agents/background-tasks";
 
@@ -363,5 +365,60 @@ describe("attaching to a parked harness", () => {
     tracker.restore([]);
     expect(tracker.hasSeenBackgroundWork()).toBe(false);
     expect(tracker.liveTasks()).toEqual([]);
+  });
+});
+
+describe("exempting subagents from the ceiling", () => {
+  const agent = { id: "a1", type: "local_agent", description: "Fix it" };
+  const workflow = { id: "w1", type: "local_workflow", description: "Review" };
+  const shell = { id: "b1", type: "local_bash", description: "npm test" };
+
+  it("holds only for a live subagent, and only when asked to", () => {
+    expect(holdsBackgroundCeiling([shell, agent], true)).toBe(true);
+    expect(holdsBackgroundCeiling([workflow], true)).toBe(true);
+    expect(holdsBackgroundCeiling([shell, agent], false)).toBe(false);
+    expect(holdsBackgroundCeiling([shell, agent], undefined)).toBe(false);
+    expect(holdsBackgroundCeiling([shell], true)).toBe(false);
+  });
+
+  it("neither runs nor counts the ceiling while held", async () => {
+    vi.useFakeTimers();
+    try {
+      const wait = new BackgroundWait(Infinity, 120_000);
+      let reason: string | undefined;
+      void wait.expired.then((value) => { reason = value; });
+      await vi.advanceTimersByTimeAsync(30_000);
+      wait.hold(true);
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(reason).toBeUndefined();
+      expect(wait.elapsedMs()).toBe(30_000);
+      wait.hold(false);
+      await vi.advanceTimersByTimeAsync(89_999);
+      expect(reason).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(reason).toBe("ceiling");
+      wait.clear();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves a finished subagent's result turn time to start when the budget is spent", async () => {
+    vi.useFakeTimers();
+    try {
+      const wait = new BackgroundWait(Infinity, 0, true);
+      let reason: string | undefined;
+      void wait.expired.then((value) => { reason = value; });
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(reason).toBeUndefined();
+      wait.hold(false);
+      await vi.advanceTimersByTimeAsync(SUBAGENT_RESULT_GRACE_MS - 1);
+      expect(reason).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(reason).toBe("ceiling");
+      wait.clear();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

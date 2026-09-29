@@ -9,6 +9,12 @@ import type {
 import type { BackgroundTask } from "../../events";
 import { AsyncQueue } from "../../shared/async-queue";
 import { debugClaude } from "../../shared/debug";
+import {
+  BackgroundTaskTracker,
+  MAX_TIMER_MS,
+  SUBAGENT_RESULT_GRACE_MS,
+  holdsBackgroundCeiling,
+} from "../background-tasks";
 import type { NativeParkBackgroundWork } from "../types";
 
 // The in-process twin of the sandbox daemon's parked runs (see the daemon
@@ -64,7 +70,8 @@ function turnEdges(message: unknown): { started: boolean; ended: boolean } {
  * attached, a turn the CLI starts on its own (a task finished, a schedule
  * fired) calls the host's `onWake`, and the next run resuming the session
  * adopts the CLI instead of spawning a second one on the same session. The
- * park lasts what is left of the background budget.
+ * park lasts what is left of the background budget, which a live subagent
+ * holds when the parking run exempts subagents.
  *
  * Every read of the CLI goes through {@link pull}, one at a time: an attached
  * run reads through {@link open}, a parked CLI is drained by {@link pump}, and
@@ -77,9 +84,14 @@ export class NativeClaudeSession {
   private iterator?: AsyncIterator<SDKMessage>;
   private handlers?: NativeRunHandlers;
   private parked?: Park;
-  // Absolute end of the background budget, carried across parks so a CLI
-  // that is adopted and parked again cannot extend its own ceiling.
-  private parkDeadline = Infinity;
+  // The background budget, carried across parks so a CLI that is adopted and
+  // parked again cannot extend its own ceiling: what was left of it at
+  // `budgetSince`, and it runs from then on. Unset while a subagent holds it.
+  private budgetLeftMs = Infinity;
+  private budgetSince: number | undefined = Date.now();
+  private exemptSubagents = false;
+  // What is live in the CLI, from every message it produces.
+  private readonly tasks = new BackgroundTaskTracker();
   private buffer: unknown[] = [];
   private bufferedBytes = 0;
   private bufferedResults = 0;
@@ -153,31 +165,66 @@ export class NativeClaudeSession {
     ttlMs: number,
     parking: NativeParkBackgroundWork,
     inflight?: Next,
+    options: { exemptSubagents?: boolean } = {},
   ): boolean {
     if (this.ending || !this.iterator) return false;
     this.handlers = undefined;
-    // Never past a deadline inherited from an earlier park: the ceiling
-    // bounds the work, not each park.
-    this.parkDeadline = Math.min(
-      this.parkDeadline,
-      Number.isFinite(ttlMs) ? Date.now() + Math.max(0, ttlMs) : Infinity,
+    // Never past a budget inherited from an earlier park: the ceiling bounds
+    // the work, not each park.
+    this.budgetLeftMs = Math.min(
+      this.budgetLeft(),
+      Number.isFinite(ttlMs) ? Math.max(0, ttlMs) : Infinity,
     );
-    const parked: Park = { tasks, parking, waking: false, wokeAt: 0 };
-    if (Number.isFinite(this.parkDeadline)) {
-      parked.timer = setTimeout(
-        () => {
-          if (this.parked !== parked) return;
-          debugClaude("★ parked CLI ran out of background budget; ending it");
-          void this.end();
-        },
-        Math.min(Math.max(0, this.parkDeadline - Date.now()), 2147483647),
-      );
-      parked.timer.unref?.();
-    }
-    this.parked = parked;
+    if (this.budgetSince !== undefined) this.budgetSince = Date.now();
+    this.exemptSubagents = options.exemptSubagents === true;
+    this.parked = { tasks, parking, waking: false, wokeAt: 0 };
     parkedSessions.set(this.sessionId, this);
+    this.updateBudget();
+    this.armBudget();
     void this.pump(inflight);
     return true;
+  }
+
+  private budgetLeft(): number {
+    return this.budgetSince === undefined
+      ? this.budgetLeftMs
+      : this.budgetLeftMs - (Date.now() - this.budgetSince);
+  }
+
+  /** Hold the budget while an exempt subagent is live. True when that changed. */
+  private updateBudget(): boolean {
+    const held = holdsBackgroundCeiling(
+      this.tasks.liveTasks(),
+      this.exemptSubagents,
+    );
+    if (held === (this.budgetSince === undefined)) return false;
+    if (held) {
+      this.budgetLeftMs = this.budgetLeft();
+      this.budgetSince = undefined;
+    } else {
+      this.budgetLeftMs = Math.max(this.budgetLeftMs, SUBAGENT_RESULT_GRACE_MS);
+      this.budgetSince = Date.now();
+    }
+    return true;
+  }
+
+  /** While parked, end the CLI once a running budget is spent. */
+  private armBudget(): void {
+    const parked = this.parked;
+    if (!parked) return;
+    clearTimeout(parked.timer);
+    parked.timer = undefined;
+    if (this.budgetSince === undefined || !Number.isFinite(this.budgetLeftMs))
+      return;
+    parked.timer = setTimeout(
+      () => {
+        if (this.parked !== parked) return;
+        debugClaude("★ parked CLI ran out of background budget; ending it");
+        void this.end();
+      },
+      Math.min(Math.max(0, this.budgetLeft()), MAX_TIMER_MS),
+    );
+    parked.timer.unref?.();
   }
 
   /**
@@ -198,9 +245,8 @@ export class NativeClaudeSession {
     parkedSessions.delete(this.sessionId);
     // What is left of the background budget, so a run that adopts and parks
     // again inherits the deadline instead of restarting it.
-    const budgetLeftMs = Number.isFinite(this.parkDeadline)
-      ? Math.max(0, this.parkDeadline - Date.now())
-      : null;
+    const left = this.budgetLeft();
+    const budgetLeftMs = Number.isFinite(left) ? Math.max(0, left) : null;
     const preamble = [
       { _parked: { tasks: parked.tasks, turns, budgetLeftMs } },
       ...this.buffer,
@@ -238,6 +284,8 @@ export class NativeClaudeSession {
         const { started, ended } = turnEdges(result.value);
         if (started) this.turnActive = true;
         if (ended) this.turnActive = false;
+        this.tasks.ingest(result.value);
+        if (this.updateBudget()) this.armBudget();
       }
       return result;
     });

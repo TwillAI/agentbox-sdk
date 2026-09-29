@@ -200,6 +200,17 @@ export interface AgentOptionsBase {
    */
   backgroundTaskTimeoutMs?: number;
   /**
+   * Leave background subagents out of {@link backgroundTaskTimeoutMs}: while
+   * one is live (Claude Code background agents and workflows, OpenCode
+   * background children) the budget does not run, so the ceiling never stops
+   * a working subagent. Shells, monitors and scheduled wakeups are still
+   * bounded once no subagent is live. Covers the run's own waits and native
+   * Claude Code parks; a sandbox run keeps waiting instead of parking while a
+   * subagent is live, since the daemon's park TTL cannot be held. Default
+   * `false`. `backgroundTaskTimeoutMs: 0` still abandons everything.
+   */
+  exemptSubagentsFromBackgroundTimeout?: boolean;
+  /**
    * Keep every normalized and raw event in memory for the life of the run so
    * {@link AgentResult.events} / {@link AgentResult.rawEvents} can replay it
    * (default `true`).

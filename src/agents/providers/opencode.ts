@@ -1390,6 +1390,8 @@ export class OpenCodeAgentAdapter implements AgentProviderAdapter<"open-code"> {
       const wait = new BackgroundWait(
         BACKGROUND_TASK_GRACE_MS,
         Math.max(0, backgroundTimeoutMs - waitedMs),
+        // Every child waited on here is a subagent.
+        request.options.exemptSubagentsFromBackgroundTimeout === true,
       );
       pendingWait = wait;
       void wait.expired.then((reason) => {

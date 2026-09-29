@@ -51,6 +51,28 @@ function asArray(value: unknown): unknown[] {
 const SCHEDULE_TOOLS = new Set(["CronCreate", "ScheduleWakeup"]);
 const DONE_STATUSES = new Set(["completed", "failed", "killed"]);
 
+// Claude Code's background subagents and workflows (`task_type`), and
+// OpenCode's background children (see opencode.ts `liveChildren`).
+const SUBAGENT_TASK_TYPES = new Set(["local_agent", "local_workflow", "subagent"]);
+
+/**
+ * A subagent that just finished queues a notification turn with its result.
+ * A ceiling resumed from a hold leaves at least this long for that turn to
+ * start, even when the budget was already spent.
+ */
+export const SUBAGENT_RESULT_GRACE_MS = 60_000;
+
+/**
+ * True when a live subagent holds the background ceiling
+ * ({@link AgentOptionsBase.exemptSubagentsFromBackgroundTimeout}).
+ */
+export function holdsBackgroundCeiling(
+  tasks: readonly BackgroundTask[],
+  exemptSubagents: boolean | undefined,
+): boolean {
+  return exemptSubagents === true && tasks.some((task) => SUBAGENT_TASK_TYPES.has(task.type));
+}
+
 /**
  * Tracks the Claude Code background work that outlives a turn, so the
  * provider knows whether a `result` is really the end of the run.
@@ -281,21 +303,48 @@ export type BackgroundWaitExpiry = "grace" | "ceiling" | "finished";
  * Timers that end one background wait. Created when a turn ends and
  * discarded when a follow-up turn starts, so a stale expiry can never
  * settle a run that has resumed. `ceilingMs` is what is left of the run's
- * budget, so re-armed waits cannot extend it.
+ * budget, so re-armed waits cannot extend it. While held (a live subagent,
+ * see {@link holdsBackgroundCeiling}) the ceiling does not run and the time
+ * is not counted against the budget.
  */
 export class BackgroundWait {
   readonly expired: Promise<BackgroundWaitExpiry>;
   private expire!: (reason: BackgroundWaitExpiry) => void;
   private grace?: NodeJS.Timeout;
-  private readonly ceiling?: NodeJS.Timeout;
+  private ceiling?: NodeJS.Timeout;
   private readonly startedAt = Date.now();
+  private heldMs = 0;
+  private heldSince?: number;
 
-  constructor(private readonly graceMs: number, ceilingMs: number) {
+  constructor(
+    private readonly graceMs: number,
+    private readonly ceilingMs: number,
+    held = false,
+  ) {
     this.expired = new Promise((resolve) => { this.expire = resolve; });
-    // Infinity = wait forever: no ceiling timer at all.
-    if (Number.isFinite(ceilingMs)) {
-      this.ceiling = setTimeout(() => this.expire("ceiling"), Math.min(ceilingMs, MAX_TIMER_MS));
+    if (held) this.heldSince = this.startedAt;
+    else this.armCeiling();
+  }
+
+  /** Stop the ceiling while a subagent is live; resume it with what is left once none is. */
+  hold(held: boolean): void {
+    if (held === (this.heldSince !== undefined)) return;
+    if (held) {
+      clearTimeout(this.ceiling);
+      this.ceiling = undefined;
+      this.heldSince = Date.now();
+      return;
     }
+    this.heldMs += Date.now() - this.heldSince!;
+    this.heldSince = undefined;
+    this.armCeiling(SUBAGENT_RESULT_GRACE_MS);
+  }
+
+  private armCeiling(floorMs = 0): void {
+    // Infinity = wait forever: no ceiling timer at all.
+    if (!Number.isFinite(this.ceilingMs)) return;
+    const leftMs = Math.max(floorMs, this.ceilingMs - this.elapsedMs());
+    this.ceiling = setTimeout(() => this.expire("ceiling"), Math.min(leftMs, MAX_TIMER_MS));
   }
 
   /** Arm the grace timer while nothing is live; disarm it once a task appears. */
@@ -309,8 +358,11 @@ export class BackgroundWait {
     this.expire("finished");
   }
 
+  /** Time counted against the budget: held time excluded. */
   elapsedMs(): number {
-    return Date.now() - this.startedAt;
+    const now = Date.now();
+    const held = this.heldMs + (this.heldSince === undefined ? 0 : now - this.heldSince);
+    return now - this.startedAt - held;
   }
 
   clear(): void {

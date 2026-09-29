@@ -7,6 +7,7 @@ import type { AgentExecutionRequest, AgentRunSink, NativeParkBackgroundWork } fr
 import type { BackgroundTasksEvent } from "../src/events";
 import { executeNativeClaude } from "../src/agents/providers/claude-code";
 import { findParkedNativeSession } from "../src/agents/providers/claude-native-session";
+import { SUBAGENT_RESULT_GRACE_MS } from "../src/agents/background-tasks";
 import { AsyncQueue } from "../src/shared/async-queue";
 
 const state = vi.hoisted(() => ({ query: vi.fn() }));
@@ -189,6 +190,64 @@ describe("native parking", () => {
     await vi.waitFor(() => expect(cli.close).toHaveBeenCalledOnce());
     expect(parking.onEnded).toHaveBeenCalledOnce();
     expect(findParkedNativeSession(sessionId)).toBeUndefined();
+  });
+
+  it("holds the budget while an exempt subagent is live, then bounds the shell with time for the result turn", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
+    try {
+      const parking = { onWake: vi.fn(), onEnded: vi.fn() };
+      const runtime = request(parking);
+      runtime.options.backgroundTaskTimeoutMs = 50;
+      runtime.options.exemptSubagentsFromBackgroundTimeout = true;
+      const agent = { task_id: "a7b921894d12d28db", task_type: "local_agent", description: "Secure remote desktop access" };
+      const cli = fakeCli();
+      const target = sink();
+      cli.emit(running(), changed([shell, agent]), success("Fixing it in the background."), idle());
+      await executeNativeClaude(runtime, target);
+      const sessionId = sessionOf(target);
+      await vi.advanceTimersByTimeAsync(2 * 60 * 60_000);
+      expect(cli.close).not.toHaveBeenCalled();
+      expect(cli.stopTask).not.toHaveBeenCalled();
+      // The subagent finished; the budget was spent before it started, so
+      // what is left is the floor for its result turn.
+      cli.emit(changed([shell]));
+      await vi.advanceTimersByTimeAsync(SUBAGENT_RESULT_GRACE_MS - 1000);
+      expect(cli.close).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(cli.close).toHaveBeenCalledOnce();
+      expect(parking.onEnded).toHaveBeenCalledOnce();
+      expect(findParkedNativeSession(sessionId)).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps an exempt subagent through adoption and a second park, past the budget", async () => {
+    const parking = { onWake: vi.fn() };
+    const exempt = (runtime: AgentExecutionRequest<"claude-code">) => {
+      runtime.options.backgroundTaskTimeoutMs = 50;
+      runtime.options.exemptSubagentsFromBackgroundTimeout = true;
+      return runtime;
+    };
+    const agent = { task_id: "a7b921894d12d28db", task_type: "local_agent", description: "Secure remote desktop access" };
+    const cli = fakeCli();
+    cli.emit(running(), changed([agent]), success("Fixing it in the background."), idle());
+    const first = sink();
+    await executeNativeClaude(exempt(request(parking)), first);
+    const sessionId = sessionOf(first);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(cli.close).not.toHaveBeenCalled();
+    const followUp = sink();
+    const run = executeNativeClaude(exempt(request(parking, { resumeSessionId: sessionId, input: "status?" })), followUp);
+    await vi.waitFor(() => expect(cli.prompts).toHaveLength(2));
+    cli.emit(running(), system("init", { session_id: sessionId }), success("Still on it."), idle());
+    await run;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(cli.close).not.toHaveBeenCalled();
+    expect(followUp.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "Still on it." }));
+    expect(lastTasks(followUp)).toMatchObject({ parked: true, tasks: [expect.objectContaining({ id: agent.task_id })] });
+    expect(cli.stopTask).not.toHaveBeenCalled();
+    await findParkedNativeSession(sessionId)!.end();
   });
 
   it("ends the parked CLI when the CLI exits on its own", async () => {

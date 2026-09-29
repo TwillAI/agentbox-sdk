@@ -603,6 +603,29 @@ describe("background tasks", () => {
     expect(backgroundEvents(target).at(-1)).toEqual({ waiting: false, ids: [] });
   });
 
+  it("never stops a subagent for the ceiling when subagents are exempt, and still bounds the shell", async () => {
+    const target = sink();
+    const stopTask = vi.fn<(id: string) => Promise<void>>(async () => {});
+    const runtime = request();
+    runtime.options.backgroundTaskTimeoutMs = 20;
+    runtime.options.exemptSubagentsFromBackgroundTimeout = true;
+    const agent = { task_id: "a7b921894d12d28db", task_type: "local_agent", description: "Secure remote desktop access" };
+    state.query.mockImplementation(() => Object.assign((async function* () {
+      yield system("init", { session_id: "s" });
+      yield changed([shell, agent]);
+      yield success("LAUNCHED");
+      // Well past the ceiling: the live subagent holds it.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      yield changed([shell]);
+      yield system("init", { session_id: "s" });
+      yield success("REPORTED");
+      await hang();
+    })(), { close() {}, stopTask }));
+    await executeNativeClaude(runtime, target);
+    expect(stopTask.mock.calls.map(([id]) => id)).toEqual(["bp6o2wveh"]);
+    expect(target.complete).toHaveBeenCalledWith(expect.objectContaining({ text: "REPORTED" }));
+  });
+
   it("keeps the legacy settle-at-first-result behaviour when backgroundTaskTimeoutMs is 0", async () => {
     const target = sink();
     const close = vi.fn();

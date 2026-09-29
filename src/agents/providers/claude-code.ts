@@ -73,6 +73,7 @@ import {
   type BackgroundWaitExpiry,
   STOP_TASKS_TIMEOUT_MS,
   applyCliBackgroundWaitCeiling,
+  holdsBackgroundCeiling,
   resolveBackgroundTaskTimeoutMs,
   withTimeout,
 } from "../background-tasks";
@@ -1813,6 +1814,11 @@ export interface BackgroundWaitOptions {
   ) => Promise<boolean>;
   /** Leave a parked run: drop the stream without winding the harness down. */
   detach?: () => Promise<void>;
+  /**
+   * `park` holds its TTL while a subagent is live, so it may take work whose
+   * budget is spent. Without it, an exempt subagent is waited on instead.
+   */
+  parkHoldsSubagents?: boolean;
   /** This run sent no input of its own (`resumeParked`). */
   attachOnly?: boolean;
 }
@@ -1844,6 +1850,11 @@ async function consumeClaudeMessages(
   const timeoutMs = resolveBackgroundTaskTimeoutMs(
     request.options.backgroundTaskTimeoutMs,
   );
+  const holdsCeiling = (live: BackgroundTask[]) =>
+    holdsBackgroundCeiling(
+      live,
+      request.options.exemptSubagentsFromBackgroundTimeout,
+    );
   const graceMs = wait.graceMs ?? BACKGROUND_TASK_GRACE_MS;
   // Set while the run stays open only for background work; dropped as soon
   // as a follow-up turn starts.
@@ -1899,11 +1910,13 @@ async function consumeClaudeMessages(
   ): Promise<boolean> => {
     const live = tracker.liveTasks();
     const ttlMs = budgetLeftMs();
+    const held = holdsCeiling(live);
     // No budget left is not something to park for: the harness would tear the
     // work down a tick later, after the run already reported it as parked.
-    // Fall through to the ordinary stop-what-is-left path instead.
-    if (!wait.park || live.length === 0 || isAborted() || ttlMs <= 0)
-      return false;
+    // Fall through to the ordinary stop-what-is-left path instead. A live
+    // exempt subagent is, but only for a park that holds its TTL for it.
+    if (!wait.park || live.length === 0 || isAborted()) return false;
+    if (held ? !wait.parkHoldsSubagents : ttlMs <= 0) return false;
     parked = await wait.park(live, ttlMs, inflight).catch(() => false);
     if (parked)
       debugClaude(
@@ -2037,6 +2050,7 @@ async function consumeClaudeMessages(
         endWait();
       }
       emitTasks(tracker.liveTasks(), pendingWait !== undefined);
+      pendingWait?.hold(holdsCeiling(tracker.liveTasks()));
       // The CLI's idle event follows notification draining. Empty task
       // snapshots and results alone are not a completion barrier.
       const sessionState =
@@ -2286,7 +2300,11 @@ async function consumeClaudeMessages(
         );
         endWait();
         pendingWait = finishWait.watch(
-          new BackgroundWait(graceMs, Math.max(0, timeoutMs - waitedMs)),
+          new BackgroundWait(
+            graceMs,
+            Math.max(0, timeoutMs - waitedMs),
+            holdsCeiling(live),
+          ),
         );
         pendingWait.setIdle(!sawSessionState && live.length === 0);
         emitTasks(live, true);
@@ -2678,7 +2696,11 @@ export async function executeNativeClaude(
         ...(parking && owned
           ? {
               park: async (tasks, ttlMs, inflight) =>
-                (parked = owned.park(tasks, ttlMs, parking, inflight)),
+                (parked = owned.park(tasks, ttlMs, parking, inflight, {
+                  exemptSubagents:
+                    request.options.exemptSubagentsFromBackgroundTimeout,
+                })),
+              parkHoldsSubagents: true,
               // The CLI lives on in the session; nothing to let go of.
               detach: async () => undefined,
             }
