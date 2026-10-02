@@ -82,6 +82,11 @@ type CodexRuntime = {
   writeLine?: (line: string) => Promise<void>;
   cleanup: () => Promise<void>;
   isAlive?: () => boolean;
+  /**
+   * Dial the same app-server again. Only remote runtimes have one: the
+   * app-server outlives a dropped WebSocket and keeps running the thread.
+   */
+  reconnect?: () => Promise<Omit<CodexRuntime, "inputItems" | "reconnect">>;
   raw: unknown;
   inputItems: Array<Record<string, unknown>>;
 };
@@ -114,6 +119,38 @@ function codexConfigDir(options: AgentOptions<"codex">): string {
 const REMOTE_CODEX_APP_SERVER_PORT = 43181;
 const REMOTE_CODEX_APP_SERVER_ID = "shared-app-server";
 const CODEX_APP_SERVER_TOKEN_FILENAME = "codex-app-server-token";
+const MAX_CODEX_RECONNECTS = 3;
+const CODEX_RECONNECT_TIMEOUT_MS = 30_000;
+
+type CodexResumedThread = {
+  status?: { type?: string };
+  turns?: Array<{ id?: string; status?: string; items?: Array<Record<string, unknown>> } & Record<string, unknown>>;
+};
+
+/**
+ * What a run missed while its transport was down, rebuilt from the
+ * `thread/resume` of the thread it rejoined: the turn's completed items not
+ * seen yet and, when the turn ended meanwhile, its `turn/completed`.
+ * Undefined when the turn cannot finish: the app-server lost the thread (a
+ * cold resume reports it idle) or interrupted the turn.
+ */
+export function missedCodexNotifications(
+  thread: CodexResumedThread,
+  threadId: string,
+  turnId: string | undefined,
+  seenItemIds: ReadonlySet<string>,
+): CodexNotification[] | undefined {
+  const active = thread.status?.type === "active";
+  const turn = turnId ? thread.turns?.find((candidate) => candidate.id === turnId) : undefined;
+  if (!turn) return active ? [] : undefined;
+  const ended = turn.status === "completed" || turn.status === "failed";
+  if (!ended && (turn.status !== "inProgress" || !active)) return undefined;
+  const missed: CodexNotification[] = (turn.items ?? [])
+    .filter((item) => typeof item.id === "string" && !seenItemIds.has(item.id) && item.status !== "inProgress")
+    .map((item) => ({ method: "item/completed", params: { threadId, turnId, item } }));
+  if (ended) missed.push({ method: "turn/completed", params: { threadId, turn: { ...turn, items: [] } } });
+  return missed;
+}
 
 function defaultRemoteCodexTokenPath(): string {
   return path.posix.join(
@@ -1459,25 +1496,28 @@ async function createRuntime(
     );
 
     const token = await getCodexAppServerToken(sandbox);
-    const transport = await connectRemoteCodexAppServer(
-      toRemoteCodexWebSocketUrl(previewUrl),
-      withCodexAppServerAuthHeaders(sandbox.previewHeaders, token),
-    );
-    debugCodex("★ codex transport established");
-    return {
-      source: transport.source,
-      writeLine: transport.send,
-      cleanup: async () => {
-        await transport?.close().catch(() => undefined);
-      },
-      raw: {
-        transport: transport.raw,
-        previewUrl,
-        port: REMOTE_CODEX_APP_SERVER_PORT,
-        codexDir,
-      },
-      inputItems,
+    const connect = async () => {
+      const transport = await connectRemoteCodexAppServer(
+        toRemoteCodexWebSocketUrl(previewUrl),
+        withCodexAppServerAuthHeaders(sandbox.previewHeaders, token),
+      );
+      return {
+        source: transport.source,
+        writeLine: transport.send,
+        cleanup: async () => {
+          await transport.close().catch(() => undefined);
+        },
+        raw: {
+          transport: transport.raw,
+          previewUrl,
+          port: REMOTE_CODEX_APP_SERVER_PORT,
+          codexDir,
+        },
+      };
     };
+    const connection = await connect();
+    debugCodex("★ codex transport established");
+    return { ...connection, reconnect: connect, inputItems };
   }
 
   // Local mode launches the codex binary fresh per execute call.
@@ -1696,7 +1736,8 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       }),
     );
 
-    const client =
+    // Replaced when a dropped remote transport is reconnected.
+    let client: CodexRpcClient =
       runtime.client ??
       new JsonRpcLineClient<CodexNotification>(
         runtime.source!,
@@ -1789,6 +1830,10 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       typeof params?.threadId === "string" && typeof params.turnId === "string" && typeof itemId === "string"
         ? `${params.threadId}:${params.turnId}:${itemId}` : undefined;
     let streamedText = "";
+    // Items a reconnect must not replay again, and the replayed ones whose
+    // live `item/completed` can still arrive on the new transport.
+    const completedItemIds = new Set<string>();
+    const replayedItemIds = new Set<string>();
     const timeoutMs = resolveBackgroundTaskTimeoutMs(request.options.backgroundTaskTimeoutMs);
     const isRootThread = (params: Record<string, unknown> | undefined) =>
       !params?.threadId || params.threadId === rootThreadId;
@@ -1845,37 +1890,95 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
       };
       void (async () => {
         let firstClientMessageLogged = false;
-        const iterator = client.messages()[Symbol.asyncIterator]();
+        let iterator = client.messages()[Symbol.asyncIterator]();
+        let next: Promise<IteratorResult<CodexNotification>> | undefined;
+        // Notifications rebuilt from `thread/resume` after a reconnect. They
+        // are read before the new transport.
+        const replay: CodexNotification[] = [];
+        let reconnects = 0;
+        // A dropped remote WebSocket does not stop the app-server: the thread
+        // keeps running with no subscriber. Rejoin it, replay what was
+        // persisted while disconnected, and keep reading.
+        const reconnect = async (cause: unknown): Promise<boolean> => {
+          if (!runtime.reconnect || abortInvoked || !rootThreadId || reconnects >= MAX_CODEX_RECONNECTS) return false;
+          reconnects++;
+          debugCodex("★ transport lost (%o); reconnecting (attempt %d)", cause, reconnects);
+          let connection: Awaited<ReturnType<NonNullable<CodexRuntime["reconnect"]>>> | undefined;
+          try {
+            connection = await runtime.reconnect();
+            const nextClient = new JsonRpcLineClient<CodexNotification>(connection.source!, connection.writeLine!);
+            const resumed = await withTimeout((async () => {
+              await initializeCodexClient(nextClient);
+              return nextClient.request<{ thread?: CodexResumedThread }>("thread/resume", { threadId: rootThreadId });
+            })(), CODEX_RECONNECT_TIMEOUT_MS);
+            const missed = resumed?.thread && missedCodexNotifications(resumed.thread, rootThreadId, turnId, completedItemIds);
+            if (!missed || abortInvoked) throw new Error("Codex thread could not be rejoined.");
+            const previous = runtime;
+            runtime = { ...runtime, ...connection };
+            await previous.cleanup().catch(() => undefined);
+            client = nextClient;
+            iterator = client.messages()[Symbol.asyncIterator]();
+            sink.setRaw(runtime.raw);
+            replay.push(...missed);
+            debugCodex("★ rejoined thread %s; replaying %d notification(s)", rootThreadId, missed.length);
+            return true;
+          } catch (error) {
+            debugCodex("★ reconnect failed: %o", error);
+            await connection?.cleanup().catch(() => undefined);
+            return false;
+          }
+        };
         type Step = { result: IteratorResult<CodexNotification> } | { reason: BackgroundWaitExpiry };
         // Manual iteration so a wait timer can race the transport read. A read
         // left pending by an expiry unwinds when cleanup() closes the transport.
-        for (let next = iterator.next(); ; next = iterator.next()) {
+        for (;;) {
           let step: Step;
-          try {
-            step = pendingWait
-              ? await Promise.race([
-                  next.then((result) => ({ result })),
-                  pendingWait.expired.then((reason) => ({ reason })),
-                ])
-              : { result: await next };
-          } catch (error) {
-            if (settleOnFailure(error)) return;
-            throw error;
-          }
-          if ("reason" in step) {
-            if (!abortInvoked) {
-              debugCodex("★ native goal wait over (%s)", step.reason);
-              settle();
-              return;
+          const replayed = replay.shift();
+          if (replayed) {
+            step = { result: { done: false, value: replayed } };
+          } else {
+            const read = (next ??= iterator.next());
+            try {
+              step = pendingWait
+                ? await Promise.race([
+                    read.then((result) => ({ result })),
+                    pendingWait.expired.then((reason) => ({ reason })),
+                  ])
+                : { result: await read };
+            } catch (error) {
+              next = undefined;
+              if (settleOnFailure(error)) return;
+              if (await reconnect(error)) continue;
+              throw error;
             }
-            // The abort handler is closing the transport, which ends the
-            // pending read (a failure there rejects into the cancel). A run
-            // the host is cancelling never settles.
-            endWait();
-            step = { result: await next };
+            if ("reason" in step) {
+              if (!abortInvoked) {
+                debugCodex("★ native goal wait over (%s)", step.reason);
+                settle();
+                return;
+              }
+              // The abort handler is closing the transport, which ends the
+              // pending read (a failure there rejects into the cancel). A run
+              // the host is cancelling never settles.
+              endWait();
+              step = { result: await read };
+            }
+            next = undefined;
           }
-          if (step.result.done) break;
+          if (step.result.done) {
+            if (pendingWait && lastTurn) break;
+            if (await reconnect(new Error("Codex transport closed."))) continue;
+            break;
+          }
           const message = step.result.value;
+          if (message.method === "item/completed") {
+            const id = (message.params?.item as { id?: unknown } | undefined)?.id;
+            if (typeof id === "string") {
+              if (replayed) replayedItemIds.add(id);
+              else if (replayedItemIds.has(id)) continue;
+              completedItemIds.add(id);
+            }
+          }
           if (!firstClientMessageLogged) {
             firstClientMessageLogged = true;
             debugCodex(
