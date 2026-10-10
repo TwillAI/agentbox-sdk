@@ -17,6 +17,7 @@ export type AgentProvider = (typeof AgentProvider)[keyof typeof AgentProvider];
 
 export const SandboxProvider = {
   LocalDocker: "local-docker",
+  Smol: "smol",
   Modal: "modal",
   Daytona: "daytona",
   Vercel: "vercel",

@@ -754,6 +754,8 @@ async function ensureSandboxOpenCodeServer(
     // command's exit and never sees one — the backgrounded opencode
     // daemon, despite being nohup'd, was enough to keep the session
     // marked as "running" for the entire ready timeout.
+    // Keep backgrounding, PID capture, and disown on separate shell lines.
+    // Joining with spaces writes "<pid> disown" to the PID file instead.
     const launchCommand = [
       `mkdir -p ${shellQuote(target.layout.rootDir)}`,
       `chmod 600 ${shellQuote(serverTokenPath)} 2>/dev/null || true`,
@@ -771,7 +773,7 @@ async function ensureSandboxOpenCodeServer(
           .join(" ")} </dev/null > ${shellQuote(logFilePath)} 2>&1 &`,
         `echo $! > ${shellQuote(pidFilePath)}`,
         `disown 2>/dev/null || true`,
-      ].join(" ")})`,
+      ].join("\n")})`,
     ].join(" && ");
 
     // Reaching here means NO healthy server is up (the health check above

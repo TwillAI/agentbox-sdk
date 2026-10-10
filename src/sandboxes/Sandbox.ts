@@ -2,6 +2,7 @@ import { DaytonaSandboxAdapter } from "./providers/daytona";
 import { E2bSandboxAdapter } from "./providers/e2b";
 import { LocalDockerSandboxAdapter } from "./providers/local-docker";
 import { ModalSandboxAdapter } from "./providers/modal";
+import { SmolSandboxAdapter } from "./providers/smol";
 import { VercelSandboxAdapter } from "./providers/vercel";
 import {
   SandboxProvider,
@@ -34,6 +35,10 @@ function createSandboxAdapter<P extends SandboxProviderName>(
     case SandboxProvider.LocalDocker:
       return new LocalDockerSandboxAdapter(
         options as SandboxOptions<"local-docker">,
+      ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
+    case SandboxProvider.Smol:
+      return new SmolSandboxAdapter(
+        options as SandboxOptions<"smol">,
       ) as unknown as SandboxAdapter<P, SandboxOptions<P>, SandboxRaw<P>>;
     case SandboxProvider.Modal:
       return new ModalSandboxAdapter(

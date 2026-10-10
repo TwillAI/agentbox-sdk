@@ -36,9 +36,55 @@ await sandbox.delete();
 Providers are mix-and-match:
 
 - **Agents** — [`claude-code`](./src/agents/providers/claude-code.ts), [`opencode`](./src/agents/providers/opencode.ts), [`codex`](./src/agents/providers/codex.ts)
-- **Sandboxes** — [`local-docker`](./src/sandboxes/providers/local-docker.ts), [`e2b`](./src/sandboxes/providers/e2b.ts), [`modal`](./src/sandboxes/providers/modal.ts), [`daytona`](./src/sandboxes/providers/daytona.ts), [`vercel`](./src/sandboxes/providers/vercel.ts)
+- **Sandboxes** — [`local-docker`](./src/sandboxes/providers/local-docker.ts), [`smol`](./src/sandboxes/providers/smol.ts), [`e2b`](./src/sandboxes/providers/e2b.ts), [`modal`](./src/sandboxes/providers/modal.ts), [`daytona`](./src/sandboxes/providers/daytona.ts), [`vercel`](./src/sandboxes/providers/vercel.ts)
 
 Swap either one and your app code stays the same.
+
+### Local microVM sandbox
+
+Use `smol` to run the same coding agents in a local microVM. Install the `smolmachines` SDK prerequisites, then supply an OCI image containing your agent CLI, git, and the tools it needs. The Smol adapter exposes the agent servers on local forwarded ports and supports command streaming, file transfer, and reattaching to tagged machines. Select a local VM by default or use the Smol Cloud option below.
+
+```ts
+import { Agent, Sandbox } from "agentbox-sdk";
+
+const sandbox = new Sandbox("smol", {
+  image: process.env.AGENT_IMAGE!,
+  workingDir: "/workspace",
+  tags: { project: "my-agent" },
+  env: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY! },
+  provider: { allowHosts: ["api.anthropic.com", "registry.npmjs.org"] },
+});
+await sandbox.findOrProvision();
+try {
+  const agent = new Agent("claude-code", { sandbox, cwd: "/workspace" });
+  await agent.setup();
+  const run = agent.stream({ input: "Inspect this repository" });
+  for await (const event of run) console.log(event);
+} finally {
+  await sandbox.delete();
+}
+```
+
+Smol keeps local machines for warm reattachment when you provide unique tags for your agent and keep its image, credentials, ports, and network policy unchanged; an untagged request creates a fresh machine. Always call `sandbox.delete()` when finished. Guest outbound networking defaults to enabled, and `provider.allowHosts` restricts it; include the agent API and any package or registry hosts your image needs. Build your image with your usual OCI tool and push it to a registry Smol can pull from; AgentBox's image builder does not yet build Smol images. Run the real VM contract test with `AGENTBOX_RUN_SMOL_E2E=1 npx vitest run test/smol-live.e2e.test.ts`. Run a complete OpenCode prompt against a guest-local model stub with `AGENTBOX_RUN_SMOL_LOCAL_PROMPT_E2E=1 npx vitest run test/smol-local-prompt-live.e2e.test.ts`. Reattaching to a paused VM requires the pending Smol SDK paused-reconnect change (smol#263); until that change is published, this case remains opt-in with `AGENTBOX_RUN_SMOL_PAUSED_E2E=1` alongside the live test flag.
+
+### Smol Cloud
+
+To run the same agent in Smol Cloud, set `provider.target` to `"cloud"` and provide a Cloud key through `SMOL_CLOUD_TOKEN`, a CLI login, or `provider.apiKey`. Cloud VM creation with an agent server requires the deferred-port support pending in `smol-machines/smol#274`. The provider starts the VM before agent ports listen, then forwards its published ports over authenticated Cloud TCP tunnels bound to localhost. This preserves the agent server's own HTTP and WebSocket authorization headers; preview links are usable on this host only.
+
+```ts
+const sandbox = new Sandbox("smol", {
+  image: process.env.AGENT_IMAGE!,
+  tags: { project: "my-cloud-agent" },
+  env: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY! },
+  provider: { target: "cloud", allowHosts: ["api.anthropic.com"] },
+});
+await sandbox.findOrProvision();
+// Use the same Agent setup and run calls as the local example above.
+```
+
+AgentBox setup also needs Bash, curl, Python 3, and git in the VM image. For OpenCode, [`examples/smol-cloud-opencode/Dockerfile`](./examples/smol-cloud-opencode/Dockerfile) adds these to its official image. The recipe pins OpenCode 1.18.35: the tested 2.0.7 image returns HTTP 405 from AgentBox's `POST /session` call. Build and push it to your own registry, then set `AGENT_IMAGE` to the resulting reference before using `new Agent("open-code", { sandbox, cwd: "/workspace" })`.
+
+Run the Cloud transport test with `AGENTBOX_RUN_SMOL_CLOUD_E2E=1 npx vitest run test/smol-cloud-live.e2e.test.ts`, or verify a real OpenCode server with `AGENTBOX_RUN_SMOL_CLOUD_AGENT_E2E=1 npx vitest run test/smol-cloud-agent-live.e2e.test.ts`; both need a Cloud key. The agent test installs image prerequisites in its test VM so it can exercise the upstream image directly. For a complete prompt through a guest-local model stub, use `AGENTBOX_RUN_SMOL_CLOUD_PROMPT_E2E=1 npx vitest run test/smol-cloud-prompt-live.e2e.test.ts`. Always call `sandbox.delete()` when finished.
 
 ## Install
 
@@ -367,11 +413,12 @@ Studio support; chat-only backends need a responses→chat proxy.
 
 ## Sandboxes
 
-Five sandbox providers are supported. Each gives you an isolated environment with the same interface:
+Six sandbox providers are supported. Each gives you an isolated environment with the same interface:
 
 | Provider       | What it is             | Auth                                                    |
 | -------------- | ---------------------- | ------------------------------------------------------- |
 | `local-docker` | Local Docker container | Docker daemon                                           |
+| `smol`         | Local or Cloud microVM | Local: no key; Cloud: `SMOL_CLOUD_TOKEN` or CLI login   |
 | `e2b`          | Cloud micro-VM         | `E2B_API_KEY`                                           |
 | `modal`        | Cloud container        | `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET`                 |
 | `daytona`      | Cloud dev environment  | `DAYTONA_API_KEY`                                       |

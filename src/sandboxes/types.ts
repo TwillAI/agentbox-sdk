@@ -86,6 +86,25 @@ export interface LocalDockerProviderOptions {
   publishedPorts?: number[];
 }
 
+export interface SmolProviderOptions {
+  /** Use local VMs by default, or Cloud VMs with the Smol SDK deferred-port feature. */
+  target?: "local" | "cloud";
+  /** Cloud API key, or use SMOL_CLOUD_TOKEN / your smol CLI login. */
+  apiKey?: string;
+  /** Optional Cloud API endpoint. */
+  baseUrl?: string;
+  /** Enable unrestricted outbound access (default: true), or set allowHosts. */
+  network?: boolean;
+  /** Restrict guest egress to these hostnames (takes precedence over network). */
+  allowHosts?: string[];
+  /** Extra ports to publish before the VM boots. Agent ports are included automatically. */
+  publishedPorts?: number[];
+}
+
+export interface SmolSandboxOptions extends SandboxOptionsBase {
+  provider?: SmolProviderOptions;
+}
+
 export interface ModalProviderOptions {
   appName?: string;
   environment?: string;
@@ -203,6 +222,7 @@ export interface E2bSandboxOptions extends SandboxOptionsBase {
 
 export type SandboxOptionsMap = {
   "local-docker": LocalDockerSandboxOptions;
+  smol: SmolSandboxOptions;
   modal: ModalSandboxOptions;
   daytona: DaytonaSandboxOptions;
   vercel: VercelSandboxOptions;
@@ -215,6 +235,7 @@ export type SandboxOptions<
 
 export type SandboxRawMap = {
   "local-docker": import("./providers/local-docker").DockerRaw;
+  smol: import("./providers/smol").SmolRaw;
   modal: import("./providers/modal").ModalRaw;
   daytona: import("./providers/daytona").DaytonaRaw;
   vercel: import("./providers/vercel").VercelRaw;

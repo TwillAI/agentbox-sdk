@@ -69,6 +69,7 @@
     "e2b": "^2.19.0",
     "eventsource-parser": "^3.0.6",
     "modal": "^0.7.4",
+    "smolmachines": "^1.25.2",
     "tar-stream": "^3.1.8",
     "ws": "^8.20.0",
     "zod": "4.3.6"

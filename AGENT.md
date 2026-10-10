@@ -7,7 +7,7 @@ AgentBox is a Bun-friendly TypeScript package for running coding agents and sand
 The main goal of this package is low-cost swapping:
 
 - swap `codex`, `opencode`, and `claude-code` behind one `Agent` abstraction
-- swap `local-docker`, `modal`, `daytona`, and `e2b` behind one `Sandbox` abstraction
+- swap `local-docker`, `smol`, `modal`, `daytona`, and `e2b` behind one `Sandbox` abstraction
 - keep provider-specific behavior available, but only behind explicit escape hatches
 
 ## Core API Rules
