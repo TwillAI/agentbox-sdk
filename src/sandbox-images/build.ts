@@ -67,6 +67,10 @@ export async function buildSandboxImage(
       return buildDaytonaSnapshot(definition, options);
     case SandboxProvider.E2B:
       return buildE2bTemplate(definition, options);
+    case SandboxProvider.Smol:
+      throw new Error(
+        "Smol image building is not supported yet; use a prebuilt OCI image containing the agent CLI.",
+      );
     default:
       throw new Error(
         `Image building is not supported for provider "${options.provider}". ` +
