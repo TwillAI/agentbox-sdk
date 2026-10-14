@@ -3,6 +3,7 @@ import { spawnCommand, type SpawnedProcess } from "../transports/spawn";
 import path from "node:path";
 
 import type {
+  McpServerStatus,
   Options as SdkQueryOptions,
   Query,
   PermissionMode,
@@ -24,6 +25,7 @@ import {
 import { sleep } from "../../shared/network";
 import { shellQuote } from "../../shared/shell";
 import { claudeHarnessCommands } from "../harness-commands";
+import { claudeMcpServersFrame } from "../mcp-servers";
 import {
   AgentProvider,
   type AgentAttachRequest,
@@ -116,7 +118,7 @@ import {
 // Bumped 10 -> 11: every route is guarded and the process survives a stray
 // rejection/exception, so one bad request can no longer take down the live
 // and parked runs sharing this daemon.
-const DAEMON_PROTOCOL_VERSION = "11";
+const DAEMON_PROTOCOL_VERSION = "12";
 const DAEMON_PORT = 43180;
 const DAEMON_PATH = "/tmp/agentbox/claude-code/daemon.mjs";
 const DAEMON_LOG_PATH = "/tmp/agentbox/claude-code/daemon.log";
@@ -419,6 +421,32 @@ function writeFrame(run, message) {
   }
   run.bufferedBytes += size;
   run.buffer.push(line);
+}
+
+// The run's MCP servers as a \`system/mcp_servers\` frame, once the CLI has
+// connected them (mirrors claudeMcpServersFrame in agents/mcp-servers.ts).
+function urlOrigin(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === "http:" || url.protocol === "https:" ? url.origin : undefined;
+  } catch { return undefined; }
+}
+async function reportMcpServers(run) {
+  let statuses;
+  try { statuses = await run.query.mcpServerStatus(); } catch { return; }
+  const servers = statuses.map((status) => {
+    const info = status.serverInfo ?? {};
+    const icons = Array.isArray(info.icons) ? info.icons.filter((icon) => typeof icon?.src === "string") : [];
+    const server = {
+      name: status.name,
+      url: status.config?.url ? urlOrigin(status.config.url) : undefined,
+      title: typeof info.title === "string" ? info.title : undefined,
+      websiteUrl: info.websiteUrl ? urlOrigin(info.websiteUrl) : undefined,
+      icons: icons.length > 0 ? icons : undefined,
+    };
+    return Object.fromEntries(Object.entries(server).filter(([, value]) => value !== undefined));
+  });
+  writeFrame(run, { type: "system", subtype: "mcp_servers", mcp_servers: servers });
 }
 
 function attachSink(run, res) {
@@ -794,6 +822,10 @@ async function handleStart(req, res, runId) {
     for await (const message of run.query) {
       observeFrame(run, message);
       writeFrame(run, message);
+      if (message.type === "system" && message.subtype === "init" && !run.mcpReported) {
+        run.mcpReported = true;
+        void reportMcpServers(run);
+      }
     }
   } catch (e) {
     writeFrame(run, { _error: String(e?.message ?? e) });
@@ -1832,6 +1864,11 @@ async function consumeClaudeMessages(
   wasCancelled: () => boolean = () => false,
   wait: BackgroundWaitOptions = {},
   tracker = new BackgroundTaskTracker(),
+  /**
+   * The CLI's MCP servers, for a run that owns its `query` (native); the
+   * sandbox daemon writes the `system/mcp_servers` frame itself.
+   */
+  mcpServerStatus?: () => Promise<McpServerStatus[]>,
 ): Promise<void> {
   let accumulatedText = "";
   // Thinking chars streamed via thinking_delta for the current main-agent
@@ -2117,6 +2154,24 @@ async function consumeClaudeMessages(
               { commands: claudeHarnessCommands(sys) },
             ),
           );
+          // Recorded next to the CLI's own messages so hosts can tell whose
+          // tool an `mcp__<server>__*` call is (endpoint, advertised icons).
+          // Best effort: nothing here may fail the run.
+          if (mcpServerStatus)
+            Promise.resolve()
+              .then(mcpServerStatus)
+              .then(
+                (statuses) =>
+                  sink.emitRaw(
+                    toRawEvent(
+                      request.runId,
+                      claudeMcpServersFrame(statuses),
+                      "system",
+                    ),
+                  ),
+                (error: unknown) =>
+                  debugClaude("mcpServerStatus failed: %o", error),
+              );
           if (sys.session_id) {
             debugClaude(
               "★ session.init session_id=%s (%dms)",
@@ -2707,6 +2762,7 @@ export async function executeNativeClaude(
           : {}),
       },
       tracker,
+      live ? () => live.mcpServerStatus() : undefined,
     );
   } catch (error) {
     if (!parked) await stop();
