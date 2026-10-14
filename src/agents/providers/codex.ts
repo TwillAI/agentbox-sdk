@@ -27,6 +27,10 @@ import {
   type HarnessCommandDescriptor,
   type HarnessCommandInvocation,
 } from "../harness-commands";
+import {
+  codexMcpServersFrame,
+  type CodexMcpServerStatus,
+} from "../mcp-servers";
 import { normalizeAsyncUserQuestions, normalizeUserQuestions, questionReply } from "../questions";
 import {
   joinTextParts,
@@ -2219,6 +2223,24 @@ export class CodexAgentAdapter implements AgentProviderAdapter<"codex"> {
         return commands;
       });
       inventory.catch(() => undefined);
+      // Recorded next to the thread's own events so hosts can tell whose tool
+      // an MCP call is (endpoint origin, advertised icons). Best effort and
+      // off the turn's path, like the command inventory.
+      client
+        .request<{ data: CodexMcpServerStatus[] }>("mcpServerStatus/list", {
+          threadId: threadResponse.thread.id,
+          detail: "full",
+        })
+        .then((response) =>
+          sink.emitRaw(
+            toRawEvent(
+              request.runId,
+              codexMcpServersFrame(response.data ?? []),
+              "agentbox/mcpServers",
+            ),
+          ),
+        )
+        .catch(() => undefined);
       if (request.run.goal) {
         await client.request("thread/goal/set", { threadId: threadResponse.thread.id, objective: request.run.goal, status: "active" });
       }

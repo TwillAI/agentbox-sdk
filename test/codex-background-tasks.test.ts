@@ -301,6 +301,7 @@ it.each(["complete", "blocked", undefined])(
         "initialize",
         "thread/start",
         "skills/list",
+        "mcpServerStatus/list",
         ...(status ? ["thread/goal/set"] : []),
         "turn/start",
       ]);
